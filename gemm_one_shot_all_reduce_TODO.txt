@@ -1,0 +1,50 @@
+The Helion kernel is at /data/users/willfeng/helion/examples/gemm_one_shot_all_reduce.py, and you can get its generated Triton kernel via HELION_PRINT_OUTPUT_CODE=1
+The Triton kernel is at /data/users/willfeng/kraken/kraken/fused/gemm_one_shot_all_reduce_fused.py
+The benchmark script to compare their perf is at /data/users/willfeng/helion/examples/benchmark_gemm_one_shot_all_reduce.pyI
+
+Please address the TODO in this file. If something fails and you think it should work in order to match the manual Triton kernel, please stop and tell me.
+
+  I've analyzed the differences between the Helion-generated and manual Triton kernels and identified the key API gaps that prevent Helion from matching Triton's approach:
+
+  1. Synchronization API Gap
+
+  Helion lacks a combined synchronization primitive like Triton's symm_mem_sync(). The current separate signal() and wait() operations:
+  - Don't automatically reset (not CUDA graph friendly)
+  - Require manual management of signal pad state
+  - Have higher overhead due to separate operations
+
+  Missing API needed:
+  hl.symm_mem_sync(
+      signal_pad_ptrs,
+      sync_id,
+      rank,
+      world_size,
+      hasPreviousMemAccess=True,
+      hasSubsequentMemAccess=True
+  )
+
+  TODO Implement solution: just use hl.inline_triton and copy the implementation from kraken/_ptx_utils/symm_mem_barrier.py#L98 (NOTE: output_like=None is accepted, and you absolutely must use hl.inline_triton!)
+
+  2. Dynamic Buffer Tuple Handling
+
+  Helion unrolls tuple access at compile time, converting buf_tuple[i] into separate parameters (buf_tuple_item_0, buf_tuple_item_1, etc.). This prevents dynamic iteration over
+  buffers.
+
+  Missing capability:
+  - Dynamic tuple/array indexing within kernels
+  - Support for iterating over collections with runtime-determined indices
+
+  TODO Implement solution: just pass in buf_tuple and then use hl.static_range in place of tl.static_range
+
+  3. Additional Missing APIs:
+
+  - Local thread barriers (hl.barrier() or hl.debug_barrier())
+  - Fine-grained memory fence control
+
+  TODO Implement solution: if you really need them, just use hl.inline_triton to call the Triton APIs
+
+  These limitations explain the performance difference:
+  - Triton kernel: 2.67x speedup over baseline
+  - Helion kernel: 0.79x speedup (actually slower than baseline)
+
+  The inefficient synchronization pattern and code bloat from tuple unrolling are the primary culprits for Helion's lower performance.
