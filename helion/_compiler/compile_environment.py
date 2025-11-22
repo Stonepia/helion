@@ -20,6 +20,7 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from .. import exc
+from .._compat import patch_fake_tensor_ctor
 from ..language.constexpr import ConstExpr
 from .loop_dependency_checker import LoopDependencyChecker
 from .source_location import SourceLocation
@@ -272,6 +273,71 @@ class CompileEnvironment:
             self._symint_cache[key] = result
         return result
 
+    def get_tile_index_tensor_block_id(self, tensor: torch.Tensor) -> int | None:
+        """Return the originating ``tile.index`` block id if present."""
+        return tensor._tile_index_block_id  # type: ignore[attr-defined]
+
+    def should_broadcast_tensor_indexers(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> bool:
+        """Check whether tensor indexers need broadcasting."""
+        if not tensors:
+            return False
+        # tile.index tensors don't need broadcasting
+        return not all(self.get_tile_index_tensor_block_id(t) for t in tensors)
+
+    def tensor_indexer_broadcast_shape(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> list[int | torch.SymInt]:
+        """Compute broadcast shape for tensor indexers."""
+        shapes = [list(t.size()) for t in tensors]
+        if all(len(s) == 1 for s in shapes) and len(shapes) > 1:  # Cartesian
+            return [s[0] for s in shapes]
+        max_ndim = max(len(s) for s in shapes)
+        padded = [([1] * (max_ndim - len(s)) + s) for s in shapes]
+        return [
+            next((d for d in dims if self.size_hint(d) != 1), 1)
+            for dims in zip(*padded, strict=True)
+        ]
+
+    def tensor_indexer_dims(
+        self, indexer_tensor: torch.Tensor, base_dim_size: int | torch.SymInt
+    ) -> list[int | torch.SymInt]:
+        """Return dims contributed by a tensor indexer (non-broadcast case)."""
+        dims = list(indexer_tensor.size())
+        non_trivial_dims = [d for d in dims if self.size_hint(d) != 1]
+        if len(non_trivial_dims) > 1:
+            return typing.cast("list[int | torch.SymInt]", dims)
+        bid = (
+            self.get_tile_index_tensor_block_id(indexer_tensor)
+            or (self.get_block_id(base_dim_size) if base_dim_size else None)
+            or (self.get_block_id(non_trivial_dims[0]) if non_trivial_dims else None)
+        )
+        return (
+            [self.block_sizes[bid].var]
+            if bid
+            else (typing.cast("list[int | torch.SymInt]", non_trivial_dims) or [1])
+        )
+
+    def new_index_result(
+        self, tensor: torch.Tensor, output_shape: typing.Sequence[int | torch.SymInt]
+    ) -> torch.Tensor:
+        """Create tensor for indexing ops, preserving tile index provenance."""
+        shape = list(output_shape)
+        non_trivial_indices = [i for i, s in enumerate(shape) if self.size_hint(s) != 1]
+        bid = self.get_tile_index_tensor_block_id(tensor)
+        if bid is None:
+            bids = {self.get_block_id(shape[i]) for i in non_trivial_indices} - {None}
+            bid = bids.pop() if len(bids) == 1 else None
+        if bid and len(non_trivial_indices) == 1:
+            shape[non_trivial_indices[0]] = self.block_sizes[bid].var
+        elif len(non_trivial_indices) > 1:
+            bid = None
+        result = tensor.new_empty(shape)
+        if bid is not None:
+            result._tile_index_block_id = bid  # type: ignore[attr-defined]
+        return result
+
     def to_fake(self, obj: object, origin: Origin) -> object:
         if obj is None:
             return None
@@ -418,6 +484,8 @@ class CompileEnvironment:
 
     def __enter__(self) -> Self:
         assert getattr(tls, "env", None) is None, "CompileEnvironment already active"
+        self.fake_tensor_ctor_patch_ctx = patch_fake_tensor_ctor()
+        self.fake_tensor_ctor_patch_ctx.__enter__()
         self.fake_mode.__enter__()
         tls.env = self
         self.loop_dependency_checker = LoopDependencyChecker()
@@ -431,6 +499,7 @@ class CompileEnvironment:
     ) -> None:
         tls.env = None
         self.fake_mode.__exit__(exc_type, exc_value, traceback)
+        self.fake_tensor_ctor_patch_ctx.__exit__(exc_type, exc_value, traceback)
 
     @staticmethod
     def current() -> CompileEnvironment:

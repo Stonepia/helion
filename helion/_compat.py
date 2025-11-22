@@ -306,3 +306,37 @@ def supports_amd_cdna_tunables() -> bool:
         return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
+
+
+@contextlib.contextmanager
+def patch_fake_tensor_ctor() -> Any:
+    """Context manager that patches FakeTensor.__new__ for the following purpose:
+    - Add _tile_index_block_id attribute with None as initial value.
+      This ensures all FakeTensors have a _tile_index_block_id attribute,
+      which is used to track which block a tile.index tensor originated from.
+    """
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    original_new = FakeTensor.__new__
+
+    def patched_new(
+        cls: type,
+        fake_mode: object,
+        elem: torch.Tensor,
+        device: torch.device,
+        constant: torch.Tensor | None = None,
+        real_tensor: torch.Tensor | None = None,
+        pytype: type[torch.Tensor] | None = None,
+        dispatch_keys: object = None,
+    ) -> FakeTensor:
+        result = original_new(
+            cls, fake_mode, elem, device, constant, real_tensor, pytype, dispatch_keys
+        )
+        result._tile_index_block_id = None  # type: ignore[attr-defined]
+        return result
+
+    FakeTensor.__new__ = staticmethod(patched_new)  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        FakeTensor.__new__ = original_new  # type: ignore[method-assign]

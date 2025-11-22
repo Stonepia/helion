@@ -460,7 +460,9 @@ class TensorType(TypeInfo):
         inputs_consumed = 0
         output_sizes = []
         env = CompileEnvironment.current()
-        for k in keys:
+        tensor_indexers = [k.fake_value for k in keys if isinstance(k, TensorType)]
+        should_broadcast = env.should_broadcast_tensor_indexers(tensor_indexers)
+        for position, k in enumerate(keys):
             if isinstance(k, LiteralType):
                 if isinstance(k.value, (int, torch.SymInt)):
                     inputs_consumed += 1
@@ -505,9 +507,18 @@ class TensorType(TypeInfo):
                 raise exc.DataDependentOutputShapeNotSupported(
                     op_desc="Boolean mask indexing (tensor[boolean_mask])"
                 )
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
+                base_dim_size = self.fake_value.size(inputs_consumed)
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                if not should_broadcast:
+                    output_sizes.extend(
+                        env.tensor_indexer_dims(
+                            k.fake_value,
+                            base_dim_size,
+                        )
+                    )
+                elif k.fake_value is tensor_indexers[0]:
+                    output_sizes.extend(env.tensor_indexer_broadcast_shape(tensor_indexers))
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -553,9 +564,11 @@ class TensorType(TypeInfo):
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
                 ) from None
-        return TensorType(
-            origin, self.fake_value.new_empty(self._device_indexing_size(key))
-        )
+        new_sizes = self._device_indexing_size(key)
+        env = CompileEnvironment.current()
+        new_fake = env.new_index_result(self.fake_value, new_sizes)
+
+        return TensorType(origin, new_fake)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):
@@ -2143,8 +2156,31 @@ class TypePropagation(ast.NodeVisitor):
         return type_info
 
     def visit_Subscript(self, node: ast.Subscript) -> TypeInfo:
-        value_type = self.visit(node.value)
-        slice_type = self.visit(node.slice)
+        value_type, slice_type = self.visit(node.value), self.visit(node.slice)
+        # In device loops, check for overpacked tiles and rank mismatch
+        if self.device_loop_depth > 0 and isinstance(value_type, TensorType):
+            keys = (
+                slice_type.unpack()
+                if isinstance(slice_type, SequenceType)
+                else [slice_type]
+            )
+            consumed, has_tensor = 0, False
+            for k in keys:
+                if k.contains_type(TileIndexType) and not isinstance(k, TileIndexType):
+                    raise exc.OverpackedTile(k)
+                if isinstance(k, TensorType):
+                    has_tensor, consumed = True, consumed + 1
+                elif isinstance(k, SliceType) or (
+                    isinstance(k, (LiteralType, SymIntType, TileIndexType))
+                    and not (isinstance(k, LiteralType) and k.value is None)
+                ):
+                    consumed += 1
+            if not has_tensor and consumed < value_type.fake_value.ndim:
+                raise exc.RankMismatch(
+                    value_type.fake_value.ndim,
+                    consumed,
+                    f"tensor shape: {tuple(value_type.fake_value.shape)}, indexed {consumed} dimensions",
+                )
         return value_type.propagate_getitem(slice_type, self.origin())
 
     def visit_Slice(self, node: ast.Slice) -> TypeInfo:
