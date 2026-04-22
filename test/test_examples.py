@@ -124,7 +124,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe barrier-based split-K example is still unsupported")
     @xfailIfPallas("missing barrier implementation")
     @skipIfTileIR("PassManager::run failed")
-    @skipIfXPU("Split-K barrier not supported on XPU backend")
     def test_split_k_barrier(self):
         m, k, n = 64, 512, 64
         a = torch.randn([m, k], device=DEVICE, dtype=torch.float32)
@@ -388,7 +387,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe template closure example still exceeds runtime resources")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
-    @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/795")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_template_via_closure1(self):
         bias = torch.randn([1, 512], device=DEVICE, dtype=HALF_DTYPE)
@@ -802,7 +800,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         "CuTe attention block-pointer example still exceeds thread-block limits"
     )
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
-    @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_attention_block_pointer(self):
         args = (
@@ -1025,7 +1022,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe persistent attention example still exceeds thread-block limits")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
-    @skipIfXPU("failure on XPU")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_attention_persistent_interleaved_l2_grouping(self):
         """Test attention with persistent interleaved execution and L2 grouping for optimal performance."""
@@ -1543,7 +1539,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("BackendError on pallas")
-    @skipIfXPU("Timeout on XPU")
     def test_gather_gemv(self):
         args = (
             torch.randn([4, 512, 512], device=DEVICE, dtype=torch.float32),
@@ -1775,7 +1770,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfCudaSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
-    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
         m, n, k = 128, 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)

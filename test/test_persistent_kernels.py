@@ -248,7 +248,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Should produce identical results
         torch.testing.assert_close(result_flat, result_persistent)
 
-    @skipIfXPU("worker crash on XPU")
     def test_xyz_vs_persistent_interleaved_equivalence(self):
         """Test that xyz and persistent_interleaved produce same results."""
 
