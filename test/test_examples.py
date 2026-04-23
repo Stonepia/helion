@@ -39,6 +39,10 @@ from helion.runtime.ref_mode import is_ref_mode_enabled
 _orig_matmul_fp32_precision: str = "none"
 _orig_cudnn_fp32_precision: str = "none"
 
+# XPU (Intel GPU) uses ocloc offline compiler which takes ~60s for first kernel
+# compilation. Allow extra time so these tests don't time out on XPU.
+_XPU_TIMEOUT = 300 if torch.xpu.is_available() else 60
+
 
 def _compile_only(
     fn: helion.Kernel,
@@ -1660,6 +1664,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     def test_fused_linear_jsd(self):
         beta = 0.5
         ignore_index = -100

@@ -6,6 +6,7 @@ from typing import Callable
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch._inductor import inductor_prims
 
@@ -20,7 +21,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
@@ -28,6 +28,10 @@ import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 from helion.runtime.settings import _get_backend
+
+# XPU (Intel GPU) uses ocloc offline compiler which takes ~60s for first kernel
+# compilation. Allow extra time so these tests don't time out on XPU.
+_XPU_TIMEOUT = 300 if torch.xpu.is_available() else 60
 
 try:
     triton = importlib.import_module("triton")
@@ -241,6 +245,7 @@ def _nested_broadcast_rand_expected_3d(
 class TestRNG(RefEagerTestBase, TestCase):
     @xfailIfPallas("implicit rand still hits TPU deferred buffer materialization")
     @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     def test_rand(self):
         """Test RNG seeding behavior, reproducibility, output range, and distribution."""
 
@@ -866,7 +871,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         with self.assertRaisesRegex(Exception, "expected .* got .*"):
             code_and_output(wrong_device_rand, (x,), block_sizes=[8, 16])
 
-    @skipIfXPU("RNG with specialized dimensions not supported on XPU")
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     @xfailIfPallas("specialized-dimension rand_like hits TPU MLIR refinement mismatch")
     @xfailIfCute(
         "CuTe matmul plus specialized-dimension rand_like still returns unstable NaNs"

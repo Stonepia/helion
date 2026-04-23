@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -16,6 +17,10 @@ from helion._testing import skipIfMetal
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
+
+# XPU (Intel GPU) uses ocloc offline compiler which takes ~60s for first kernel
+# compilation. Allow extra time so these tests don't time out on XPU.
+_XPU_TIMEOUT = 300 if torch.xpu.is_available() else 60
 
 
 def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -39,6 +44,7 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 class TestGrid(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
         def grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import operator
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -12,6 +13,10 @@ from helion._testing import TestCase
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfNotTriton
 import helion.language as hl
+
+# XPU (Intel GPU) uses ocloc offline compiler which takes ~60s for first kernel
+# compilation. Allow extra time so these tests don't time out on XPU.
+_XPU_TIMEOUT = 300 if torch.xpu.is_available() else 60
 
 
 @skipIfMTIA("autodiff not tested on MTIA")
@@ -236,6 +241,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(kernel, lambda x: x * torch.sin(x), 1)
 
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     def test_sin_squared(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -268,6 +274,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         self._check_backward(kernel, lambda x, y: torch.exp(x) * torch.sin(y), 2)
 
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     def test_sin_x_cos_y(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

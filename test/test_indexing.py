@@ -4,6 +4,7 @@ import math
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -25,6 +26,10 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
+
+# XPU (Intel GPU) uses ocloc offline compiler which takes ~60s for first kernel
+# compilation. Allow extra time so these tests don't time out on XPU.
+_XPU_TIMEOUT = 300 if torch.xpu.is_available() else 60
 
 _LARGE_BF16_SHAPE = (51200, 51200)
 _LARGE_BF16_REQUIRED_BYTES = (
@@ -746,6 +751,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
     )
+    @pytest.mark.timeout(_XPU_TIMEOUT)
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
