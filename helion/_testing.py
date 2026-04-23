@@ -410,6 +410,21 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
+def _has_ccl() -> bool:
+    """Return True if oneCCL bindings for PyTorch are importable (XPU distributed)."""
+    try:
+        import oneccl_bindings_for_pytorch  # type: ignore[import-not-found]  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def skipUnlessCCL(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless Intel oneCCL bindings are available (required for XPU distributed ops)."""
+    return skipIfFn(lambda: not _has_ccl(), reason)
+
+
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
 
