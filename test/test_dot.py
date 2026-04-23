@@ -1156,7 +1156,7 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
         torch.bfloat16,
         torch.float32,
     ):
-        _test_func = skipIfXPU("skip: float6 accmulator for non-fp16 input data types")(
+        _test_func = skipIfXPU("skip: float16 accumulator not supported for bf16/fp32/fp8 inputs on XPU")(
             _test_func
         )
 
