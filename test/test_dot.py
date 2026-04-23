@@ -477,7 +477,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
     @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Debug dtype codegen checks rely on compiled code")
-    @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/772")
     def test_baddbmm_pipeline_debug_dtype_asserts(self):
         # Reproduces scripts/repro512.py within the test suite and asserts
         # the kernel compiles and runs with debug dtype asserts enabled.
