@@ -16,6 +16,7 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 
@@ -289,7 +290,7 @@ class TestSettingsEnv(TestCase):
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env = CompileEnvironment(torch.device(DEVICE, 0), settings)
         self.assertEqual(
             env.config_spec.allowed_pid_types,
             ("persistent_blocked", "persistent_interleaved"),
@@ -303,7 +304,7 @@ class TestSettingsEnv(TestCase):
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
             patch("helion.runtime.get_num_sm", return_value=200),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env = CompileEnvironment(torch.device(DEVICE, 0), settings)
         self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
 
     def test_backend_env_var_accepts_cute(self) -> None:

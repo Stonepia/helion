@@ -16,6 +16,8 @@ import helion.language as hl
 
 
 def _supports_epilogue_subtile_autotune() -> bool:
+    if not torch.cuda.is_available():
+        return False  # not applicable on XPU/ROCm
     return supports_tensor_descriptor() and torch.cuda.get_device_capability() >= (
         10,
         0,

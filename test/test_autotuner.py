@@ -2113,11 +2113,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # on tensors of the same size
         ref_a = torch.randn(numel, device=DEVICE)
         ref_b = ref_a.clone()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        base_mem = torch.cuda.memory_allocated()
-        torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
-        naive_peak = torch.cuda.max_memory_allocated() - base_mem
+        if torch.xpu.is_available():
+            torch.xpu.empty_cache()
+            torch.xpu.reset_peak_memory_stats()
+            base_mem = torch.xpu.memory_allocated()
+            torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
+            naive_peak = torch.xpu.max_memory_allocated() - base_mem
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            base_mem = torch.cuda.memory_allocated()
+            torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
+            naive_peak = torch.cuda.max_memory_allocated() - base_mem
         del ref_a, ref_b
 
         # Patch _assert_close to record peak memory delta during each call
@@ -2125,10 +2132,16 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         peaks: list[int] = []
 
         def measuring_assert_close(*args, **kwargs):
-            torch.cuda.reset_peak_memory_stats()
-            before = torch.cuda.memory_allocated()
-            real_assert_close(*args, **kwargs)
-            peak = torch.cuda.max_memory_allocated() - before
+            if torch.xpu.is_available():
+                torch.xpu.reset_peak_memory_stats()
+                before = torch.xpu.memory_allocated()
+                real_assert_close(*args, **kwargs)
+                peak = torch.xpu.max_memory_allocated() - before
+            else:
+                torch.cuda.reset_peak_memory_stats()
+                before = torch.cuda.memory_allocated()
+                real_assert_close(*args, **kwargs)
+                peak = torch.cuda.max_memory_allocated() - before
             peaks.append(peak)
 
         with patch.object(_bs, "_assert_close", measuring_assert_close):
