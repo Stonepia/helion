@@ -2620,12 +2620,18 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        # XPU inductor backend may fuse kernels differently; skip count assertion on XPU
+        expected_num_kernels = (
+            None
+            if not allow_torch_compile_fusion or torch.xpu.is_available()
+            else 3
+        )
         self._run_compile_test(
             f,
             (x, y),
             kernels=[k_add_inplace_1d],
             allow_torch_compile_fusion=allow_torch_compile_fusion,
-            expected_num_kernels=3 if allow_torch_compile_fusion else None,
+            expected_num_kernels=expected_num_kernels,
             kernels_ref=[k_add_inplace_ref],
         )
 
