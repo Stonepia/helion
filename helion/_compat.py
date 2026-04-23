@@ -537,7 +537,10 @@ def _supports_maxnreg() -> bool:
 
 @functools.cache
 def _regs_per_block() -> int:
-    """Max 32-bit registers per block on the current CUDA device."""
+    """Max 32-bit registers per block on the current device."""
+    if torch.xpu.is_available():
+        # Intel Max GPU (Xe-HPC): 128 GRF registers per thread
+        return 128 * 1024
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return props.regs_per_multiprocessor  # pyrefly: ignore[missing-attribute]
 
