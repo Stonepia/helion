@@ -590,7 +590,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("precision differences with bf16xint16 operations on pallas")
     @skipIfTileIR("precision differences with bf16xint16 operations on tileir")
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
-    @skipIfXPU("precision differences with bf16xint16 operations on xpu")
     def test_bf16xint16(self):
         from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
 
@@ -599,11 +598,16 @@ class TestExamples(RefEagerTestBase, TestCase):
         x = torch.randn([m, k], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randint(-(2**15), 2**15 - 1, (k, n), device=DEVICE, dtype=torch.int16)
 
+        # XPU uses a slightly different FP rounding mode for int16->bf16 conversion,
+        # resulting in ~1-5 elements out of 83M differing by at most 0.375. Use a
+        # looser tolerance on XPU rather than skipping the test entirely.
+        xpu_atol = 0.5 if torch.xpu.is_available() else 0.1
         check_example(
             "bf16xint16_gemm",
             (x, w),
             reference_bf16xint16_pytorch(x, w, False),
             fn_name="_bf16xint16_gemm",
+            atol=xpu_atol,
         )
 
         x_int16 = torch.randint(
