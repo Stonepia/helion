@@ -1847,6 +1847,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
@@ -1890,6 +1891,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe squeeze-and-excitation backward still fails lowering/runtime")
     @skipIfA10G("failure on a10g")
+    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_db(self):
         m, n, k = 256, 256, 256
