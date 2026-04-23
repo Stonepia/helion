@@ -886,7 +886,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfCute("CuTe jagged dense bmm example still returns incorrect results")
     @xfailIfPallas("tensor-derived if-predicates not supported")
-    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
