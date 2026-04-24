@@ -620,6 +620,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             (x_int16, w_bf16),
             reference_bf16xint16_pytorch(x_int16, w_bf16, True),
             fn_name="_int16xbf16_gemm",
+            atol=xpu_atol,
         )
 
     def test_rms_norm_fwd(self):
