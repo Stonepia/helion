@@ -1,5 +1,5 @@
 ---
-status: executing
+status: needs_review
 current_phase: 1
 current_phase_name: Environment and Baseline
 milestone: v1
@@ -24,9 +24,11 @@ passes on XPU, with no unexplained XPU-only skip.
 
 - Codebase map: complete.
 - Planning contract: approved by the user.
-- Environment setup: pending.
-- Baseline test run: pending.
-- Mandatory next checkpoint: report and discuss the baseline before any fixes.
+- Environment setup: complete; XPU import and matrix-multiplication smoke test passed.
+- Baseline test run: complete; 1,643 passed, 1,295 skipped, 12 failed, 1 worker-crash error.
+- Baseline report: `.planning/phases/01-environment-and-baseline/01-BASELINE-REPORT.md`.
+- Mandatory next checkpoint: user review and category-by-category design discussion before
+  any fixes.
 
 ## Decisions
 
@@ -43,4 +45,5 @@ passes on XPU, with no unexplained XPU-only skip.
 
 ## Next Action
 
-Create `.venv`, install and validate the XPU environment, then run the approved baseline.
+Review the baseline report with the user and agree on the functionality-mode verification
+contract before selecting the first fix category.

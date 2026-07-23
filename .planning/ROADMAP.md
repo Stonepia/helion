@@ -46,7 +46,7 @@ categories reviewable and independently testable.
 
 | Phase | Status | Requirements |
 |-------|--------|--------------|
-| 1. Environment and Baseline | In progress | ENV-01, ENV-02, BASE-01, BASE-02, BASE-03 |
+| 1. Environment and Baseline | Needs user review | ENV-01, ENV-02, BASE-01, BASE-02, BASE-03 |
 | 2. Baseline Review and Fix Design | Pending | DISC-01, DISC-02 |
 | 3. Approved Category Fixes | Pending | FIX-01, FIX-02, FIX-03 |
 | 4. Integration and Personal-Fork Review | Pending | VER-01, VER-02, PUB-01 |
