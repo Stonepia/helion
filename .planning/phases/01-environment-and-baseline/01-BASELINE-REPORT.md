@@ -73,18 +73,24 @@ The exact node IDs are in `xpu-enabling-logs/09-failures.tsv` and the passing co
 small control invocation without the override for tests whose purpose is autotuning or effort
 configuration. This requires user approval as part of the verification contract.
 
-### B. Reproducible XPU correctness failures: 2
+### B. External nightly PyTorch XPU oracle defect: 2
 
 - `test.test_misc.TestMisc::test_torch_topk_in_kernel`
 - `test.test_misc.TestMisc::test_torch_topk_smallest`
 
-Both fail serially with effort `none`. The largest-value case has 3/16 mismatches with
-maximum absolute difference 2.150169; the smallest-value case has 9/16 mismatches with
-maximum absolute difference 0.253067.
+Both fail serially with effort `none`, but follow-up diagnosis proved that the Helion result
+is correct and the reference is wrong. The tests compute their expected values with
+`torch.topk` on XPU. For the same input, Helion and a direct Triton ranking implementation
+match CPU `torch.topk`, while nightly PyTorch XPU `torch.topk` selects incorrect values and
+indices.
 
-**Suspected owner:** Helion lowering/code generation or XPU Triton `topk` semantics.  
-**Recommended next step:** compare eager PyTorch, generated Triton, and a direct Triton
-reproducer before deciding whether the fix belongs in Helion or upstream Triton.
+**Owner:** nightly PyTorch XPU `torch.topk`; this is not a Helion correctness defect.
+**User decision (2026-07-23):** defer these failures. Do not modify Helion, do not modify the
+test oracle, and do not create a fix worktree. Preserve the detailed reproducer as the
+required explanation for the retained external gap.
+
+Evidence is recorded in `xpu-enabling-logs/18-topk-diagnostic.log` through
+`xpu-enabling-logs/21-torch-xpu-vs-cpu-topk.log`.
 
 ### C. XPU RNG worker crash: 1
 
@@ -124,7 +130,8 @@ No item below is approved merely by appearing here.
 1. Agree on the functionality-mode verification contract for the 10 autotuning-sensitive
    tests.
 2. Discuss CUDA assumptions/helpers, likely the safest and most parallelizable category.
-3. Discuss non-RNG stability/timeouts and small correctness groups, starting with `topk`.
+3. Discuss non-RNG stability/timeouts and remaining small correctness groups. The two
+   `topk` oracle failures are excluded by the documented user decision above.
 4. Discuss RNG, tensor descriptors, and autodiff as difficult serial investigations.
 5. Discuss architecture-specific tests individually because parity may require an XPU semantic
    equivalent rather than executing PTX/CUDA artifacts.
