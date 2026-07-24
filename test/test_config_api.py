@@ -24,9 +24,9 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
+from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -427,14 +427,16 @@ class TestSettingsEnv(TestCase):
             ("persistent_blocked", "persistent_interleaved"),
         )
 
-    @skipIfXPU("Uses torch.device('cuda') directly")
     def test_distributed_limits_pid_types_to_persistent(self) -> None:
         settings = helion.Settings()
+        device = (
+            torch.device("xpu", 0) if DEVICE.type == "xpu" else torch.device("cuda", 0)
+        )
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
-            env = CompileEnvironment(torch.device("cuda", 0), settings)
+            env = CompileEnvironment(device, settings)
         self.assertEqual(
             env.config_spec.allowed_pid_types,
             ("persistent_blocked", "persistent_interleaved"),

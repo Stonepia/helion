@@ -13,7 +13,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfXPU
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -98,26 +97,52 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         )
         self.assertExpectedJournal(output)
 
-    @skipIfXPU("CUDA-only")
     def test_cuda_device_properties(self):
-        @helion.kernel
-        def use_device_properties(x: torch.Tensor) -> torch.Tensor:
-            device = x.device
-            props = torch.cuda.get_device_properties(device)
-            sm_count = props.multi_processor_count
+        if DEVICE.type == "xpu":
 
-            n = x.shape[0]
-            out = torch.zeros_like(x)
+            @helion.kernel
+            def use_device_properties(x: torch.Tensor) -> torch.Tensor:
+                device = x.device
+                props = torch.xpu.get_device_properties(device)
+                sm_count = props.gpu_subslice_count
 
-            for worker_id in hl.grid(sm_count):
-                for i in hl.grid(n):
-                    idx = worker_id + i * sm_count
-                    if idx < n:
-                        out[idx] = x[idx]
-            return out
+                n = x.shape[0]
+                out = torch.zeros_like(x)
 
-        x = torch.ones([128], device="cuda")  # @ignore-device-lint
+                for worker_id in hl.grid(sm_count):
+                    for i in hl.grid(n):
+                        idx = worker_id + i * sm_count
+                        if idx < n:
+                            out[idx] = x[idx]
+                return out
+
+        else:
+
+            @helion.kernel
+            def use_device_properties(x: torch.Tensor) -> torch.Tensor:
+                device = x.device
+                props = torch.cuda.get_device_properties(device)
+                sm_count = props.multi_processor_count
+
+                n = x.shape[0]
+                out = torch.zeros_like(x)
+
+                for worker_id in hl.grid(sm_count):
+                    for i in hl.grid(n):
+                        idx = worker_id + i * sm_count
+                        if idx < n:
+                            out[idx] = x[idx]
+                return out
+
+        device = DEVICE if DEVICE.type == "xpu" else torch.device("cuda")
+        x = torch.ones([128], device=device)
         output = type_propagation_report(use_device_properties, x)
+        if DEVICE.type == "xpu":
+            output = (
+                output.replace("torch.xpu", "torch.cuda")
+                .replace("key='xpu'", "key='cuda'")
+                .replace("gpu_subslice_count", "multi_processor_count")
+            )
         self.assertExpectedJournal(output)
 
     def test_symbolic_comparison_preserves_expression(self):
@@ -148,18 +173,31 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         self.assertIn(">= 64", output)
         self.assertNotRegex(output, r"SymBoolType\(Eq\(u\d+, 1\)\)")
 
-    @skipIfXPU("CUDA-only")
     def test_cuda_device_properties_unsupported_attribute(self):
-        @helion.kernel
-        def use_unsupported_property(x: torch.Tensor) -> torch.Tensor:
-            device = x.device
-            props = torch.cuda.get_device_properties(device)
-            for i in hl.grid(x.shape[0]):
-                unsupported = props.total_memory  # attribute not supported yet
-                x[i] = unsupported
-            return x
+        if DEVICE.type == "xpu":
 
-        x = torch.ones([16], device="cuda")  # @ignore-device-lint
+            @helion.kernel
+            def use_unsupported_property(x: torch.Tensor) -> torch.Tensor:
+                device = x.device
+                props = torch.xpu.get_device_properties(device)
+                for i in hl.grid(x.shape[0]):
+                    unsupported = props.total_memory  # attribute not supported yet
+                    x[i] = unsupported
+                return x
+
+        else:
+
+            @helion.kernel
+            def use_unsupported_property(x: torch.Tensor) -> torch.Tensor:
+                device = x.device
+                props = torch.cuda.get_device_properties(device)
+                for i in hl.grid(x.shape[0]):
+                    unsupported = props.total_memory  # attribute not supported yet
+                    x[i] = unsupported
+                return x
+
+        device = DEVICE if DEVICE.type == "xpu" else torch.device("cuda")
+        x = torch.ones([16], device=device)
         with self.assertRaisesRegex(
             exc.TypeInferenceError,
             r"Attribute 'total_memory' is not supported on .*test_type_propagation.py",
@@ -185,7 +223,6 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         output = type_propagation_report(kernel, x)
         self.assertExpectedJournal(output)
 
-    @skipIfXPU("CUDA-only")
     def test_list_iteration(self):
         @helion.kernel()
         def kernel_list_iteration(

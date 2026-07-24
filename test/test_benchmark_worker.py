@@ -27,7 +27,6 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfXPU
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
@@ -532,9 +531,11 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
 # Triton backend supports it (Pallas/CuTe return False).
 @onlyBackends(["triton"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_with_subprocess_bench(self) -> None:
-        if not torch.cuda.is_available():
+        if DEVICE.type == "xpu":
+            if not torch.xpu.is_available():
+                self.skipTest("requires XPU")
+        elif not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
         examples_dir = Path(__file__).parent.parent / "examples"
@@ -552,12 +553,14 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         random.seed(123)
         RandomSearch(bound_kernel, args, 20).autotune()
 
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
         # autotune must still pick a best config from the rest.
-        if not torch.cuda.is_available():
+        if DEVICE.type == "xpu":
+            if not torch.xpu.is_available():
+                self.skipTest("requires XPU")
+        elif not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
         original = LocalBenchmarkProvider._benchmark_function_subprocess
@@ -598,13 +601,15 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         self.assertGreaterEqual(call_count[0], 6)
         self.assertGreaterEqual(call_count[1], 2)
 
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
         # A config can pass the timed run and then crash in the accuracy
         # check. Patches the accuracy job to raise a sticky CUDA error for a
         # fraction of configs; the worker dies and respawns, and autotune must
         # still pick a best config from the rest instead of aborting.
-        if not torch.cuda.is_available():
+        if DEVICE.type == "xpu":
+            if not torch.xpu.is_available():
+                self.skipTest("requires XPU")
+        elif not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
         original = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
