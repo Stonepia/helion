@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
+import functools
 import logging
 import math
 import multiprocessing as mp
@@ -42,7 +43,6 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
@@ -88,6 +88,7 @@ _HOPPER_HARDWARE = HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm90",
 )
+_HOPPER_REGS_PER_BLOCK = 65536
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
@@ -129,6 +130,40 @@ def without_env_var(name: str):
     finally:
         if previous is not sentinel:
             os.environ[name] = previous
+
+
+def _cuda_maxnreg_snapshot(
+    test_item: Callable[..., object],
+) -> Callable[..., object]:
+    """Supply CUDA policy inputs only when a snapshot runs on XPU."""
+
+    @functools.wraps(test_item)
+    def wrapper(*args: object, **kwargs: object) -> object:
+        if DEVICE.type != "xpu":
+            return test_item(*args, **kwargs)
+
+        with (
+            patch.object(_compat, "_supports_maxnreg", lambda: True),
+            patch(
+                "helion.autotuner.config_spec._regs_per_block",
+                lambda: _HOPPER_REGS_PER_BLOCK,
+            ),
+            patch(
+                "helion.autotuner.config_spec.warps_to_threads",
+                lambda num_warps: num_warps * 32,
+            ),
+            patch(
+                "helion.autotuner.config_generation.warps_to_threads",
+                lambda num_warps: num_warps * 32,
+            ),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=_HOPPER_HARDWARE,
+            ),
+        ):
+            return test_item(*args, **kwargs)
+
+    return wrapper
 
 
 class RecordingRandomSearch(RandomSearch):
@@ -813,7 +848,6 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
 
     @skipIfRefEager("Autotuning not supported in ref eager mode")
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_log_started_completed(self):
         """Test started/completion logging with all autotuning algorithms."""
         configs = [
@@ -844,7 +878,6 @@ class TestAutotuneIgnoreErrors(TestCase):
                 self._run_autotuner_and_check_logging(factory)
 
     @skipIfRefEager("Autotuning not supported in ref eager mode")
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_skips_restricted_search(self):
         """A run restricted to user-pinned configs (``configs=[...]`` without
         ``force_autotune``) is a biased slice excluded from the dataset: even
@@ -900,7 +933,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("config space differs on ROCm")
-    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @_cuda_maxnreg_snapshot
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -921,7 +954,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("torch.version.xpu", None)
     @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
-    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @_cuda_maxnreg_snapshot
     def test_config_fragment1(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -943,7 +976,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
-    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @_cuda_maxnreg_snapshot
     def test_config_warp_specialize_unroll(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -960,8 +993,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("config space differs on ROCm")
-    @skipIfXPU("maxnreg uses CUDA-specific register query")
     @skipIfTileIR("block-size overshoot is gated to the triton backend")
+    @_cuda_maxnreg_snapshot
     def test_small_dim_block_size_overshoot(self):
         # All dims are 16, smaller than SMALL_DIM_BLOCK_SIZE_OVERSHOOT, so the
         # generated configs may use block sizes larger than the dimensions
@@ -1148,7 +1181,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # should allow autotuning to succeed.
         torch.testing.assert_close(add(*args), sum(args))
 
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -3297,11 +3329,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
-    @skipIfXPU("CUDA specific API used to check memory usage")
     def test_chunked_allclose_memory(self):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
         import helion.autotuner.accuracy as _accuracy
 
+        memory = torch.xpu if DEVICE.type == "xpu" else torch.cuda
         numel = 2**26  # 64M float32 elements (~256 MB each)
 
         config1 = helion.Config(block_sizes=[128], num_warps=4)
@@ -3327,11 +3359,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # on tensors of the same size
         ref_a = torch.randn(numel, device=DEVICE)
         ref_b = ref_a.clone()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        base_mem = torch.cuda.memory_allocated()
+        memory.empty_cache()
+        memory.reset_peak_memory_stats()
+        base_mem = memory.memory_allocated()
         torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
-        naive_peak = torch.cuda.max_memory_allocated() - base_mem
+        naive_peak = memory.max_memory_allocated() - base_mem
         del ref_a, ref_b
 
         # Patch the moved chunked helper to record peak memory delta per call.
@@ -3339,10 +3371,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         peaks: list[int] = []
 
         def measuring_chunked_assert_close(*args, **kwargs):
-            torch.cuda.reset_peak_memory_stats()
-            before = torch.cuda.memory_allocated()
+            memory.reset_peak_memory_stats()
+            before = memory.memory_allocated()
             real_chunked_assert_close(*args, **kwargs)
-            peak = torch.cuda.max_memory_allocated() - before
+            peak = memory.max_memory_allocated() - before
             peaks.append(peak)
 
         with patch.object(
@@ -5015,9 +5047,11 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
             search_capture["search"] = search
             return search
 
-        kernel_settings = {
+        kernel_settings: dict[str, object] = {
             "autotuner_fn": autotuner_factory,
         }
+        if DEVICE.type == "xpu":
+            kernel_settings["autotune_effort"] = "quick"
         kernel_settings.update(settings)
 
         @helion.kernel(**kernel_settings)
@@ -5041,7 +5075,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         )
         return search.samples[0]
 
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
@@ -5065,7 +5098,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
             second = self._autotune_and_record()
         self.assertNotEqual(first, second)
 
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)

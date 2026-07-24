@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 import unittest
 
 import torch
@@ -11,18 +12,18 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
+if TYPE_CHECKING:
+    from helion.autotuner.config_spec import ConfigSpec
 
-def _supports_epilogue_subtile_autotune() -> bool:
-    return supports_tensor_descriptor() and torch.cuda.get_device_capability() >= (
-        10,
-        0,
-    )
+
+def _supports_epilogue_subtile_autotune(config_spec: ConfigSpec) -> bool:
+    arch = config_spec.target_device_capability
+    return arch is not None and arch >= (10, 0) and supports_tensor_descriptor()
 
 
 def _assert_split_codegen(test_case: TestCase, code: str, store_count: int) -> None:
@@ -405,15 +406,15 @@ class TestEpilogueSubtiling(TestCase):
         self.assertNotIn("tl.split", code)
         self.assertEqual(code.count("tl.atomic_add("), 1)
 
-    @skipIfXPU("epilogue_subtile_autotune check uses CUDA device properties")
     def test_autotune_field_enabled_for_large_k(self):
         args = (
             torch.randn([128, 1024], device=DEVICE, dtype=torch.float32),
             torch.randn([1024, 128], device=DEVICE, dtype=torch.float32),
             torch.randn([128], device=DEVICE, dtype=torch.float32),
         )
-        fields = matmul_with_bias.bind(args).config_spec._flat_fields()
-        if _supports_epilogue_subtile_autotune():
+        config_spec = matmul_with_bias.bind(args).config_spec
+        fields = config_spec._flat_fields()
+        if _supports_epilogue_subtile_autotune(config_spec):
             self.assertIn("epilogue_subtile", fields)
             fragment = fields["epilogue_subtile"]
             assert isinstance(fragment, EnumFragment)
@@ -430,23 +431,24 @@ class TestEpilogueSubtiling(TestCase):
         fields = matmul_with_bias.bind(args).config_spec._flat_fields()
         self.assertNotIn("epilogue_subtile", fields)
 
-    @skipIfXPU("uses torch.cuda.get_device_capability() - Blackwell is CUDA-specific")
     def test_autotune_field_large_k_allows_s4_on_blackwell(self):
         args = (
             torch.randn([128, 16384], device=DEVICE, dtype=torch.float32),
             torch.randn([16384, 128], device=DEVICE, dtype=torch.float32),
             torch.randn([128], device=DEVICE, dtype=torch.float32),
         )
-        fields = matmul_with_bias.bind(args).config_spec._flat_fields()
-        if not _supports_epilogue_subtile_autotune():
+        config_spec = matmul_with_bias.bind(args).config_spec
+        fields = config_spec._flat_fields()
+        if not _supports_epilogue_subtile_autotune(config_spec):
             self.assertNotIn("epilogue_subtile", fields)
             return
 
         self.assertIn("epilogue_subtile", fields)
         fragment = fields["epilogue_subtile"]
         assert isinstance(fragment, EnumFragment)
+        arch = config_spec.target_device_capability
         expected_choices = (
-            (None, 2, 4) if torch.cuda.get_device_capability() >= (10, 0) else (None, 2)
+            (None, 2, 4) if arch is not None and arch >= (10, 0) else (None, 2)
         )
         self.assertEqual(fragment.choices, expected_choices)
 

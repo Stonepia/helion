@@ -27,7 +27,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfXPU
+from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
@@ -528,13 +528,27 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(search.best_perf_so_far, 0.50)
 
 
+class _SingleConfigSearch(BaseSearch):
+    """Exercise the full autotune lifecycle with one benchmarked config."""
+
+    def _autotune(self) -> Config:
+        config = self.config_spec.default_config()
+        result = self.benchmark(config)
+        assert math.isfinite(result.perf), (
+            "single-config subprocess benchmark was not finite"
+        )
+        return config
+
+
 # Subprocess benchmarking depends on Backend.supports_precompile(); only the
 # Triton backend supports it (Pallas/CuTe return False).
 @onlyBackends(["triton"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_with_subprocess_bench(self) -> None:
-        if not torch.cuda.is_available():
+        if DEVICE.type == "xpu":
+            if not torch.xpu.is_available():
+                self.skipTest("requires XPU")
+        elif not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
         examples_dir = Path(__file__).parent.parent / "examples"
@@ -550,14 +564,20 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_precompile = None
 
         random.seed(123)
-        RandomSearch(bound_kernel, args, 20).autotune()
+        if DEVICE.type == "xpu":
+            _SingleConfigSearch(bound_kernel, args).autotune()
+        else:
+            # Preserve the original 20-config CUDA stress test.
+            RandomSearch(bound_kernel, args, 20).autotune()
 
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
         # autotune must still pick a best config from the rest.
-        if not torch.cuda.is_available():
+        if DEVICE.type == "xpu":
+            if not torch.xpu.is_available():
+                self.skipTest("requires XPU")
+        elif not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
         original = LocalBenchmarkProvider._benchmark_function_subprocess
@@ -588,23 +608,28 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_precompile = None
 
         random.seed(123)
+        # Four configs exercise one injected failure on XPU; retain the full
+        # 20-config CUDA stress case and its stronger call-count assertions.
+        search_count = 4 if DEVICE.type == "xpu" else 20
         with patch.object(
             LocalBenchmarkProvider,
             "_benchmark_function_subprocess",
             maybe_fail,
         ):
-            RandomSearch(bound_kernel, args, 20).autotune()
+            RandomSearch(bound_kernel, args, search_count).autotune()
 
-        self.assertGreaterEqual(call_count[0], 6)
-        self.assertGreaterEqual(call_count[1], 2)
+        self.assertGreaterEqual(call_count[0], 3 if DEVICE.type == "xpu" else 6)
+        self.assertGreaterEqual(call_count[1], 1 if DEVICE.type == "xpu" else 2)
 
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
         # A config can pass the timed run and then crash in the accuracy
         # check. Patches the accuracy job to raise a sticky CUDA error for a
         # fraction of configs; the worker dies and respawns, and autotune must
         # still pick a best config from the rest instead of aborting.
-        if not torch.cuda.is_available():
+        if DEVICE.type == "xpu":
+            if not torch.xpu.is_available():
+                self.skipTest("requires XPU")
+        elif not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
         original = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
@@ -641,16 +666,19 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         bound_kernel.settings.autotune_precompile = None
 
         random.seed(123)
+        # Four configs exercise one worker crash/respawn on XPU; retain the
+        # full 20-config CUDA stress case and stronger count assertions.
+        search_count = 4 if DEVICE.type == "xpu" else 20
         with patch.object(
             LocalBenchmarkProvider,
             "_run_subprocess_accuracy_check_job",
             maybe_crash,
         ):
-            best = RandomSearch(bound_kernel, args, 20).autotune()
+            best = RandomSearch(bound_kernel, args, search_count).autotune()
 
         self.assertIsNotNone(best)
-        self.assertGreaterEqual(call_count[0], 6)
-        self.assertGreaterEqual(call_count[1], 2)
+        self.assertGreaterEqual(call_count[0], 3 if DEVICE.type == "xpu" else 6)
+        self.assertGreaterEqual(call_count[1], 1 if DEVICE.type == "xpu" else 2)
 
 
 if __name__ == "__main__":
