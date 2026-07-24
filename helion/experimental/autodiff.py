@@ -1060,6 +1060,22 @@ class GraphAnalyzer:
                 xs_nodes.append(mask2d)
                 scan_mask_present = True
 
+        device_sources = [
+            *(load.args[0] for load, *_ in (*tiled_loads, *bcast_loads)),
+            *(arg for arg in outer_args if isinstance(arg, Node)),
+            *(store.args[0] for store, *_ in stores),
+        ]
+        scan_device = next(
+            (
+                fake.device
+                for source in device_sources
+                if isinstance((fake := source.meta.get("val")), torch.Tensor)
+            ),
+            None,
+        )
+        if scan_device is None:
+            raise exc.AutodiffNotSupported("cannot determine scan loop device")
+
         combine_gm = self._build_combine_fn(
             sub_info,
             outer_args,
@@ -1068,6 +1084,7 @@ class GraphAnalyzer:
             tiled_loads,
             bcast_loads,
             stores,
+            scan_device,
             scan_mask_present,
         )
 
@@ -1075,16 +1092,10 @@ class GraphAnalyzer:
         if not init_nodes:
             anchor = xs_nodes[0] if xs_nodes else (add_nodes[0] if add_nodes else None)
             assert anchor is not None
-            anchor_fake = anchor.meta.get("val")
-            device = (
-                anchor_fake.device
-                if isinstance(anchor_fake, torch.Tensor)
-                else torch.device("cuda")
-            )
             unit = compute_graph.call_function(
                 torch.ops.aten.zeros.default,
                 ([],),
-                {"dtype": torch.float32, "device": device},
+                {"dtype": torch.float32, "device": scan_device},
             )
             init_nodes = [unit]
             combine_gm = self._wrap_combine_fn_for_unit_carry(combine_gm)
@@ -1588,6 +1599,7 @@ class GraphAnalyzer:
         tiled_loads: list,
         bcast_loads: list,
         stores: list,
+        scan_device: torch.device,
         scan_mask_present: bool = False,
     ) -> torch.fx.GraphModule:
         """Build a fresh FX `GraphModule` that's the combine_fn body for
@@ -1737,19 +1749,10 @@ class GraphAnalyzer:
         # empty (no stores, or xs not needed for recomputation), the backward
         # scan_op call does bw_xs[0].shape[0] to get scan_length and raises
         # IndexError.  The dummy ensures bw_xs is non-empty.
-        dummy_device: object = torch.device("cuda")
-        if carry_phs_in_cg:
-            anchor_fake = carry_phs_in_cg[0].meta.get("val")
-            if isinstance(anchor_fake, torch.Tensor):
-                dummy_device = anchor_fake.device
-        elif xs_placeholders:
-            anchor_fake = xs_placeholders[0].meta.get("val")
-            if isinstance(anchor_fake, torch.Tensor):
-                dummy_device = anchor_fake.device
         dummy_ys = cg.call_function(
             torch.ops.aten.zeros.default,
             ([1],),
-            {"dtype": torch.float32, "device": dummy_device},  # pyrefly: ignore [bad-argument-type]
+            {"dtype": torch.float32, "device": scan_device},
         )
         cg.output(tuple([*new_carry, dummy_ys, *ys]))
         return torch.fx.GraphModule({}, cg)
