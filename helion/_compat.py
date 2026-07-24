@@ -258,7 +258,7 @@ if triton_is_available():
             # pyrefly: ignore [missing-import]
             from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
 
-            device_properties = torch.xpu.get_device_properties()
+            device_properties = torch.xpu.get_device_properties(device)
             gpu_target_info = {
                 k: getattr(device_properties, k)
                 for k in device_properties.__dir__()

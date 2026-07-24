@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from helion._compat import extract_device
 from helion.autotuner.base_search import _AutotunableKernel
 from helion.autotuner.config_spec import ConfigSpec
 from helion.runtime.config import Config
@@ -102,17 +103,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         self._compile_fn = compile_fn
         self._compile_cache: dict[Config, Callable[..., Any]] = {}
 
-        self._env = _FakeEnv(
-            device
-            or next(
-                (
-                    arg.device
-                    for arg in args
-                    if isinstance(arg, torch.Tensor) and arg.is_cuda
-                ),
-                torch.device("cuda"),
-            )
-        )
+        self._env = _FakeEnv(device or extract_device(args) or torch.device("cuda"))
         self._settings = Settings(**settings_kwargs)
         if baseline_fn is not None:
             self._settings.autotune_baseline_fn = baseline_fn
@@ -259,7 +250,7 @@ def autotune(
         algorithm: Name of the search algorithm.  One of ``"PatternSearch"``,
             ``"LFBOPatternSearch"``, ``"DifferentialEvolutionSearch"``,
             ``"DESurrogateHybrid"``, ``"RandomSearch"``, ``"FiniteSearch"``.
-        device: CUDA device.  Auto-detected from *args* if not given.
+        device: Accelerator device.  Auto-detected from *args* if not given.
         **kwargs: Split automatically -- keys in ``SETTINGS_KWARGS`` go to
             ``Settings`` (e.g. ``autotune_accuracy_check``), everything else
             goes to the search algorithm constructor (e.g.
