@@ -2209,7 +2209,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
-    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
@@ -2219,7 +2218,11 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
+        config = helion.Config(
+            block_size=[16, 16, 16, 16],
+            num_warps=2 if DEVICE.type == "xpu" else 4,
+            num_stages=3,
+        )
         configured_kernel = helion.kernel(
             squeeze_and_excitation_net_fwd.fn, config=config
         )
@@ -2254,7 +2257,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
-    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -2263,7 +2265,11 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
+        config = helion.Config(
+            block_size=[16, 16, 16, 16],
+            num_warps=2 if DEVICE.type == "xpu" else 4,
+            num_stages=3,
+        )
         configured_kernel = helion.kernel(
             squeeze_and_excitation_net_fwd.fn, config=config
         )
@@ -2297,7 +2303,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
-    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_db(self):
         torch.manual_seed(0)
         m, n, k = 256, 256, 256
@@ -2308,7 +2313,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         # Create configured kernel with explicit config
         from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
+        config = helion.Config(
+            block_size=[16, 16, 16, 16],
+            num_warps=2 if DEVICE.type == "xpu" else 4,
+            num_stages=3,
+        )
         configured_kernel = helion.kernel(
             squeeze_and_excitation_net_fwd.fn, config=config
         )
