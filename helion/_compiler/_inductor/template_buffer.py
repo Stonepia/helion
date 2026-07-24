@@ -13,6 +13,7 @@ import torch
 from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import ExactWeakKeyDictionary
 from torch._inductor.codecache import PyCodeCache
+from torch._inductor.codegen.triton import IndexingOptions
 from torch._inductor.ir import Buffer
 from torch._inductor.ir import FinalizeCodegenResult
 from torch._inductor.ir import IRNode
@@ -84,6 +85,24 @@ class _FusionMetadata:
     prologue_vars: dict[str, dict[str, str]]
     prologue_fused_params: set[str]
     prologue_has_source: set[str]
+
+
+class _HelionExternalTritonTemplateKernel(ExternalTritonTemplateKernel):
+    """External template kernel that preserves epilogue block-shape metadata."""
+
+    def indexing(self, index: sympy.Expr, **kwargs: Any) -> Any:  # noqa: ANN401
+        options = super().indexing(index, **kwargs)
+        template_out_shape = self.template_out_shape
+        if (
+            isinstance(options, IndexingOptions)
+            and options.expand_shape is None
+            and isinstance(template_out_shape, str)
+        ):
+            options = dataclasses.replace(
+                options,
+                expand_shape=tuple(self.cse.varname_map[template_out_shape].shape),
+            )
+        return options
 
 
 class _FusionAutotuneAdapter:
@@ -169,7 +188,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         def _make_kernel_render(
             out_node: TemplateBuffer, hint_override: object = None
         ) -> tuple[object, Callable[[], PartialRender]]:
-            kernel = ExternalTritonTemplateKernel(out_node)
+            kernel = _HelionExternalTritonTemplateKernel(out_node)
 
             def render() -> PartialRender:
                 return tb_self._render_with_hooks(kernel)

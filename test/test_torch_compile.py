@@ -4424,6 +4424,32 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_device_only_template_scalar_epilogue_shape(self):
+        """Scalar epilogues preserve block shape without tensor arguments."""
+
+        @helion.kernel(autotune_effort="none", torch_compile_fusion=True)
+        def device_only_kernel(target: torch.device) -> torch.Tensor:
+            out = torch.empty([16], dtype=torch.float32, device=target)
+            for tile in hl.tile(out.size()):
+                out[tile] = 3.0
+            return out
+
+        def add_scalar(x: torch.Tensor) -> torch.Tensor:
+            return device_only_kernel(x.device) + x[0] * 0
+
+        def multiply_scalar(x: torch.Tensor) -> torch.Tensor:
+            return device_only_kernel(x.device) * (x[0] * 0 + 1)
+
+        x = torch.ones(1, device=DEVICE)
+        expected = torch.full((16,), 3.0, device=DEVICE)
+        for name, fn in (("add", add_scalar), ("multiply", multiply_scalar)):
+            with self.subTest(name):
+                torch._dynamo.reset()
+                actual = torch.compile(fn, fullgraph=True, backend="inductor")(x)
+                torch.testing.assert_close(actual, expected)
+
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_self_read(self, allow_torch_compile_fusion):
