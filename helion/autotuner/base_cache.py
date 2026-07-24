@@ -320,7 +320,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         return config
 
     def _release_trial_state(self) -> None:
-        """Reclaim CUDA allocator state between best-of-K trials.
+        """Reclaim accelerator state between best-of-K trials.
 
         ``LocalBenchmarkProvider.cleanup`` (called from
         ``BaseSearch.autotune``'s exit stack and from
@@ -328,21 +328,21 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         reference cycle and drops the baseline tensors, so refcounting
         can free the provider's GPU memory deterministically. This
         helper then runs a Python ``gc.collect`` pass to catch any other
-        cycles, plus ``torch.cuda.empty_cache`` so the caching allocator
+        cycles, plus an accelerator cache clear so the caching allocator
         returns the freed blocks to the driver pool before the next
         trial / the post-autotune steady-state measurement allocates.
         """
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        if torch.accelerator.is_available():
+            torch.accelerator.synchronize()
+            torch.accelerator.memory.empty_cache()
 
     def _run_one_trial(self, i: int, k: int, trial_seed: int) -> tuple[Config, float]:
         """Construct a fresh trial autotuner, run it, return its results.
 
         The trial autotuner is scoped to this helper's local frame so it
         becomes unreachable as soon as we return. The caller then runs
-        ``_release_trial_state`` to release the provider's CUDA memory
+        ``_release_trial_state`` to release the provider's accelerator memory
         before the next trial / rebench / ``_bench_steady`` step.
         Returns ``(trial_config, trial_low_water_perf)``; any exception
         from the inner ``autotune()`` propagates to the caller (whose
@@ -386,8 +386,8 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         After each trial and after the final rebench round, the trial's
         local autotuner is dropped and ``_release_trial_state`` runs a
-        Python GC pass + ``torch.cuda.empty_cache`` to return the
-        provider's freed CUDA blocks to the driver pool before the next
+        Python GC pass + accelerator cache clear to return the provider's
+        freed blocks to the driver pool before the next
         allocation wave (the next trial or the post-autotune
         ``_bench_steady`` measurement). Without this, the caching
         allocator stays fragmented across the autotune and the
@@ -440,7 +440,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
                     # exit stack) breaks the search-provider-budget-hook
                     # cycle and drops the baseline tensors;
                     # ``_release_trial_state`` then returns the freed
-                    # CUDA blocks to the driver pool before the next
+                    # accelerator blocks to the driver pool before the next
                     # trial / the post-autotune ``_bench_steady`` runs.
                     self.autotuner = original_autotuner
                     self._release_trial_state()
@@ -483,7 +483,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         The rebench autotuner is scoped to a private helper so it becomes
         unreachable as soon as we return; ``_release_trial_state`` then
-        releases CUDA memory before the caller proceeds to the
+        releases accelerator memory before the caller proceeds to the
         post-autotune ``_bench_steady`` measurement.
         """
         perfs = self._run_rebench_round(configs)
@@ -495,7 +495,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
 
         Scoped to its own frame so the rebench autotuner becomes
         unreachable when this returns and the caller's
-        ``_release_trial_state`` pass can return its CUDA blocks to the
+        ``_release_trial_state`` pass can return its accelerator blocks to the
         driver pool. Note that ``benchmark_provider.cleanup`` (called in
         the ``finally`` below) is what actually drops the provider's
         baseline tensors and breaks the search-provider-budget-hook
