@@ -75,7 +75,6 @@ class HardwareInfo:
             return [self.compute_capability, *arch_list]
 
 
-@functools.cache
 def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     """
     Get hardware information for the current or specified device.
@@ -88,6 +87,11 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     """
     if device is None and not torch.cuda.is_available() and torch.xpu.is_available():
         device = torch.device("xpu", torch.xpu.current_device())
+    return _get_hardware_info_cached(device)
+
+
+@functools.cache
+def _get_hardware_info_cached(device: torch.device | None) -> HardwareInfo:
 
     # XPU (Intel) path
     if (
@@ -146,3 +150,8 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     raise RuntimeError(
         "No supported GPU or TPU device found. Helion requires CUDA, ROCm, XPU, or TPU."
     )
+
+
+get_hardware_info.cache_clear = (  # pyrefly: ignore[missing-attribute]
+    _get_hardware_info_cached.cache_clear
+)

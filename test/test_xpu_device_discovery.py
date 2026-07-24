@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
@@ -36,6 +37,33 @@ def test_implicit_hardware_discovery_falls_back_to_current_xpu() -> None:
     assert info.device_kind == "xpu"
     assert info.hardware_name == props.name
     get_props.assert_called_once_with(torch.device("xpu", 2))
+
+
+def test_implicit_hardware_discovery_tracks_current_xpu() -> None:
+    props = [
+        SimpleNamespace(name="Intel Test XPU 0", driver_version="1.0"),
+        SimpleNamespace(name="Intel Test XPU 1", driver_version="1.1"),
+    ]
+    with (
+        patch.object(torch.cuda, "is_available", return_value=False),
+        patch.object(torch.xpu, "is_available", return_value=True),
+        patch.object(torch.xpu, "current_device", side_effect=(0, 1)),
+        patch.object(
+            torch.xpu, "get_device_properties", side_effect=props
+        ) as get_props,
+    ):
+        get_hardware_info.cache_clear()
+        first = get_hardware_info()
+        second = get_hardware_info()
+
+    get_hardware_info.cache_clear()
+    assert first is not second
+    assert first.hardware_name == props[0].name
+    assert second.hardware_name == props[1].name
+    assert get_props.call_args_list == [
+        call(torch.device("xpu", 0)),
+        call(torch.device("xpu", 1)),
+    ]
 
 
 def test_implicit_hardware_discovery_preserves_cuda_priority() -> None:
@@ -75,6 +103,16 @@ def test_external_adapter_detects_xpu_tensor_device() -> None:
         device=torch.device("cpu"),
     )
     assert explicit.env.device == torch.device("cpu")
+
+
+def test_external_adapter_detects_bare_device_argument() -> None:
+    target = torch.device("xpu", 3)
+    adapter = _ExternalKernelAdapter(
+        create_user_config_spec({}),
+        lambda config: lambda device: device,
+        (target,),
+    )
+    assert adapter.env.device == target
 
 
 def test_min_dot_size_queries_requested_xpu() -> None:

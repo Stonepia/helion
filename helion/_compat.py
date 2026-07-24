@@ -712,10 +712,18 @@ def supports_torch_compile_fusion() -> bool:
 
 
 def extract_device(args: Sequence[object]) -> torch.device | None:
-    """Return the first torch.device found in *args*."""
+    """Return the first tensor or explicit device found in *args*."""
     for arg in args:
+        if isinstance(arg, torch.device):
+            return arg
         if isinstance(arg, torch.Tensor):
             return arg.device
-        if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
-            return arg[0].device
+        if isinstance(arg, (tuple, list)):
+            device = extract_device(arg)
+        elif isinstance(arg, dict):
+            device = extract_device(tuple(arg.values()))
+        else:
+            continue
+        if device is not None:
+            return device
     return None
