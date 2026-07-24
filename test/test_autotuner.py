@@ -5050,8 +5050,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         kernel_settings: dict[str, object] = {
             "autotuner_fn": autotuner_factory,
         }
-        if DEVICE.type == "xpu":
-            kernel_settings["autotune_effort"] = "quick"
         kernel_settings.update(settings)
 
         @helion.kernel(**kernel_settings)
