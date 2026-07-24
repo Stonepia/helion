@@ -245,7 +245,11 @@ if triton_is_available():
     def _min_dot_size(
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
+        # Helion's Pallas backend always targets TPU's Mosaic MXU, even in
+        # interpret mode where the actual device is "cpu".
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
             # TPU Mosaic MXU tile: (8, 128) sublane × lane.
             # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
             return (8, 128, 128)
@@ -328,7 +332,9 @@ else:
     def _min_dot_size(  # type: ignore[misc]
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type == "tpu":
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
             return (8, 128, 128)
         return (16, 16, 16)
 
@@ -339,6 +345,30 @@ else:
 def supports_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_tensor_descriptor()
+
+
+def target_device_capability(
+    device: torch.device | None = None,
+) -> tuple[int, int] | None:
+    """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
+    if device is not None and device.type != "cuda":
+        return None
+    if device is not None and device.index is not None:
+        return _target_device_capability(device.index)
+    if not torch.cuda.is_available():
+        return None
+    # device=None means the current device; resolve it per call so a later
+    # set_device is not frozen under one cache key.
+    return _target_device_capability(torch.cuda.current_device())
+
+
+@functools.cache
+def _target_device_capability(index: int) -> tuple[int, int] | None:
+    # Memoize per index (capability is fixed per device). Tests patch the
+    # public wrapper above, mirroring is_hip / _is_hip.
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(index)
 
 
 def min_dot_size(
@@ -445,6 +475,64 @@ def supports_amd_cdna_tunables() -> bool:
         return False
 
 
+# CUs per XCD by base CDNA architecture.  Used to derive the live,
+# partition-visible XCD count from the observed CU count (see get_num_xcd).
+_CUS_PER_XCD: dict[str, int] = {
+    "gfx942": 38,  # CDNA3 (MI300)
+    "gfx950": 32,  # CDNA4 (MI350)
+    "gfx951": 32,  # CDNA4 (MI355)
+}
+
+
+def get_num_xcd(device: torch.device | int | None = None) -> int:
+    """Number of XCDs visible for ``device`` on AMD CDNA, else ``1``.
+
+    Derived from the live, partition-visible compute-unit count rather than the
+    architecture name, so MI300A (6 XCDs) and compute-partition modes such as CPX
+    (which expose a single XCD) are handled correctly.  Returns ``1`` -- which
+    disables xcd_remap -- for unknown architectures or a CU count that does not
+    look like an integer number of XCDs.
+    """
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        props = torch.cuda.get_device_properties(
+            device if device is not None else torch.cuda.current_device()
+        )
+    except Exception:
+        return 1
+    arch = getattr(props, "gcnArchName", None)
+    if not arch:
+        return 1
+    cus_per_xcd = _CUS_PER_XCD.get(arch.split(":")[0])
+    if cus_per_xcd is None:
+        return 1
+    cu_count = props.multi_processor_count
+    num_xcd = round(cu_count / cus_per_xcd)
+    # Tolerate harvested parts, but bail out (return 1) if the live CU count does
+    # not look like an integer number of XCDs.
+    if num_xcd < 1 or abs(num_xcd * cus_per_xcd - cu_count) > cus_per_xcd // 4:
+        return 1
+    return num_xcd
+
+
+def device_num_sm(device: torch.device | int | None = None) -> int:
+    """SM/CU count for ``device`` (or the current device), or 1 if unavailable.
+
+    Used as the default for ``ConfigSpec.num_sm`` so direct ConfigSpec
+    constructions derive a value consistent with ``get_num_xcd`` instead of
+    assuming 1.  The real compile path passes the reserved-adjusted count.
+    """
+    if not torch.cuda.is_available():
+        return 1
+    try:
+        return torch.cuda.get_device_properties(
+            device if device is not None else torch.cuda.current_device()
+        ).multi_processor_count
+    except Exception:
+        return 1
+
+
 def supports_mtia_tunables() -> bool:
     """Check if running on MTIA hardware.
 
@@ -535,6 +623,30 @@ def _supports_maxnreg() -> bool:
     )
 
 
+def fp8_block_ptr_padding_broken() -> bool:
+    # call private func we can patch in testing
+    return _fp8_block_ptr_padding_broken()
+
+
+@functools.cache
+def _fp8_block_ptr_padding_broken() -> bool:
+    """Whether a block-pointer ``tl.load`` with ``padding_option='zero'`` fails to
+    compile for FP8 tensors.
+
+    Regression from triton-lang/triton#9668 ("Rewrite block pointer to be
+    python-only"), tracked in triton-lang/triton#10751: the python lowering emits
+    an ``int`` zero for ``other``, which Triton cannot cast to FP8. Present in the
+    triton 3.8 series; gated by version so the workaround drops automatically once
+    a fix ships in a later release. See ``BlockPtrIndexingStrategy.codegen_load``.
+    """
+    if not triton_is_available():
+        return False
+    import triton
+
+    triton_version = version.parse(triton.__version__)
+    return version.parse("3.8.0") <= triton_version < version.parse("3.9.0")
+
+
 @functools.cache
 def _regs_per_block() -> int:
     """Max 32-bit registers per block on the current CUDA device."""
@@ -561,8 +673,27 @@ def requires_torch_version(min_version: str) -> bool:
 
 
 @functools.cache
+def requires_cuda_version(min_version: str) -> bool:
+    """Check if PyTorch's CUDA runtime version meets the minimum requirement.
+
+    Args:
+        min_version: Minimum required CUDA version (e.g., "13").
+
+    Returns:
+        True if ``torch.version.cuda`` is set and >= ``min_version``.
+        False if PyTorch was not built with CUDA support.
+    """
+    cuda_version = torch.version.cuda
+    if cuda_version is None:
+        return False
+    return version.parse(cuda_version) >= version.parse(min_version)
+
+
+@functools.cache
 def supports_torch_compile_fusion() -> bool:
-    """Check whether this PyTorch build exposes Helion's fusion entrypoint."""
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+    if torch.xpu.is_available():
+        return False
     if not requires_torch_version("2.11"):
         return False
     try:
@@ -574,6 +705,7 @@ def supports_torch_compile_fusion() -> bool:
         init_names = TemplateBuffer.__init__.__code__.co_names
         assert "allow_prologue_fusion" in init_names
         assert "allow_epilogue_fusion" in init_names
+        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
     except (ImportError, AttributeError, AssertionError):
         return False
     return True

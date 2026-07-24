@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
+    from .layout import SymIntLike
 
 log = logging.getLogger(__name__)
 
@@ -70,13 +71,12 @@ def plan_layouts(
     for graph_info in graphs:
         _seed_constraints(graph_info, tile_strategy)
         _plan_matmul_execution(graph_info, tile_strategy)
+        _plan_warp_per_row_execution(graph_info, tile_strategy)
         _forward_propagate(graph_info)
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
         _insert_layout_changes(graph_info)
         _validate_layout_contracts(graph_info)
-
-    _validate_thread_budget_graphs(graphs)
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,7 @@ def _seed_constraints(
 ) -> None:
     """Attach preferred LayoutConstraints to loads, stores, reductions."""
     for node in graph_info.graph.nodes:
-        constraint = preferred_constraint_for_node(node, graph_info, tile_strategy)
+        constraint = preferred_constraint_for_node(node, tile_strategy)
         if constraint is not None:
             node.meta[META_KEY] = constraint
 
@@ -226,6 +226,116 @@ def _plan_matmul_execution(
         )
 
 
+def _plan_warp_per_row_execution(
+    graph_info: GraphInfo,
+    tile_strategy: TileStrategyDispatch,
+) -> None:
+    """Detect the softmax-shaped warp-per-row layout.
+
+    When the kernel has a single 1-D outer grid loop over rows (M-axis)
+    and an inner non-reduction tile loop over the reduction axis (N),
+    and the autotuner picks ``num_threads`` such that:
+
+      * M-block (outer grid) has a thread extent >= 2 (multi-row CTAs)
+      * N-tile (inner) has a thread extent >= 32 and is a multiple of 32
+      * Joint thread extent (M_threads * N_threads) <= 1024
+
+    we want each CUDA warp to own ONE row so the inner reduction can
+    use ``cute.arch.warp_reduction_*`` (single warp shuffle) rather
+    than the cross-warp shared-memory two-stage reduce. That requires
+    swapping the thread-axis assignment so:
+
+      * N (inner) lands on thread_idx[0] (32 contiguous threads per warp)
+      * M (outer grid) lands on thread_idx[1] (warp index = row index)
+
+    This emits a ``CuTeGridExecutionPlan`` that sets
+    ``block_axis_priority`` to put N before M and disables the
+    reduction-axis reservation (no reduction strategy claims a thread
+    axis here — the strided reduction inside the inner tile body picks
+    the warp-reduce path because ``group_span = N_threads = 32`` once
+    M has moved to a higher-indexed thread axis).
+    """
+    from ..host_function import HostFunction
+    from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import CuteNDTileStrategy
+
+    if not isinstance(graph_info, RootGraphInfo):
+        return
+    device_ir = HostFunction.current().device_ir
+    # Only one outer grid (1 M-block).
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
+        return
+    (m_block_id,) = device_ir.grid_block_ids[0]
+    # No MMA — those use a different plan.
+    matmul_nodes = [
+        node
+        for node in graph_info.graph.nodes
+        if node.op == "call_function" and node.target is torch.ops.aten.mm.default
+    ]
+    if matmul_nodes:
+        return
+    # Don't conflict with a plan already attached for this graph (e.g.
+    # the matmul plan above).
+    if graph_info.cute_grid_execution_plans:
+        return
+    # No reduction strategy (rolled reduction) — that path runs the
+    # CuteTileVecWarpReduceHeuristic-style single-row layout already.
+    if any(
+        isinstance(s, ReductionStrategy) and s.thread_axes_used() > 0
+        for s in tile_strategy.strategies
+    ):
+        return
+    # Find the M strategy (outer grid) and the N strategy (inner tile)
+    # by walking ``tile_strategy.strategies``.  The M strategy owns
+    # ``m_block_id``; the N strategy is any other CuteNDTileStrategy
+    # with a different block_id and at least one thread axis.
+    m_strategy = tile_strategy.block_id_to_strategy.get((m_block_id,))
+    if not isinstance(m_strategy, CuteNDTileStrategy):
+        return
+    if m_strategy.thread_axes_used() != 1:
+        return
+    m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
+    if not isinstance(m_threads, int) or m_threads < 2:
+        return
+    n_strategies: list[CuteNDTileStrategy] = []
+    for strategy in tile_strategy.strategies:
+        if strategy is m_strategy:
+            continue
+        if not isinstance(strategy, CuteNDTileStrategy):
+            continue
+        if strategy.thread_axes_used() != 1:
+            continue
+        if m_block_id in strategy.block_ids:
+            continue
+        n_strategies.append(strategy)
+    if not n_strategies:
+        return
+    n_block_ids = {bid for s in n_strategies for bid in s.block_ids}
+    if len(n_block_ids) != 1:
+        # Multiple distinct inner blocks — not the simple softmax shape.
+        return
+    (n_block_id,) = n_block_ids
+    n_threads = tile_strategy.thread_extent_for_block_id(n_block_id)
+    if not isinstance(n_threads, int) or n_threads < 32 or n_threads % 32 != 0:
+        return
+    # Joint thread budget check.
+    from .thread_budget import MAX_THREADS_PER_BLOCK
+
+    if m_threads * n_threads > MAX_THREADS_PER_BLOCK:
+        return
+    graph_info.cute_grid_execution_plans = (
+        *graph_info.cute_grid_execution_plans,
+        CuTeGridExecutionPlan(
+            scoped_block_ids=frozenset({m_block_id, n_block_id}),
+            block_axis_priority={
+                n_block_id: 0,
+                m_block_id: 1,
+            },
+            disable_reduction_axis_reservation_for=frozenset({m_block_id, n_block_id}),
+        ),
+    )
+
+
 def _direct_grouped_n_scalar_block_id(
     tile_strategy: TileStrategyDispatch,
     lhs_val: torch.Tensor,
@@ -283,11 +393,21 @@ def _forward_propagate(graph_info: GraphInfo) -> None:
         if constraint.preferred_output is not None:
             continue
 
-        layout = _first_input_layout(node)
-        if layout is not None:
-            inherited = layout.with_tag(LayoutTag.INHERITED)
-            constraint.preferred_input = inherited
-            constraint.preferred_output = inherited
+        result = _first_input_layout_node(node)
+        if result is None:
+            continue
+        layout, input_node = result
+        # Shape-collapsing reductions (e.g. ``aten.amax``/``aten.sum``) cover
+        # fewer elements than their input.  Forward inheriting the input layout
+        # would describe the wrong tile, so leave the output flexible and let
+        # backward propagation pick a layout that matches the reduced tile.
+        if _is_reduction_target(node.target) and not _numels_match(
+            _node_tile_numel(node), _node_tile_numel(input_node)
+        ):
+            continue
+        inherited = layout.with_tag(LayoutTag.INHERITED)
+        constraint.preferred_input = inherited
+        constraint.preferred_output = inherited
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +430,6 @@ def _backward_propagate(graph_info: GraphInfo) -> None:
         if not isinstance(val, torch.Tensor):
             continue
         constraint = _constraint_for_node(node)
-        if constraint.required:
-            continue  # non-negotiable
 
         # Don't backward-propagate through nodes with semantic preferences
         # (reductions need threads along the reduction axis).
@@ -455,6 +573,12 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
                 # Reduction lowering still has custom fallbacks for arbitrary
                 # producer layouts, so a missed relayout here is not fatal.
                 continue
+            if _is_shape_reducing_user(node, user):
+                # Shape-collapsing reductions (e.g. ``aten.amax``/``aten.sum``)
+                # consume the producer's full tile and own the layout transition
+                # to the reduced output themselves (warp/shared reduce), so a
+                # producer/consumer layout difference here is expected.
+                continue
             consumer_layout = user_lc.input_layout
             if (
                 producer_layout.tag is LayoutTag.MMA_ACCUMULATOR
@@ -462,6 +586,7 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
                 and node.target
                 in {
                     torch.ops.aten.mm.default,
+                    torch.ops.aten.bmm.default,
                     torch.ops.aten.addmm.default,
                     torch.ops.aten.baddbmm.default,
                 }
@@ -483,52 +608,166 @@ def _validate_layout_contracts(graph_info: GraphInfo) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Thread budget validation
-# ---------------------------------------------------------------------------
-
-
-def _validate_thread_budget_graphs(graphs: list[GraphInfo]) -> None:
-    """Check that all resolved layouts use <= 1024 threads.
-
-    When thread counts are symbolic, validation is deferred to launch time.
-
-    Layouts inside device/reduction loops may inherit thread counts from
-    the parent that include loop threads.  These are validated at kernel
-    launch time via the actual thread block dimensions, so we skip the
-    per-node check when the thread count exceeds the limit — it will be
-    caught by :func:`check_thread_limit` in the launcher if genuinely
-    over-budget.
-    """
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
 def _first_input_layout(node: torch.fx.Node) -> ThreadLayout | None:
     """Return the preferred/resolved output layout of the first input."""
+    result = _first_input_layout_node(node)
+    return result[0] if result is not None else None
+
+
+def _first_input_layout_node(
+    node: torch.fx.Node,
+) -> tuple[ThreadLayout, torch.fx.Node] | None:
+    """Return the first input's output layout together with that input node."""
     for inp in node.all_input_nodes:
         lc = inp.meta.get(META_KEY)
         if lc is None:
             continue
         layout = lc.output_layout or lc.preferred_output
         if layout is not None:
-            return layout
+            return layout, inp
     return None
 
 
 def _collect_user_layouts(node: torch.fx.Node) -> list[ThreadLayout]:
-    """Collect preferred/resolved consumer input layouts from all users."""
+    """Collect preferred/resolved consumer input layouts from all users.
+
+    A reduction user that never received a proper reduction-axis layout and
+    instead picked up a *degenerate scalar* layout from its own consumer
+    (covering far fewer elements than the producer's own tile) cannot legally
+    describe *node*'s full tile.  Adopting such a layout would corrupt the
+    producer (every thread reading a single reduced element instead of its
+    slice of the full tile), so those reduction users are skipped.  A
+    correctly-seeded reduction keeps a full reduction-axis input layout — at
+    least as large as the producer's tile — so it is retained and continues to
+    drive the producer onto the shared reduction layout.
+    """
     layouts: list[ThreadLayout] = []
     for user in node.users:
         lc = user.meta.get(META_KEY)
         if lc is None:
             continue
         layout = lc.input_layout or lc.preferred_input
-        if layout is not None:
-            layouts.append(layout)
+        if layout is None:
+            continue
+        if _is_reduction_target(user.target) and _reduction_layout_is_degenerate(
+            node, layout
+        ):
+            continue
+        layouts.append(layout)
     return layouts
+
+
+_ATEN_REDUCTION_TARGETS = frozenset(
+    {
+        torch.ops.aten.sum.dim_IntList,
+        torch.ops.aten.sum.default,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+        torch.ops.aten.prod.dim_int,
+        torch.ops.aten.mean.dim,
+        torch.ops.aten.max.dim,
+        torch.ops.aten.min.dim,
+    }
+)
+
+
+def _is_reduction_target(target: object) -> bool:
+    """True if *target* is a tile reduction op (collapses one or more dims)."""
+    return target is reduce_ops._reduce or target in _ATEN_REDUCTION_TARGETS
+
+
+def _reduction_layout_is_degenerate(
+    node: torch.fx.Node, reduction_layout: ThreadLayout
+) -> bool:
+    """True if a reduction user's input layout is degenerate w.r.t. *node*.
+
+    A legitimately-seeded reduction reads the producer's full tile, so its
+    input layout spans at least as many elements as the producer's own
+    resolved layout.  A *degenerate* reduction (one that never got a real
+    reduction-axis layout and instead inherited a scalar layout from its own
+    consumer) covers strictly fewer elements than the producer's tile — that is
+    the only case backward propagation must ignore.
+
+    Comparing the two thread/value layouts (rather than the fake-tensor numels)
+    keeps this provable: both layouts are built from concrete thread counts and
+    block sizes, whereas a node's fake-tensor numel may be symbolic and would
+    spuriously flag every reduction as degenerate.
+    """
+    producer_layout = _node_layout(node) or _first_input_layout(node)
+    if producer_layout is None:
+        return False
+    return _known_lt(reduction_layout.tile_numel(), producer_layout.tile_numel())
+
+
+def _node_layout(node: torch.fx.Node) -> ThreadLayout | None:
+    """Return *node*'s own resolved/preferred output layout, if any."""
+    lc = node.meta.get(META_KEY)
+    if lc is None:
+        return None
+    return lc.output_layout or lc.preferred_output
+
+
+def _is_shape_reducing_user(node: torch.fx.Node, user: torch.fx.Node) -> bool:
+    """True if *user* is a reduction consuming a smaller tile than *node*.
+
+    A reduction (e.g. ``aten.amax``/``aten.sum``) collapses one or more of
+    *node*'s dims, so the user's tensor has fewer elements.  Such users own
+    the layout transition from the producer's full tile to the reduced output
+    in their own lowering, so an edge-level layout mismatch is expected.
+    """
+    if not _is_reduction_target(user.target):
+        return False
+    node_numel = _node_tile_numel(node)
+    user_numel = _node_tile_numel(user)
+    if node_numel is None or user_numel is None:
+        return False
+    if isinstance(node_numel, int) and isinstance(user_numel, int):
+        return user_numel < node_numel
+    # Symbolic: a reduction either preserves or shrinks the tile, so treat it
+    # as reducing whenever the numels are not provably equal.
+    return not _numels_match(node_numel, user_numel)
+
+
+def _node_tile_numel(node: torch.fx.Node) -> SymIntLike | None:
+    """Total element count of *node*'s tile, or None if unknown."""
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor):
+        return None
+    numel: SymIntLike = 1
+    for dim in val.shape:
+        numel = numel * dim  # type: ignore[operator]
+    return numel
+
+
+def _numels_match(a: SymIntLike | None, b: SymIntLike | None) -> bool:
+    """Conservatively compare two (possibly symbolic) element counts.
+
+    Returns True only when the two counts are provably equal.  When either
+    side is unknown, fall back to True so callers keep their prior behaviour.
+    Symbolic comparison goes through ``known_equal`` (static evaluation) so it
+    never installs a guard or trips a value-range assertion.
+    """
+    if a is None or b is None:
+        return True
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    return CompileEnvironment.current().known_equal(a, b)
+
+
+def _known_lt(a: SymIntLike, b: SymIntLike) -> bool:
+    """True only when *a* is provably strictly less than *b*.
+
+    Layout numels are concrete integers in practice; the symbolic branch falls
+    back to ``False`` (not provably smaller -> not degenerate) so the caller
+    never drops a legitimate reduction layout on an unprovable comparison.
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return a < b
+    return False
 
 
 def _constraint_for_node(node: torch.fx.Node) -> LayoutConstraint:

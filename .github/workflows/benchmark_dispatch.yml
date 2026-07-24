@@ -13,21 +13,72 @@ on:
         required: false
         type: boolean
         default: true
-      run_mi325x:
-        description: 'Run benchmark on MI325X'
-        required: false
-        type: boolean
-        default: false
       run_mi350x:
         description: 'Run benchmark on MI350X'
         required: false
         type: boolean
         default: false
+      run_tpu:
+        description: 'Run benchmark on TPU v7'
+        required: false
+        type: boolean
+        default: false
+      run_tpu_bridge:
+        # Transitional: kept separate (default off) so this PR can land without
+        # the bridge entering the nightly before its dashboard wiring exists. The
+        # dashboard follow-up folds this into `run_tpu` (both TPU jobs gated by
+        # one toggle) and removes this input.
+        description: 'Run TPU v7 benchmark via the tritonbench bridge (WIP; artifact-only until the dashboard follow-up lands). Independent of run_tpu; transitional, folded into run_tpu later.'
+        required: false
+        type: boolean
+        default: false
+      run_b200_cute:
+        description: 'Run benchmark on B200 with the Helion CuTe backend'
+        required: false
+        type: boolean
+        default: false
+      run_b200_linattn:
+        description: 'Run linear-attention benchmark (vs FLA) on B200'
+        required: false
+        type: boolean
+        default: false
+      run_h100_linattn:
+        description: 'Run linear-attention benchmark (vs FLA) on H100'
+        required: false
+        type: boolean
+        default: false
       kernels:
-        description: 'Comma-separated list of kernels to benchmark'
+        description: 'Comma-separated list of kernels to benchmark on GPU runners'
         required: false
         type: string
-        default: "softmax,jsd,welford,kl_div,int4_gemm,layer_norm,layer_norm-bwd,rms_norm,rms_norm-bwd,cross_entropy,flash_attention,gemm,grouped_gemm"
+        # Ordered to balance B200 runtime under compute-benchmark-matrix's
+        # round-robin sharding with max-runners=13.
+        # rope-bwd temporarily removed: autotune trips Triton's
+        # LinearLayout::reshapeOuts assertion on H100/B200/MI350X and aborts
+        # the parent process, producing Shape Failures for every shape. Re-add
+        # once #2531 (compile-phase subprocess isolation) lands or the upstream
+        # Triton bug is fixed. Forward `rope` stays in the list.
+        default: "flash_attention,gdn_fwd_h,cross_entropy,grouped_gemm,gemm,welford,layer_norm-bwd,int4_gemm,softmax,layer_norm,mamba2_chunk_state,rms_norm-bwd,rope,jsd,mamba2_chunk_scan,kl_div,rms_norm"
+      kernels_tpu:
+        description: 'Comma-separated list of kernels to benchmark on TPU (examples-based; disjoint from `kernels`). Default is the dashboard-tracked subset; pass an explicit list, or `all` to run every kernel registered in benchmarks/run_tpu.py::KERNEL_MAPPINGS.'
+        required: false
+        type: string
+        default: "flash_attention,bmm,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,cross_entropy,kl_div"
+      kernels_tpu_bridge:
+        description: 'Kernels benchmarked on TPU via the tritonbench bridge (benchmarks/run.py --device tpu). Currently produces artifacts only (manual, gated behind run_tpu_bridge); a follow-up wires these into the shared tpu dashboard column and moves them off kernels_tpu.'
+        required: false
+        type: string
+        default: "flash_attention,gemm,welford,softmax,layer_norm,rms_norm,rms_norm-bwd,kl_div"
+      kernels_cute:
+        description: 'Comma-separated list of kernels to benchmark on B200 with HELION_BACKEND=cute. Defaults to the CuTe-capable TritonBench subset.'
+        required: false
+        type: string
+        default: "vector_add,layer_norm,rms_norm,vector_exp,sum"
+      kernels_linattn:
+        description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; each appears on the dashboard as both a forward and a -bwd row.'
+        required: false
+        type: string
+        default: "vanilla_linear_attn,vanilla_linear_attn-bwd,simple_gla,simple_gla-bwd,retention,retention-bwd,full_gla,full_gla-bwd,delta_rule,delta_rule-bwd,gated_delta_rule,gated_delta_rule-bwd,kda,kda-bwd"
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
@@ -57,10 +108,10 @@ jobs:
       id-token: write
       contents: read
     with:
-      runner: linux.aws.h100
+      runner: mt-l-x86iamx-22-225-h100
       python-version: "3.12"
-      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
-      runtime-version: cu128
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
       container-options: --gpus all
       alias: h100
       kernels: ${{ matrix.kernels }}
@@ -94,29 +145,30 @@ jobs:
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
 
-  gen-matrix-mi325x:
+  gen-matrix-b200-cute:
     uses: ./.github/workflows/compute-benchmark-matrix.yml
-    if: ${{ github.event.inputs.run_mi325x == 'true' }}
+    if: ${{ github.event.inputs.run_b200_cute == 'true' }}
     with:
       max-runners: 6
-      kernels: ${{ github.event.inputs.kernels }}
+      kernels: ${{ github.event.inputs.kernels_cute }}
 
-  run-mi325x:
-    needs: gen-matrix-mi325x
+  run-b200-cute:
+    needs: gen-matrix-b200-cute
     uses: ./.github/workflows/benchmark.yml
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.gen-matrix-mi325x.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.gen-matrix-b200-cute.outputs.matrix) }}
     permissions:
       id-token: write
       contents: read
     with:
-      runner: linux.rocm.gpu.gfx942.1
+      runner: linux.dgx.b200
       python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:7.1.1-complete
-      runtime-version: rocm7.1
-      container-options: --device=/dev/kfd --device=/dev/dri
-      alias: mi325x
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: b200_cute
+      backend: cute
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
@@ -147,3 +199,76 @@ jobs:
       kernels: ${{ matrix.kernels }}
       env-vars: ${{ github.event.inputs.env_vars }}
       custom-args: ${{ github.event.inputs.custom_args }}
+
+  run-tpu:
+    if: ${{ github.event.inputs.run_tpu == 'true' }}
+    uses: ./.github/workflows/benchmark_tpu.yml
+    permissions:
+      contents: read
+    with:
+      alias: tpu
+      kernels: ${{ github.event.inputs.kernels_tpu }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
+  run-b200-linattn:
+    if: ${{ github.event.inputs.run_b200_linattn == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: linux.dgx.b200
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: b200
+      suite: linattn
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
+  run-h100-linattn:
+    if: ${{ github.event.inputs.run_h100_linattn == 'true' }}
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: mt-l-x86iamx-22-225-h100
+      python-version: "3.12"
+      image: nvidia/cuda:13.1.0-devel-ubuntu24.04
+      runtime-version: cu130
+      container-options: --gpus all
+      alias: h100
+      suite: linattn
+      kernels: ${{ github.event.inputs.kernels_linattn }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
+  run-tpu-bridge:
+    if: ${{ github.event.inputs.run_tpu_bridge == 'true' }}
+    uses: ./.github/workflows/benchmark_tpu_bridge.yml
+    permissions:
+      contents: read
+    with:
+      alias: tpu_bridge
+      kernels: ${{ github.event.inputs.kernels_tpu_bridge }}
+      env-vars: ${{ github.event.inputs.env_vars }}
+
+  trigger-docs-deploy:
+    if: always()
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-tpu, run-b200-linattn, run-h100-linattn, run-tpu-bridge]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger docs deploy
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docs-deploy.yml',
+              ref: 'main'
+            })

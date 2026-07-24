@@ -6,6 +6,7 @@ import random
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .base_search import BenchmarkResult
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import check_population_consistency
@@ -161,6 +162,7 @@ class LFBOPatternSearch(PatternSearch):
     def get_kwargs_from_profile(
         cls, profile: AutotuneEffortProfile, settings: Settings
     ) -> dict[str, object]:
+        from ..runtime.settings import _env_get_int
         from ..runtime.settings import _get_initial_population_strategy
 
         assert profile.lfbo_pattern_search is not None
@@ -174,8 +176,30 @@ class LFBOPatternSearch(PatternSearch):
             "max_generations": profile.lfbo_pattern_search.max_generations,
             "initial_population_strategy": strategy,
             "best_available_pad_random": profile.lfbo_pattern_search.best_available_pad_random,
+            "num_neighbors_cap": _env_get_int("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS", -1),
             **PopulationBasedSearch.get_kwargs_from_profile(profile, settings),
         }
+
+    def seed_training_data(
+        self,
+        results: Sequence[BenchmarkResult],
+    ) -> None:
+        """Pre-populate the surrogate's training set with externally-benchmarked configs.
+
+        Useful when an outer loop (e.g. a hybrid LLM+LFBO search) has already
+        benchmarked configs and wants the LFBO surrogate to learn from them
+        rather than starting from scratch. Failed configs (perf=inf) are
+        kept since the surrogate's binary classifier learns from negatives too.
+        """
+        for result in results:
+            try:
+                flat_values = self.config_gen.flatten(result.config)
+                encoded = self.config_gen.encode_config(flat_values)
+            except Exception as e:
+                self.log.debug(f"seed_training_data: skipping config: {e}")
+                continue
+            self.train_x.append(encoded)
+            self.train_y.append(result.perf)
 
     def _fit_surrogate(self) -> None:
         train_x = np.array(self.train_x)
@@ -384,6 +408,9 @@ class LFBOPatternSearch(PatternSearch):
         check_population_consistency(
             self.population, process_group_name=self.kernel.env.process_group_name
         )
+        # Snapshot compiler-seeded members so they survive the search-loop
+        # pruning into the final-pick verification candidate pool.
+        self.capture_compiler_seed_members(self.population)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -409,7 +436,7 @@ class LFBOPatternSearch(PatternSearch):
             for idx, m in enumerate(starting_points)
         ]
 
-        for generation in range(1, self.max_generations + 1):
+        for generation in self._budgeted_range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -459,9 +486,8 @@ class LFBOPatternSearch(PatternSearch):
                 # Fit model
                 self._fit_surrogate()
 
-        # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
+        # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
+        return self._finalize()
 
     def _generate_neighbors(self, base: FlatConfig) -> list[FlatConfig]:
         """
@@ -669,6 +695,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
             FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
             remainder with random configs when best_available_pad_random is True.
             Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
+        num_neighbors_cap: Maximum number of neighbors to explore per generation.
+            -1 means no cap. Set HELION_CAP_AUTOTUNE_NUM_NEIGHBORS=N to override.
     """
 
     def __init__(
@@ -688,6 +716,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         similarity_penalty: float = 1.0,
         initial_population_strategy: InitialPopulationStrategy | None = None,
         best_available_pad_random: bool = PATTERN_SEARCH_DEFAULTS.best_available_pad_random,
+        num_neighbors_cap: int = -1,
         finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = PATTERN_SEARCH_DEFAULTS.compile_timeout_quantile,
@@ -707,6 +736,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
             similarity_penalty=similarity_penalty,
             initial_population_strategy=initial_population_strategy,
             best_available_pad_random=best_available_pad_random,
+            num_neighbors_cap=num_neighbors_cap,
             finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
@@ -838,4 +868,4 @@ class LFBOTreeSearch(LFBOPatternSearch):
             if current_flat != base_list:
                 all_results.append(list(current_flat))
 
-        return all_results
+        return self.shrink_neighbors(all_results)

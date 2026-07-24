@@ -26,6 +26,7 @@ from .base_cache import StrictAutotuneCacheKey
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Sequence
+    from typing import Callable
 
     from .base_search import BaseSearch
 
@@ -44,6 +45,11 @@ def helion_triton_cache_dir(device_index: int) -> str:
     return str(get_helion_cache_dir() / "triton" / str(device_index))
 
 
+def helion_cute_cache_dir(device_index: int) -> str:
+    """Return per-device CuTe DSL cache directory under Helion's cache root."""
+    return str(get_helion_cache_dir() / "cute" / str(device_index))
+
+
 @dataclasses.dataclass(frozen=True)
 class SavedBestConfig:
     """A parsed cache entry from a .best_config file."""
@@ -60,6 +66,33 @@ class SavedBestConfig:
         return list(self.flat_config)
 
 
+def parse_cache_entry(raw: str) -> SavedBestConfig:
+    """Parse a serialized .best_config JSON string into a SavedBestConfig.
+
+    Raises:
+        ValueError: if the payload is malformed or missing required fields.
+    """
+    try:
+        data = json.loads(raw)
+        fields = data["key"]["fields"]
+        raw_flat = data.get("flat_config")
+        if isinstance(raw_flat, str):
+            flat_config: tuple[object, ...] | None = tuple(json.loads(raw_flat))
+        elif raw_flat is not None:
+            flat_config = tuple(raw_flat)
+        else:
+            flat_config = None
+        return SavedBestConfig(
+            hardware=fields.get("hardware", ""),
+            specialization_key=fields.get("specialization_key", ""),
+            config=Config.from_json(data["config"]),
+            config_spec_hash=fields.get("config_spec_hash", ""),
+            flat_config=flat_config,
+        )
+    except (KeyError, TypeError, json.JSONDecodeError) as e:
+        raise ValueError(f"malformed cache entry: {e}") from e
+
+
 def iter_cache_entries(
     cache_path: Path, *, max_scan: int | None = None
 ) -> Iterator[SavedBestConfig]:
@@ -74,26 +107,11 @@ def iter_cache_entries(
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     for p in itertools.islice(files, max_scan):
+        # parse_cache_entry consolidates KeyError/TypeError/JSONDecodeError into ValueError.
         try:
-            data = json.loads(p.read_text())
-            fields = data["key"]["fields"]
-            raw_flat = data.get("flat_config")
-            if isinstance(raw_flat, str):
-                flat_config: tuple[object, ...] | None = tuple(json.loads(raw_flat))
-            elif raw_flat is not None:
-                flat_config = tuple(raw_flat)
-            else:
-                flat_config = None
-            yield SavedBestConfig(
-                hardware=fields.get("hardware", ""),
-                specialization_key=fields.get("specialization_key", ""),
-                config=Config.from_json(data["config"]),
-                config_spec_hash=fields.get("config_spec_hash", ""),
-                flat_config=flat_config,
-            )
-        except (OSError, KeyError, ValueError, TypeError) as e:
+            yield parse_cache_entry(p.read_text())
+        except (OSError, ValueError) as e:
             log.warning("Skipping corrupt cache file %s: %s", p.name, e)
-            continue
 
 
 class LocalAutotuneCache(AutotuneCacheBase):
@@ -108,8 +126,13 @@ class LocalAutotuneCache(AutotuneCacheBase):
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
     """
 
-    def __init__(self, autotuner: BaseSearch) -> None:
-        super().__init__(autotuner)
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
         self.key = self._generate_key()
 
     def _generate_key(self) -> LooseAutotuneCacheKey:
@@ -160,7 +183,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 runtime_name = "unknown"
 
         assert hardware is not None and runtime_name is not None
-        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash()
+        config_spec_hash = self.kernel.config_spec.structural_fingerprint_hash(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
         return LooseAutotuneCacheKey(
             specialization_key=in_memory_cache_key.specialization_key,
             extra_results=in_memory_cache_key.extra_results,
@@ -170,6 +195,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
             backend=self.kernel.env.backend.name,
             config_spec_hash=config_spec_hash,
             extra_cache_key=self.kernel.extra_cache_key(),
+            best_of_k=self.autotuner.settings.autotune_best_of_k,
         )
 
     def _get_local_cache_path(self) -> Path:
@@ -199,7 +225,9 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "key": key_dict,
         }
 
-        config_gen = self.kernel.config_spec.create_config_generation()
+        config_gen = self.kernel.config_spec.create_config_generation(
+            advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
+        )
         data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)

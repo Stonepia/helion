@@ -5,6 +5,7 @@ from __future__ import annotations
 import textwrap
 from typing import TYPE_CHECKING
 
+from ..base_search import normalize_autotune_seed_configs
 from .configs import describe_config_space
 from .feedback import MAX_CHANGED_FIELDS_PER_CONFIG
 from .feedback import format_config_for_prompt
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from ...runtime.config import Config
     from ..base_search import _AutotunableKernel
     from ..config_spec import ConfigSpec
 
@@ -134,12 +136,15 @@ def _initial_strategy_lines(
         )
     if "reduction_loops" in flat_fields:
         lines.append(
-            "This is reduction-like: keep most configs conservative and avoid very large block_sizes or maxed num_warps/num_stages."
+            "This is reduction-like: span the space — include conservative configs (small blocks, num_stages=1-2) AND aggressive configs (large blocks up to the reduction dim, num_stages=4-8 with deep range_num_stages pipelining). Memory-bound reductions on modern accelerators often prefer the aggressive end."
         )
     if any(name in flat_fields for name in _ADVANCED_TOGGLE_FIELDS):
         lines.append(
             "Use advanced toggles like warp_specialize, multi_buffer, and flatten in only a minority of otherwise sane configs."
         )
+    lines.append(
+        "Explicitly diversify num_stages and num_warps across the batch: don't cluster all suggestions at num_stages=1; include several with num_stages in {2, 4, 8} so LFBO refinement has aggressive seeds to anchor on."
+    )
     return lines
 
 
@@ -194,6 +199,86 @@ def build_initial_search_guidance(
     )
 
 
+# One-line purpose for each compiler-owned autotuner heuristic, keyed by the
+# heuristic's ``name`` (see helion/_compiler/autotuner_heuristics/). Used to
+# annotate the fired-heuristic names surfaced to the LLM. Names without an entry
+# still render (with no annotation), so a new heuristic is never silently
+# dropped from the prompt.
+_HEURISTIC_PURPOSES: Mapping[str, str] = {
+    "triton_skinny_gemm": (
+        "skinny GEMM (one operand dim >> the other): tile the long dims and "
+        "use a deep K tile"
+    ),
+    "triton_reduction_tile": (
+        "canonical row reduction (softmax/rms_norm/cross_entropy): one row per "
+        "program with a single persistent pass over the reduction axis "
+        "(reduction_loops null, not a rolled loop), warps scaled to the "
+        "reduction width"
+    ),
+}
+
+
+def _config_list_lines(configs: Sequence[Config]) -> str:
+    """Render configs as ``  - <config>`` lines for a prompt section."""
+    return "\n".join(f"  - {format_config_for_prompt(config)}" for config in configs)
+
+
+def build_compiler_analysis_section(config_spec: ConfigSpec) -> str:
+    """Surface the compiler's fired heuristics and seed configs to the LLM.
+
+    Helion fires eligible heuristics before autotuning; their names and
+    analytical seed configs already feed the search seed path. This also shows
+    them to the LLM as a structural prior. No-op ("") when nothing fired.
+    """
+    heuristic_names = config_spec.autotuner_heuristics
+    seed_configs = config_spec.compiler_seed_configs
+    if not heuristic_names and not seed_configs:
+        return ""
+
+    body_parts: list[str] = [
+        (
+            "Helion's compiler statically analyzed this kernel's structure and "
+            "derived the following structural priors. Treat them as strong "
+            "starting points: include configs matching these and nearby "
+            "mutations before venturing to unrelated families."
+        )
+    ]
+    if heuristic_names:
+        name_lines = "\n".join(
+            (
+                f"  - {name}: {_HEURISTIC_PURPOSES[name]}"
+                if name in _HEURISTIC_PURPOSES
+                else f"  - {name}"
+            )
+            for name in heuristic_names
+        )
+        body_parts.append("Fired compiler heuristics:\n" + name_lines)
+    if seed_configs:
+        body_parts.append(
+            "Compiler-derived seed config(s):\n" + _config_list_lines(seed_configs)
+        )
+    return _section("Compiler Analysis", "\n".join(body_parts))
+
+
+def build_author_seed_section(kernel: _AutotunableKernel) -> str:
+    """Surface author-provided ``autotune_seed_configs`` to the LLM as an anchor.
+
+    No-op ("") for kernels that declare no seeds.
+    """
+    seed_configs = normalize_autotune_seed_configs(kernel.settings)
+    if not seed_configs:
+        return ""
+    body = (
+        "The kernel author provided the following seed config(s) as a known-good "
+        "starting point for this specific kernel. Treat them as a strong prior:\n"
+        f"{_config_list_lines(seed_configs)}\n"
+        "Include at least one candidate matching each seed exactly, plus several "
+        "that explore nearby (small mutations of the seed's fields), before "
+        "venturing to unrelated families."
+    )
+    return _section("Author Seed Configs", body)
+
+
 def build_initial_prompt(
     *,
     kernel: _AutotunableKernel,
@@ -225,6 +310,8 @@ def build_initial_prompt(
         describe_kernel(kernel, args),
         _section("Configuration Space", describe_config_space(config_spec)),
         default_section,
+        build_compiler_analysis_section(config_spec),
+        build_author_seed_section(kernel),
         guidance,
         _section("Task", task_section),
     )

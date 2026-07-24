@@ -126,7 +126,11 @@ class PatternSearch(PopulationBasedSearch):
                 n_random = max(0, self.initial_population - len(pop))
                 pop.extend(self.config_gen.random_flat() for _ in range(n_random))
             return pop
-        return self.config_gen.random_population_flat(self.initial_population)
+        return self.config_gen.random_population_flat(
+            self.initial_population,
+            user_seed_configs=self._autotune_seed_configs(),
+            log_func=self.log,
+        )
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
@@ -151,6 +155,9 @@ class PatternSearch(PopulationBasedSearch):
 
         # again with higher accuracy
         self.rebenchmark_population(self.population, desc="Verifying initial results")
+        # Snapshot compiler-seeded members so they survive the search-loop
+        # pruning into the final-pick verification candidate pool.
+        self.capture_compiler_seed_members(self.population)
         self.population.sort(key=performance)
         starting_points = []
         for member in self.population[: self.copies]:
@@ -164,7 +171,7 @@ class PatternSearch(PopulationBasedSearch):
             raise exc.NoConfigFound
 
         search_copies = [self._pattern_search_from(m, visited) for m in starting_points]
-        for generation in range(1, self.max_generations + 1):
+        for generation in self._budgeted_range(1, self.max_generations + 1):
             prior_best = self.best
             new_population = {id(prior_best): prior_best}
             num_neighbors = 0
@@ -200,9 +207,8 @@ class PatternSearch(PopulationBasedSearch):
             # Log final statistics for this generation
             self.log(f"Generation {generation} complete:", self.statistics)
 
-        # Run finishing phase to simplify the best configuration
-        best = self.run_finishing_phase(self.best, self.finishing_rounds)
-        return best.config
+        # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
+        return self._finalize()
 
     def _pattern_search_from(
         self, current: PopulationMember, visited: set[Config]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .base_search import normalize_autotune_seed_configs
 from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
 
@@ -35,14 +36,19 @@ class RandomSearch(FiniteSearch):
         args: Sequence[object],
         count: int = RANDOM_SEARCH_DEFAULTS.count,
     ) -> None:
+        config_gen = kernel.config_spec.create_config_generation(
+            overrides=kernel.settings.autotune_config_overrides or None,
+            advanced_controls_files=kernel.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
+        )
+        seed_configs = list(normalize_autotune_seed_configs(kernel.settings))
         super().__init__(
             kernel,
             args,
-            configs=kernel.config_spec.create_config_generation(
-                overrides=kernel.settings.autotune_config_overrides or None,
-                advanced_controls_files=kernel.settings.autotune_search_acf or None,
-                process_group_name=kernel.env.process_group_name,
-            ).random_population(count),
+            configs=config_gen.random_population(
+                count,
+                user_seed_configs=seed_configs,
+            ),
         )
 
     @classmethod

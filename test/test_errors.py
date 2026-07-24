@@ -18,6 +18,7 @@ from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.external import _FakeEnv
 from helion.exc import InvalidConfig
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 @helion.kernel()
@@ -36,7 +37,7 @@ def _test_outer_kernel_calling_inner(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestErrors(RefEagerTestDisabled, TestCase):
     def test_autotune_no_valid_configs(self):
         class FakeKernel:
@@ -68,6 +69,9 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 output_origin_lines: bool | None = None,
             ) -> str:
                 return ""
+
+            def supports_subprocess_benchmark(self) -> bool:
+                return False
 
             @property
             def env(self):
@@ -104,7 +108,10 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         """Binary op should detect broadcast shape mismatch from reduction without keep_dims.
 
         This mirrors the softmax pattern where a row-wise reduction loses the
-        dimension and then is subtracted from a 2D tensor without keep_dims.
+        dimension and is then subtracted from a 2D tile without keep_dims, so the
+        reduction's M axis is silently aligned onto the N axis. Helion rejects
+        this with ``ShapeMismatch`` on every backend at graph-build time -- the
+        correct kernel uses ``keepdim=True`` (see examples/softmax.py).
         """
 
         # Mirror scratch.py behavior exactly
@@ -118,8 +125,9 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 out[tile_m, :] = out_rows
             return out
 
+        x = torch.randn(32, 64, device=DEVICE)
         with self.assertRaises(helion.exc.ShapeMismatch):
-            fn(torch.randn(32, 64, device=DEVICE))
+            fn(x)
 
     def test_tile_unpacking(self):
         @helion.kernel()
@@ -145,7 +153,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(fn, (torch.randn(128, 128, device=DEVICE),))
-        self.assertIn("tl.load", code)
+        self.assertIn(".load()" if _get_backend() == "cute" else "tl.load", code)
 
     def test_tile_invalid_range_unpack(self):
         @helion.kernel()
@@ -671,6 +679,9 @@ def _make_fake_kernel():
         ) -> str:
             return ""
 
+        def supports_subprocess_benchmark(self) -> bool:
+            return False
+
         @property
         def env(self):
             return _FakeEnv(device=DEVICE)
@@ -678,7 +689,7 @@ def _make_fake_kernel():
     return FakeKernel()
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestInvalidConfig(RefEagerTestDisabled, TestCase):
     """Tests for autotuner robustness to InvalidConfig exceptions."""
 

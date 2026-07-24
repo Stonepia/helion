@@ -5,6 +5,7 @@ import csv
 import hashlib
 import io
 import itertools
+import json
 import logging
 import math
 import os
@@ -27,15 +28,17 @@ from typing_extensions import Self
 
 from torch._inductor.runtime.triton_compat import OutOfResources
 from torch._inductor.runtime.triton_compat import PTXASError
+from torch.cuda import OutOfMemoryError as CudaOOMError
 
 from helion._dist_utils import is_master_rank
 
 if TYPE_CHECKING:
-    from _csv import _writer as CsvWriter
+    from _csv import Writer as CsvWriter
 
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
+    from .metrics import KernelMetadata
 
 else:
     CsvWriter = Any  # type: ignore[assignment]
@@ -113,15 +116,23 @@ class AutotuningLogger:
 
     @contextlib.contextmanager
     def autotune_logging(
-        self, base_path: str | None = None
+        self,
+        base_path: str | None = None,
+        metadata: KernelMetadata | None = None,
+        collect_dataset: bool = False,
     ) -> Iterator[AutotuneLogSink | None]:
-        """Attach an :class:`AutotuneLogSink` for the duration of a tuning run."""
+        """Attach an :class:`AutotuneLogSink` for the duration of a tuning run.
+
+        ``<base>.csv``/``.log`` are written whenever a log path is set. With
+        ``collect_dataset`` and ``metadata``, a ``<base>.meta.jsonl`` record
+        (identity + configs) is also written at run end, joined via ``run_id``.
+        """
 
         path = base_path or self._settings.autotune_log
         if not path:
             yield None
             return
-        with AutotuneLogSink(path) as sink:
+        with AutotuneLogSink(path, metadata, collect_dataset) as sink:
             self._attach_sink(sink)
             sink.start_run()
             try:
@@ -136,6 +147,14 @@ class AutotuningLogger:
         if self._log_sink is None:
             return
         self._log_sink.record(entry)
+
+    def register_config(self, config: Config) -> str | None:
+        """Return the content-addressed ``config_id`` (registering it on the sink
+        for the ``.meta.jsonl`` record), or ``None`` when no sink is active."""
+
+        if self._log_sink is None:
+            return None
+        return self._log_sink.register_config(config)
 
     def _attach_sink(self, sink: AutotuneLogSink) -> None:
         self._log_sink = sink
@@ -260,6 +279,7 @@ class AutotuneLogEntry(NamedTuple):
     status: str
     perf_ms: float | None
     compile_time: float | None
+    config_id: str
     config: Config
 
 
@@ -268,15 +288,25 @@ class AutotuneLogSink:
     Writes autotune results to CSV and connects autotune logs to a file handler.
     """
 
-    def __init__(self, base_path: str) -> None:
+    def __init__(
+        self,
+        base_path: str,
+        metadata: KernelMetadata | None = None,
+        collect_dataset: bool = False,
+    ) -> None:
         self._base_path = Path(base_path)
         self.csv_path = self._base_path.with_suffix(".csv")
         self.log_path = self._base_path.with_suffix(".log")
+        self.meta_path = self._base_path.with_suffix(".meta.jsonl")
+        self._metadata = metadata
+        self._collect_dataset = collect_dataset
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: CsvWriter | None = None
         self._log_handler: logging.FileHandler | None = None
         self._run_start_time: float | None = None
-        self._config_counter: int = 0
+        # config_id -> full config; flushed to the .meta.jsonl record at end_run.
+        # Populated only when collecting the dataset; identical configs collapse.
+        self._configs: dict[str, dict[str, object]] = {}
 
     def __enter__(self) -> Self:
         self.open()
@@ -295,21 +325,26 @@ class AutotuneLogSink:
             return
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._csv_file = self.csv_path.open("w", encoding="utf-8", newline="")
+        # Append so runs sharing one base path accumulate; header only for a new
+        # or empty file. The .meta.jsonl record is written at end_run.
+        write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+        self._csv_file = self.csv_path.open("a", encoding="utf-8", newline="")
         self._csv_writer = csv.writer(self._csv_file)
-        self._csv_writer.writerow(
-            [
-                "timestamp_s",
-                "config_index",
-                "generation",
-                "status",
-                "perf_ms",
-                "compile_time_s",
-                "config",
-            ]
-        )
-        self._csv_file.flush()
-        handler = logging.FileHandler(self.log_path, mode="w", encoding="utf-8")
+        if write_header:
+            self._csv_writer.writerow(
+                [
+                    "run_id",
+                    "timestamp_s",
+                    "config_id",
+                    "generation",
+                    "status",
+                    "perf_ms",
+                    "compile_time_s",
+                    "config",
+                ]
+            )
+            self._csv_file.flush()
+        handler = logging.FileHandler(self.log_path, mode="a", encoding="utf-8")
         handler.setLevel(logging.DEBUG)
         self._log_handler = handler
 
@@ -324,20 +359,41 @@ class AutotuneLogSink:
             self._log_handler.close()
         self._log_handler = None
         self._run_start_time = None
-        self._config_counter = 0
+        self._configs = {}
 
     def start_run(self) -> None:
         self._run_start_time = time.perf_counter()
-        self._config_counter = 0
+        self._configs = {}
 
     def end_run(self) -> None:
+        # Append the per-run record (identity + configs map) once every config is
+        # known. default=str keeps it JSON-safe for non-serializable settings
+        # (torch.dtype, enums, callables). CSV rows join via run_id + config_id.
+        if self._collect_dataset and self._metadata is not None:
+            record = {**self._metadata.to_dict(), "configs": self._configs}
+            with self.meta_path.open("a", encoding="utf-8") as meta_file:
+                meta_file.write(json.dumps(record, default=str) + "\n")
         self._run_start_time = None
-        self._config_counter = 0
+        self._configs = {}
+
+    def register_config(self, config: Config) -> str | None:
+        """Return a stable ``config_id`` for ``config``: ``sha256`` of the
+        canonical config JSON (sorted keys, compact), 16 hex chars -- the same
+        config always maps to the same id (the CSV<->record join key). Returns
+        ``None`` when the sink is not open. When collecting the dataset, the config
+        is stored under its id for the .meta.jsonl record (identical ids collapse).
+        """
+        if self._csv_writer is None:
+            return None
+        canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+        config_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        if self._collect_dataset:
+            self._configs[config_id] = config.config
+        return config_id
 
     def record(self, entry: AutotuneLogEntry) -> None:
         if self._csv_writer is None:
             return
-        self._config_counter += 1
         timestamp_field = ""
         if self._run_start_time is not None:
             timestamp = time.perf_counter() - self._run_start_time
@@ -348,10 +404,13 @@ class AutotuneLogSink:
         compile_field = ""
         if entry.compile_time is not None:
             compile_field = f"{entry.compile_time:.2f}"
+        # run_id joins the row to its .meta.jsonl record; config_id to its config.
+        run_id = self._metadata.run_id if self._metadata is not None else ""
         self._csv_writer.writerow(
             [
+                run_id,
                 timestamp_field,
-                self._config_counter,
+                entry.config_id,
                 entry.generation,
                 entry.status,
                 perf_field,
@@ -364,7 +423,9 @@ class AutotuneLogSink:
 
 
 SUPPRESSED_TRITON_CODE_MSG = (
-    "Enable HELION_AUTOTUNE_LOG_LEVEL=DEBUG to log generated Triton code."
+    "Set HELION_AUTOTUNE_LOG_LEVEL=DEBUG to log the generated Triton code, "
+    "or HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR=<dir> to write per-failure dumps "
+    "(source code + traceback) to <dir>."
 )
 
 
@@ -396,7 +457,7 @@ def _format_triton_code(kernel: _AutotunableKernel, config: Config, prefix: str)
     return f"{prefix}\n{code}"
 
 
-_FAILURE_DUMP_ENV = "HELION_AUTOTUNER_TRITON_FAILURE_DUMP"
+_FAILURE_DUMP_ENV = "HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR"
 
 
 def _get_failure_dump_dir() -> str | None:
@@ -414,7 +475,7 @@ def maybe_dump_triton_failure(
     remote_traceback: str | None = None,
     captured_output: str | None = None,
 ) -> None:
-    """Dump a Triton failure report if HELION_AUTOTUNER_TRITON_FAILURE_DUMP is set."""
+    """Dump a Triton failure report if HELION_AUTOTUNER_TRITON_FAILURE_DUMP_DIR is set."""
     dump_dir = _get_failure_dump_dir()
     if not dump_dir:
         return
@@ -461,6 +522,8 @@ _EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
                 "too many blocks in cooperative launch",  # CUDA cooperative launch limit
                 "too many resources requested for launch",  # Triton resource error
                 "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
+                "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
+                "[CUDA]: out of memory",  # Triton CUDA OOM
                 "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
             ],
         )
@@ -497,7 +560,7 @@ def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "d
       - "debug": benign/expected error; caller can log at debug level
     """
     # Known exception types first
-    if isinstance(err, OutOfResources):
+    if isinstance(err, (OutOfResources, CudaOOMError)):
         return "debug"
     # Different PTXASError classes may be raised from different modules; match by name as well
     if isinstance(err, PTXASError) or err.__class__.__name__ == "PTXASError":

@@ -18,9 +18,7 @@ The workflow is:
 from __future__ import annotations
 
 import csv
-import dataclasses
 from dataclasses import dataclass
-import functools
 import hashlib
 import importlib
 import importlib.util
@@ -39,171 +37,29 @@ from typing import Literal
 
 import torch
 
-from ..experimental.aot_kernel import _flatten_key_value
-from ..experimental.aot_kernel import extract_key_features
-from ..experimental.aot_kernel import extract_shape_features
+from .._hardware import get_hardware_info
 from ..runtime.config import Config
+from .aot_kernel import _flatten_key_value
+from .aot_kernel import extract_key_features
+from .aot_kernel import extract_shape_features
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from typing import Callable
 
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
-
-# Compute capability lists for fallback (newest to oldest)
-_CUDA_COMPUTE_CAPS: list[str] = [
-    "sm100",
-    "sm90",
-    "sm89",
-    "sm87",
-    "sm86",
-    "sm80",
-    "sm75",
-    "sm72",
-    "sm70",
-]
-
-_ROCM_ARCHS: list[str] = [
-    "gfx950",
-    "gfx942",
-    "gfx941",
-    "gfx940",
-    "gfx90a",
-    "gfx908",
-    "gfx906",
-    "gfx900",
-]
-
-
-@dataclasses.dataclass(frozen=True)
-class HardwareInfo:
-    """
-    Hardware information for cache keys and heuristic file discovery.
-
-    Attributes:
-        device_kind: Device type ('cuda', 'rocm', 'xpu')
-        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a')
-        runtime_version: Runtime version (e.g., '12.4', 'gfx90a')
-        compute_capability: Compute capability for heuristics (e.g., 'sm90', 'gfx90a')
-    """
-
-    device_kind: str
-    hardware_name: str
-    runtime_version: str
-    compute_capability: str
-
-    @property
-    def hardware_id(self) -> str:
-        """Get a unique identifier string for this hardware."""
-        safe_name = self.hardware_name.replace(" ", "_")
-        return f"{self.device_kind}_{safe_name}_{self.runtime_version}"
-
-    def get_compatible_compute_ids(self) -> list[str]:
-        """
-        Get a list of compatible compute IDs for fallback, ordered from current to oldest.
-
-        For CUDA/ROCm, returns the current compute capability followed by all older
-        compatible architectures. This allows using heuristics tuned on older hardware
-        when newer hardware-specific heuristics aren't available.
-        """
-        if self.device_kind == "cuda":
-            arch_list = _CUDA_COMPUTE_CAPS
-        elif self.device_kind == "rocm":
-            arch_list = _ROCM_ARCHS
-        else:
-            return [self.compute_capability]
-
-        try:
-            current_idx = arch_list.index(self.compute_capability)
-            return arch_list[current_idx:]
-        except ValueError:
-            return [self.compute_capability, *arch_list]
-
-
-@functools.cache
-def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
-    """
-    Get hardware information for the current or specified device.
-
-    This is the single source of truth for hardware detection, used by both
-    local cache and AOT cache.
-
-    Args:
-        device: Optional device to get info for. If None, uses first available GPU or CPU.
-
-    Returns:
-        HardwareInfo with device details for caching and heuristic lookup.
-    """
-    # XPU (Intel) path
-    if (
-        device is not None
-        and device.type == "xpu"
-        and getattr(torch, "xpu", None) is not None
-        and torch.xpu.is_available()
-    ):
-        props = torch.xpu.get_device_properties(device)
-        return HardwareInfo(
-            device_kind="xpu",
-            hardware_name=props.name,
-            runtime_version=props.driver_version,
-            compute_capability=props.name,  # XPU doesn't have compute capability
-        )
-
-    # CUDA/ROCm path
-    if torch.cuda.is_available():
-        dev = (
-            device
-            if device is not None and device.type == "cuda"
-            else torch.device("cuda:0")
-        )
-        props = torch.cuda.get_device_properties(dev)
-
-        if torch.version.cuda is not None:
-            return HardwareInfo(
-                device_kind="cuda",
-                hardware_name=props.name,
-                runtime_version=str(torch.version.cuda),
-                compute_capability=f"sm{props.major}{props.minor}",
-            )
-        if torch.version.hip is not None:
-            return HardwareInfo(
-                device_kind="rocm",
-                hardware_name=props.gcnArchName,
-                runtime_version=torch.version.hip,
-                compute_capability=props.gcnArchName,
-            )
-
-    # TPU / Pallas path
-    try:
-        import jax
-
-        tpu_devices = [d for d in jax.devices() if d.platform == "tpu"]
-        if tpu_devices:
-            first_tpu = tpu_devices[0]
-            return HardwareInfo(
-                device_kind="tpu",
-                hardware_name=first_tpu.device_kind,
-                runtime_version=jax.__version__,
-                compute_capability=first_tpu.device_kind,
-            )
-    except ImportError:
-        pass
-
-    raise RuntimeError(
-        "No supported GPU or TPU device found. Helion requires CUDA, ROCm, XPU, or TPU."
-    )
-
 
 # Environment variable to control AOT mode
 AOT_MODE_ENV = "HELION_AOT_MODE"
 AOT_DATA_DIR_ENV = "HELION_AOT_DATA_DIR"
 # Environment variable to override heuristic search path (for comparing heuristics)
 HEURISTIC_DIR_ENV = "HELION_HEURISTIC_DIR"
-# Environment variable to enable verbose output in evaluate mode (default: quiet)
+# Environment variable to enable verbose output in quiet AOT modes.
 AOT_VERBOSE_ENV = "HELION_AOT_VERBOSE"
 
 AOTMode = Literal["collect", "measure", "evaluate", "compile", "disabled"]
@@ -223,7 +79,7 @@ def get_aot_mode() -> AOTMode:
 def is_aot_verbose() -> bool:
     """Check if verbose output is enabled for AOT mode.
 
-    In evaluate mode, output is quiet by default (just using heuristics).
+    In evaluate and compile mode, output is quiet by default.
     Set HELION_AOT_VERBOSE=1 to enable verbose output.
     """
     return os.environ.get(AOT_VERBOSE_ENV, "").lower() in ("1", "true", "yes")
@@ -387,6 +243,10 @@ def compute_tensor_hash(tensor: torch.Tensor) -> str:
     # Convert dtypes not supported by numpy (e.g., bfloat16)
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.to(torch.float32)
+    # fp8 (and other sub-byte-named) dtypes have no numpy equivalent; hash the
+    # raw bytes by viewing as uint8 (fp8_e4m3fn / fp8_e5m2 are 1 byte each).
+    elif tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        tensor = tensor.view(torch.uint8)
     return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:8]
 
 
@@ -448,8 +308,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
         cls._mode_announced.clear()
         log.debug("Cleared AOTAutotuneCache caches")
 
-    def __init__(self, autotuner: BaseSearch) -> None:
-        super().__init__(autotuner)
+    def __init__(
+        self,
+        autotuner: BaseSearch,
+        *,
+        autotuner_factory: Callable[[], BaseSearch] | None = None,
+    ) -> None:
+        super().__init__(autotuner, autotuner_factory=autotuner_factory)
         self.mode = get_aot_mode()
         self.hardware_id = get_hardware_info().hardware_id
         self.data_dir = get_aot_data_dir()
@@ -463,7 +328,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._collect_fn = getattr(self.kernel.kernel, "_aot_collect_fn", None)
         self._measure_fn = getattr(self.kernel.kernel, "_aot_measure_fn", None)
 
-        # Announce mode once per mode type (quiet in evaluate mode unless verbose)
+        # Announce mode once per mode type (quiet in evaluate/compile unless verbose)
         should_announce = (
             self.mode != "disabled"
             and self.mode not in AOTAutotuneCache._mode_announced
@@ -479,6 +344,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
             if num_configs > 0:
                 print(f"[AOT] Loaded {num_configs} existing configs", file=sys.stderr)
             AOTAutotuneCache._mode_announced.add(self.mode)
+
+    def _should_report_cache_hit(self) -> bool:
+        return self.mode not in ("evaluate", "compile") or self._verbose
 
     @property
     def _configs_file(self) -> Path:
@@ -684,7 +552,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 print(
                     f"[AOT] Warning: No heuristic found for '{kernel_name}'. "
                     f"Using default config. "
-                    f"Use `python -m helion.experimental.aot_runner` to generate tuned configs.",
+                    f"Use `python -m helion.autotuner.aot_runner` to generate tuned configs.",
                     file=sys.stderr,
                 )
         return self.autotuner.config_spec.default_config()
@@ -977,7 +845,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 )
 
         # -- emit standalone file -------------------------------------------
-        from ..experimental.aot_compile import generate_standalone_file
+        from .aot_compile import generate_standalone_file
 
         out_path = generate_standalone_file(
             kernel_name=kernel_name,

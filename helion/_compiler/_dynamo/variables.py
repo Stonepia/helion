@@ -28,13 +28,19 @@ from helion.runtime.kernel import Kernel
 _SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
 
 if TYPE_CHECKING:
-    from torch._dynamo.symbolic_convert import InstructionTranslator
+    from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
-    """Find params mutated via subscript assignment (e.g. x[tile] = ...)."""
+    """Find params mutated in place via subscript store (x[tile] = ...) or
+    atomic op (hl.atomic_*(x, ...)).
+
+    Uses ``inplace_writes`` rather than ``writes`` so that a plain rebind of a
+    param name (``x, y = torch.broadcast_tensors(x, y)``) is not mistaken for a
+    mutation of the caller's tensor.
+    """
     rw = ReadWrites.from_list(body)
-    return [name for name in rw.writes if name in param_names]
+    return [name for name in rw.inplace_writes if name in param_names]
 
 
 def _validate_return(
@@ -320,7 +326,7 @@ class HelionKernelVariable(VariableTracker):
 
     def call_function(
         self,
-        tx: InstructionTranslator,
+        tx: InstructionTranslatorBase,
         args: Sequence[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
@@ -373,7 +379,7 @@ class HelionKernelVariable(VariableTracker):
         hop_kwargs = {
             "kernel_idx": self._kernel_idx,
             "constant_args": constant_args,
-            "tensor_args": ConstDictVariable(tensor_args, dict).as_proxy(),
+            "tensor_args": ConstDictVariable(tensor_args).as_proxy(),
             "output_spec": output_spec,
         }
 
@@ -399,7 +405,7 @@ class HelionKernelVariable(VariableTracker):
             else None,
         )
         result = _call_function_and_unflatten_output(
-            tx,
+            cast("Any", tx),
             helion_kernel_wrapper_mutation,
             (),
             hop_kwargs,

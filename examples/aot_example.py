@@ -16,19 +16,19 @@ The AOT workflow consists of four phases:
 
 Usage:
     # Run the full workflow using the AOT runner
-    python -m helion.experimental.aot_runner -- python examples/aot_example.py
+    python -m helion.autotuner.aot_runner -- python examples/aot_example.py
 
     # Run only specific kernels
-    python -m helion.experimental.aot_runner --kernel row_softmax -- python examples/aot_example.py
+    python -m helion.autotuner.aot_runner --kernel row_softmax -- python examples/aot_example.py
 
     # Or run individual phases manually:
     HELION_AOT_MODE=collect HELION_AOT_DATA_DIR=./aot_data python examples/aot_example.py
     HELION_AOT_MODE=measure HELION_AOT_DATA_DIR=./aot_data python examples/aot_example.py
 
-Using @helion.experimental.aot_kernel():
-    The simplest way to use AOT autotuning is with the @helion.experimental.aot_kernel() decorator:
+Using @helion.aot_kernel():
+    The simplest way to use AOT autotuning is with the @helion.aot_kernel() decorator:
 
-    @helion.experimental.aot_kernel()
+    @helion.aot_kernel()
     def my_kernel(...):
         ...
 
@@ -44,10 +44,10 @@ import argparse
 import os
 
 import torch
-from triton.testing import do_bench
 
+import helion
 from helion._testing import DEVICE
-import helion.experimental
+from helion.autotuner.benchmarking import do_bench_generic as do_bench
 import helion.language as hl
 
 # ============================================================================
@@ -55,7 +55,7 @@ import helion.language as hl
 # ============================================================================
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
     """Scale a vector by a constant."""
     n = x.size(0)
@@ -72,7 +72,7 @@ def vector_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
 # ============================================================================
 
 
-@helion.experimental.aot_kernel(static_shapes=False)
+@helion.aot_kernel(static_shapes=False)
 def row_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Row-wise softmax with explicit 2D tiling.
@@ -111,7 +111,7 @@ def row_softmax(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@helion.experimental.aot_kernel()
+@helion.aot_kernel()
 def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     """
     Column-wise sum reduction with 2D tiling.
@@ -144,7 +144,7 @@ def col_reduce_sum(x: torch.Tensor) -> torch.Tensor:
 # ============================================================================
 
 
-@helion.experimental.aot_kernel(batched=[[0, None], None])
+@helion.aot_kernel(batched=[[0, None], None])
 def rms_norm_batched(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
     """RMS normalization with batch-aware heuristic.
 
@@ -194,7 +194,7 @@ def _rms_norm_oneshot_measure_inputs() -> list[tuple[torch.Tensor, float]]:
     ]
 
 
-@helion.experimental.aot_kernel(
+@helion.aot_kernel(
     batched=[[0, None], None],
     collect_fn=_rms_norm_oneshot_collect_inputs,
     measure_fn=_rms_norm_oneshot_measure_inputs,
@@ -242,7 +242,7 @@ def _matmul_key(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int, int, int]:
     return (m, n, k, a.element_size())
 
 
-@helion.experimental.aot_kernel(key=_matmul_key)
+@helion.aot_kernel(key=_matmul_key)
 def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Matrix multiplication with custom key function for heuristic.
 
@@ -269,9 +269,44 @@ def matmul_custom_key(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.aot_kernel()
+def sum_aot(x: torch.Tensor) -> torch.Tensor:
+    """
+    Sums a 2D tensor along the last dimension.
+    This kernel is proven to compile and run reliably on Pallas/TPU.
+    """
+    m, n = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].sum(-1)
+
+    return out
+
+
 # ============================================================================
 # Benchmarking
 # ============================================================================
+
+
+def benchmark_sum_aot() -> None:
+    """Benchmark sum_aot kernel."""
+    print("=== sum_aot kernel ===")
+    print(f"{'Shape':>16} {'Time (ms)':>12} {'GB/s':>10}")
+    print("-" * 40)
+    # Use sizes that trigger interesting block selection behavior
+    shapes = [
+        (5120, 256),
+        (10240, 256),
+    ]
+    for m, n in shapes:
+        x = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        sum_aot(x)  # Warmup
+        time_ms = do_bench(lambda x=x: sum_aot(x))
+        assert isinstance(time_ms, float)
+        total_bytes = x.numel() * x.element_size() * 2  # read + write
+        gbps = total_bytes / time_ms * 1e-6
+        print(f"{(m, n)!s:>16} {time_ms:>12.4f} {gbps:>10.2f}")
 
 
 def benchmark_vector_scale() -> None:
@@ -425,6 +460,10 @@ KERNEL_BENCHMARKS = {
     "matmul_custom_key": benchmark_matmul_custom_key,
 }
 
+TPU_SUPPORTED_KERNELS = {
+    "sum_aot": benchmark_sum_aot,
+}
+
 
 def benchmark_kernels(kernels: list[str] | None = None) -> None:
     """Run benchmarks on selected kernels."""
@@ -432,17 +471,21 @@ def benchmark_kernels(kernels: list[str] | None = None) -> None:
     print(f"AOT Data Dir: {os.environ.get('HELION_AOT_DATA_DIR', 'N/A')}")
     print()
 
+    active_benchmarks = (
+        TPU_SUPPORTED_KERNELS if DEVICE.type == "tpu" else KERNEL_BENCHMARKS
+    )
+
     if kernels is None:
-        kernels = list(KERNEL_BENCHMARKS.keys())
+        kernels = list(active_benchmarks.keys())
 
     for i, kernel_name in enumerate(kernels):
-        if kernel_name in KERNEL_BENCHMARKS:
+        if kernel_name in active_benchmarks:
             if i > 0:
                 print()
-            KERNEL_BENCHMARKS[kernel_name]()
+            active_benchmarks[kernel_name]()
         else:
             print(f"Unknown kernel: {kernel_name}")
-            print(f"Available kernels: {', '.join(KERNEL_BENCHMARKS.keys())}")
+            print(f"Available kernels: {', '.join(active_benchmarks.keys())}")
 
 
 def main() -> None:
@@ -473,9 +516,7 @@ def main() -> None:
         print()
     else:
         print(f"Running in AOT mode: {aot_mode}")
-        print(
-            "(Using @helion.experimental.aot_kernel() for automatic AOT configuration)"
-        )
+        print("(Using @helion.aot_kernel() for automatic AOT configuration)")
         print()
 
     benchmark_kernels(kernels)

@@ -144,7 +144,11 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
                 return pop[:target]
             return pop
 
-        return self.config_gen.random_population_flat(self.population_size * 2)
+        return self.config_gen.random_population_flat(
+            self.population_size * 2,
+            user_seed_configs=self._autotune_seed_configs(),
+            log_func=self.log,
+        )
 
     def initial_two_generations(self) -> None:
         # The initial population is 2x larger so we can throw out the slowest half and give the tuning process a head start
@@ -265,7 +269,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.best_perf_history = [self.best.perf]
             self.generations_without_improvement = 0
 
-        for i in range(2, self.max_generations):
+        for i in self._budgeted_range(2, self.max_generations):
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()
@@ -277,6 +281,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
         self.rebenchmark_population()
 
-        # Run finishing phase to simplify the best configuration
+        # Run final verification and finishing phase to simplify the best configuration.
+        self.best = self.final_rebenchmark_best(self.best)
         self.best = self.run_finishing_phase(self.best, self.finishing_rounds)
         return self.best.config

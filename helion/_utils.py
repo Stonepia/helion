@@ -24,6 +24,14 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def prev_power_of_2(n: int) -> int:
+    """Return the largest power of 2 <= n (>= 1). Use this to floor a budget to a valid
+    pow2 tile: ``next_power_of_2`` would round UP past the budget."""
+    if n <= 1:
+        return 1
+    return 1 << (n.bit_length() - 1)
+
+
 @functools.cache
 def triton_is_available() -> bool:
     """Return True if triton is installed and importable."""
@@ -89,3 +97,27 @@ def convert_tile_indices_to_slices(index: object) -> object:
     if isinstance(index, tuple):
         return tuple(_extract_slice(idx) for idx in index)
     return _extract_slice(index)
+
+
+def is_scalar_index(idx: object) -> bool:
+    """Return True if the given index behaves as a single scalar coordinate."""
+    import torch
+
+    if isinstance(idx, torch.SymInt):
+        # Exclude tiled block ranges.
+        from helion._compiler.compile_environment import CompileEnvironment
+        from helion._compiler.compile_environment import NoCurrentEnvironment
+
+        try:
+            env = CompileEnvironment.current()
+            if env.get_block_id(idx) is not None:
+                return False
+        except NoCurrentEnvironment:
+            pass
+        return True
+
+    if isinstance(idx, int):
+        return True
+    if hasattr(idx, "ndim"):
+        return idx.ndim == 0
+    return False

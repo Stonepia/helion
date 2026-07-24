@@ -1,0 +1,4779 @@
+from __future__ import annotations
+
+import math
+import os
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import torch
+
+import helion
+from helion._compiler.autotuner_heuristics import compiler_seed_configs
+from helion._compiler.autotuner_heuristics.cute import (
+    CuteFlashAttentionCausalLptHeuristic,
+)
+from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
+from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonStandardReductionHeuristicSM90,
+)
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonStandardReductionHeuristicSM100,
+)
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonUserTiledReductionHeuristicSM90,
+)
+from helion._compiler.backend import CuteBackend
+from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
+from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
+from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
+from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
+from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
+from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
+from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
+from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
+from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
+from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+from helion._compiler.cute.cute_flash import FLASH_MMA_INTERLEAVE_KEY
+from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
+from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
+from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
+from helion._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
+from helion._compiler.cute.cute_flash import FLASH_RECOMPUTE_TILE_COORDS_KEY
+from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
+from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+from helion._compiler.cute.cute_flash import FLASH_S_LOAD_REP_KEY
+from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
+from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
+from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
+from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
+from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+from helion._compiler.cute.cute_flash import flash_attention_seed_config
+from helion._compiler.cute.cute_flash import flash_attention_seed_configs
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY
+from helion._compiler.cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
+from helion._compiler.cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
+from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+from helion._compiler.cute.strategies import Tcgen05Strategy
+from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE,
+)
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
+from helion._compiler.cute.tcgen05_constants import tcgen05_default_epilogue_tile_size
+from helion._hardware import HardwareInfo
+from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
+from helion._testing import TestCase
+from helion._testing import default_cute_mma_support
+from helion._testing import onlyBackends
+from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfRefEager
+from helion.autotuner import IntegerFragment
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import BlockSizeSpec
+from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import CoResidencyGroup
+from helion.autotuner.config_spec import MatmulFact
+from helion.autotuner.config_spec import ReductionCategory
+from helion.autotuner.config_spec import ReductionDescriptor
+from helion.autotuner.config_spec import ReductionKernelFact
+from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.pattern_search import PatternSearch
+import helion.language as hl
+from helion.runtime.settings import Settings
+
+HOPPER_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA H100",
+    runtime_version="12.8",
+    compute_capability="sm90",
+)
+MI350_HARDWARE = HardwareInfo(
+    device_kind="rocm",
+    hardware_name="AMD MI350",
+    runtime_version="7.0",
+    compute_capability="gfx950",
+)
+BLACKWELL_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA B200",
+    runtime_version="12.8",
+    compute_capability="sm100",
+)
+A100_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA A100",
+    runtime_version="12.8",
+    compute_capability="sm80",
+)
+
+
+class TestAutotunerHeuristic(TestCase):
+    def test_disable_autotuner_heuristics_setting_env(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HELION_DISABLE_AUTOTUNER_HEURISTICS", None)
+            self.assertFalse(Settings().disable_autotuner_heuristics)
+
+        with patch.dict(
+            os.environ,
+            {"HELION_DISABLE_AUTOTUNER_HEURISTICS": "1"},
+        ):
+            self.assertTrue(Settings().disable_autotuner_heuristics)
+
+    def test_compiler_seed_configs_handles_failed_optional_and_duplicate_seeds(
+        self,
+    ) -> None:
+        class FailingAutotunerHeuristic(AutotunerHeuristic):
+            name = "failing_autotuner_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                return True
+
+            @classmethod
+            def get_seed_config(cls, env: object, device_ir: object) -> helion.Config:
+                raise RuntimeError("synthetic compiler seed failure")
+
+        class NoSeedAutotunerHeuristic(AutotunerHeuristic):
+            name = "no_seed_autotuner_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                return True
+
+        class ValidAutotunerHeuristic(AutotunerHeuristic):
+            name = "valid_autotuner_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                return True
+
+            @classmethod
+            def get_seed_config(cls, env: object, device_ir: object) -> helion.Config:
+                return helion.Config(block_sizes=[64])
+
+        class DuplicateAutotunerHeuristic(ValidAutotunerHeuristic):
+            name = "duplicate_autotuner_heuristic"
+
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = MagicMock()
+        env.settings = Settings()
+        heuristics = (
+            FailingAutotunerHeuristic,
+            NoSeedAutotunerHeuristic,
+            ValidAutotunerHeuristic,
+            DuplicateAutotunerHeuristic,
+        )
+
+        with (
+            self.assertLogs(
+                "helion._compiler.autotuner_heuristics", level="DEBUG"
+            ) as logs,
+            patch(
+                "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+                {"triton": heuristics},
+            ),
+        ):
+            configs = compiler_seed_configs(env, MagicMock())
+
+        self.assertEqual([config.config for config in configs], [{"block_sizes": [64]}])
+        self.assertEqual(
+            env.config_spec.autotuner_heuristics,
+            [ValidAutotunerHeuristic.name, DuplicateAutotunerHeuristic.name],
+        )
+        self.assertIn(FailingAutotunerHeuristic.name, "\n".join(logs.output))
+        self.assertIn("synthetic compiler seed failure", "\n".join(logs.output))
+
+    def test_compiler_seed_configs_respects_disable_setting(self) -> None:
+        class EnabledAutotunerHeuristic(AutotunerHeuristic):
+            name = "enabled_autotuner_heuristic"
+            backend = "triton"
+
+            @classmethod
+            def is_eligible(cls, env: object, device_ir: object) -> bool:
+                raise AssertionError("disabled heuristics should not be queried")
+
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = MagicMock()
+        env.config_spec.autotuner_heuristics = ["stale"]
+        env.settings = Settings(disable_autotuner_heuristics=True)
+
+        with patch(
+            "helion._compiler.autotuner_heuristics.HEURISTICS_BY_BACKEND",
+            {"triton": (EnabledAutotunerHeuristic,)},
+        ):
+            configs = compiler_seed_configs(env, MagicMock())
+
+        self.assertEqual(configs, [])
+        self.assertEqual(env.config_spec.autotuner_heuristics, [])
+
+    def test_cute_flash_disable_heuristics_keeps_value_priors(self) -> None:
+        spec = ConfigSpec(backend=CuteBackend())
+        for block_id, size_hint in enumerate((1, 128, 128)):
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
+            )
+        spec.enable_cute_flash_search(
+            head_dim=64,
+            num_kv=64,
+            block_size_targets={0: 1, 1: 128, 2: 128},
+            is_causal=True,
+        )
+        env = MagicMock()
+        env.backend_name = "cute"
+        env.config_spec = spec
+        env.settings = Settings(disable_autotuner_heuristics=True)
+
+        self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
+        self.assertEqual(spec.compiler_seed_configs, [])
+        self.assertEqual(spec.autotuner_heuristics, [])
+        self.assertTrue(spec.autotune_seed_configs())
+
+        config_gen = spec.create_config_generation()
+        self.assertIn(FLASH_TOPOLOGY_KEY, config_gen._config_value_priors)
+        self.assertIn(FLASH_CAUSAL_KV_ORDER_KEY, config_gen._config_value_priors)
+        population = config_gen.random_population(4)
+
+        self.assertGreaterEqual(len(population), 4)
+        self.assertIn(spec.default_config(), population)
+
+    def test_seed_flat_config_pairs_skips_invalid_compiler_seed(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.compiler_seed_configs = [
+            helion.Config(block_sizes=["invalid"]),
+            helion.Config(block_sizes=[64]),
+        ]
+        config_gen = spec.create_config_generation()
+        messages: list[str] = []
+
+        pairs = config_gen.seed_flat_config_pairs(messages.append)
+
+        self.assertEqual(
+            [config.config["block_sizes"] for _flat, config in pairs],
+            [[64]],
+        )
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Failed to transfer compiler seed config 1", messages[0])
+
+    def test_default_config_promotes_compiler_seed(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.compiler_default_config = helion.Config(
+            block_sizes=[64], num_warps=8, num_stages=2
+        )
+
+        default = spec.default_config()
+        config_gen = spec.create_config_generation()
+        flat_default = config_gen.unflatten(config_gen.default_flat())
+
+        self.assertEqual(default.config["block_sizes"], [64])
+        self.assertEqual(default.config["num_warps"], 8)
+        self.assertEqual(default.config["num_stages"], 2)
+        self.assertEqual(flat_default.config["block_sizes"], [64])
+        self.assertEqual(flat_default.config["num_warps"], 8)
+        self.assertEqual(flat_default.config["num_stages"], 2)
+
+    def test_should_promote_gate(self) -> None:
+        # should_promote() gates a seed's PROMOTION (becoming the autotune-off
+        # default) on PROMOTE_TARGETS, independently of where the seed fires.
+        env = MagicMock()
+        env.device = "cuda"
+
+        class _AllArches(AutotunerHeuristic):
+            promote_seed_to_default = True
+            PROMOTE_TARGETS = None  # promote wherever it fires (back-compat)
+
+        class _Sm90Only(AutotunerHeuristic):
+            promote_seed_to_default = True
+            PROMOTE_TARGETS = (("cuda", "sm90"),)
+
+        class _NotPromoting(AutotunerHeuristic):
+            promote_seed_to_default = False
+            PROMOTE_TARGETS = (("cuda", "sm90"),)
+
+        # PROMOTE_TARGETS=None promotes without consulting hardware.
+        self.assertTrue(_AllArches.should_promote(env))
+
+        # A target list restricts promotion to the matching arch...
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            self.assertTrue(_Sm90Only.should_promote(env))
+        # ...and declines on an off-target arch (seed still fires; only the
+        # promotion is gated).
+        with patch(
+            "helion._hardware.get_hardware_info", return_value=BLACKWELL_HARDWARE
+        ):
+            self.assertFalse(_Sm90Only.should_promote(env))
+
+        # promote_seed_to_default=False vetoes regardless of the target list.
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            self.assertFalse(_NotPromoting.should_promote(env))
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_pointwise_seed_promotes_only_on_target_arch(self) -> None:
+        # The pointwise seed fires arch-agnostically but its PROMOTION to the
+        # autotune-off default is gated to PROMOTE_TARGETS (sm90/sm100). On a
+        # target arch the promoted seed replaces the base default; off-target it
+        # is still offered as a search candidate but the base default is kept.
+        def make_add() -> object:
+            @helion.kernel(backend="triton")
+            def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.shape):
+                    out[tile] = x[tile] + y[tile]
+                return out
+
+            return triton_add
+
+        x = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
+        y = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
+
+        self.assertIn(("cuda", "sm90"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
+        self.assertIn(("cuda", "sm100"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
+
+        # A fresh kernel object per arch: bind() caches by args, so reusing one
+        # kernel would return the first arch's config on the second bind.
+        for name, hardware, promotes in (
+            ("sm90", HOPPER_HARDWARE, True),
+            ("sm100", BLACKWELL_HARDWARE, True),
+            ("sm80", A100_HARDWARE, False),
+        ):
+            with (
+                self.subTest(arch=name),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                bound = make_add().bind((x, y))
+                spec = bound.config_spec
+                # The seed fires and is offered as a search candidate on every arch.
+                self.assertEqual(spec.autotuner_heuristics, ["triton_pointwise"])
+                self.assertEqual(len(spec.compiler_seed_configs), 1)
+                seed = spec.compiler_seed_configs[0]
+                if promotes:
+                    self.assertEqual(spec.compiler_default_config, seed)
+                else:
+                    self.assertIsNone(spec.compiler_default_config)
+
+
+class TestMatmulFacts(TestCase):
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
+    def test_matmul_facts_record_kernel_structure(self) -> None:
+        @helion.kernel(backend="triton")
+        def triton_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="triton")
+        def triton_matmul_epilogue(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="triton")
+        def triton_two_matmuls(
+            x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc0 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                acc1 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc0 = torch.addmm(acc0, x[tile_m, tile_k], y[tile_k, tile_n])
+                    acc1 = torch.addmm(acc1, x[tile_m, tile_k], z[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc0 + acc1).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="triton")
+        def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                out[tile_m] = x[tile_m] + y[tile_m]
+            return out
+
+        x = torch.empty([1024, 4096], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.empty([4096, 8192], device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.empty([4096, 8192], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.empty([8192], device=DEVICE, dtype=HALF_DTYPE)
+        add_x = torch.empty([1024], device=DEVICE, dtype=HALF_DTYPE)
+        add_y = torch.empty([1024], device=DEVICE, dtype=HALF_DTYPE)
+
+        cases = (
+            ("gemm", triton_matmul, (x, y), 1),
+            ("gemm_epilogue", triton_matmul_epilogue, (x, y, bias), 1),
+            ("gemm_gemm", triton_two_matmuls, (x, y, z), 2),
+            ("add", triton_add, (add_x, add_y), 0),
+        )
+
+        for name, kernel, args, expected_facts in cases:
+            with (
+                self.subTest(name=name),
+                patch(
+                    "helion._hardware.get_hardware_info",
+                    return_value=HOPPER_HARDWARE,
+                ),
+            ):
+                bound = kernel.bind(args)
+
+            self.assertEqual(len(bound.config_spec.matmul_facts), expected_facts)
+            if expected_facts == 0:
+                # No matmul fact: a pure-pointwise kernel (triton_add) is instead seeded by
+                # TritonPointwiseSeedHeuristic. Assert it routes there (one seed config), not
+                # the pre-pointwise-heuristic expectation of no seed at all.
+                self.assertEqual(
+                    bound.config_spec.autotuner_heuristics, ["triton_pointwise"]
+                )
+                self.assertEqual(len(bound.config_spec.compiler_seed_configs), 1)
+            for fact in bound.config_spec.matmul_facts:
+                self.assertEqual(fact.lhs_ndim, 2)
+                self.assertEqual(fact.rhs_ndim, 2)
+                self.assertEqual(
+                    (fact.static_m, fact.static_n, fact.static_k),
+                    (1024, 8192, 4096),
+                )
+                self.assertIsNotNone(fact.m_block_id)
+                self.assertIsNotNone(fact.n_block_id)
+                self.assertIsNotNone(fact.k_block_id)
+                self.assertEqual(fact.lhs_dtype, HALF_DTYPE)
+                self.assertEqual(fact.rhs_dtype, HALF_DTYPE)
+
+
+class TestTritonSkinnyGemmHeuristic(TestCase):
+    def _make_triton_env_with_block_sizes(
+        self,
+        m_max: int = 8192,
+        n_max: int = 8192,
+        k_max: int = 8192,
+    ) -> MagicMock:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=m_max))
+        spec.block_sizes.append(BlockSizeSpec(block_id=1, size_hint=n_max))
+        spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=k_max))
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.config_spec = spec
+        env.device = DEVICE
+        env.settings = Settings()
+        return env
+
+    def _matmul_fact(
+        self,
+        static_m: int = 1024,
+        static_n: int = 8192,
+        static_k: int = 4096,
+        *,
+        lhs_ndim: int = 2,
+        rhs_ndim: int = 2,
+        m_block_id: int | None = 0,
+        n_block_id: int | None = 1,
+        k_block_id: int | None = 2,
+    ) -> MatmulFact:
+        return MatmulFact(
+            lhs_ndim=lhs_ndim,
+            rhs_ndim=rhs_ndim,
+            m_block_id=m_block_id,
+            n_block_id=n_block_id,
+            k_block_id=k_block_id,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=HALF_DTYPE,
+            rhs_dtype=HALF_DTYPE,
+        )
+
+    def test_triton_skinny_gemm_seed_eligibility_and_config(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "hopper",
+                HOPPER_HARDWARE,
+                [self._matmul_fact()],
+                [[64, 64, 256]],
+                [TritonSkinnyGemmHeuristic.name],
+            ),
+            (
+                "mi350",
+                MI350_HARDWARE,
+                [self._matmul_fact()],
+                [[64, 64, 256]],
+                [TritonSkinnyGemmHeuristic.name],
+            ),
+            (
+                "blackwell",
+                BLACKWELL_HARDWARE,
+                [self._matmul_fact()],
+                [],
+                [],
+            ),
+            (
+                "balanced_shape",
+                HOPPER_HARDWARE,
+                [self._matmul_fact(static_m=4096, static_n=4096)],
+                [],
+                [],
+            ),
+            (
+                "multiple_matmuls",
+                HOPPER_HARDWARE,
+                [self._matmul_fact(), self._matmul_fact()],
+                [],
+                [],
+            ),
+        )
+        for name, hardware, facts, expected_block_sizes, expected_heuristics in cases:
+            env = self._make_triton_env_with_block_sizes()
+            env.config_spec.matmul_facts.extend(facts)
+            with (
+                self.subTest(name=name),
+                patch(
+                    "helion._hardware.get_hardware_info",
+                    return_value=hardware,
+                ),
+            ):
+                configs = compiler_seed_configs(env, MagicMock())
+
+            self.assertEqual(
+                [config.config["block_sizes"] for config in configs],
+                expected_block_sizes,
+            )
+            self.assertEqual(
+                env.config_spec.autotuner_heuristics,
+                expected_heuristics,
+            )
+
+    def test_triton_skinny_gemm_seed_clamps_to_static_dims(self) -> None:
+        env = self._make_triton_env_with_block_sizes(
+            m_max=16,
+            n_max=8192,
+            k_max=128,
+        )
+        env.config_spec.matmul_facts.append(
+            self._matmul_fact(static_m=16, static_n=8192, static_k=128)
+        )
+
+        config = TritonSkinnyGemmHeuristic.get_seed_config(env, MagicMock())
+
+        assert config is not None
+        self.assertEqual(config.config["block_sizes"], [16, 64, 128])
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
+    def test_triton_skinny_gemm_seed_in_initial_population(self) -> None:
+        @helion.kernel(backend="triton")
+        def triton_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="triton")
+        def triton_matmul_epilogue(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="triton")
+        def triton_two_matmuls(
+            x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc0 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                acc1 = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc0 = torch.addmm(acc0, x[tile_m, tile_k], y[tile_k, tile_n])
+                    acc1 = torch.addmm(acc1, x[tile_m, tile_k], z[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc0 + acc1).to(x.dtype)
+            return out
+
+        x = torch.empty([1024, 4096], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.empty([4096, 8192], device=DEVICE, dtype=HALF_DTYPE)
+        z = torch.empty([4096, 8192], device=DEVICE, dtype=HALF_DTYPE)
+        bias = torch.empty([8192], device=DEVICE, dtype=HALF_DTYPE)
+        cases = (
+            ("gemm", triton_matmul, (x, y), True),
+            ("gemm_epilogue", triton_matmul_epilogue, (x, y, bias), True),
+            ("gemm_gemm", triton_two_matmuls, (x, y, z), False),
+        )
+        seed_block_sizes = [64, 64, 256]
+
+        def assert_skinny_gemm_seeded(configs: list[helion.Config]) -> None:
+            self.assertIn(
+                seed_block_sizes,
+                [config.config["block_sizes"] for config in configs],
+            )
+
+        for name, kernel, args, expect_seed in cases:
+            with (
+                self.subTest(name=name),
+                patch(
+                    "helion._hardware.get_hardware_info",
+                    return_value=HOPPER_HARDWARE,
+                ),
+            ):
+                bound = kernel.bind(args)
+                heuristic = TritonSkinnyGemmHeuristic
+
+                config_gen = bound.config_spec.create_config_generation()
+                compiler_seed_block_sizes = [
+                    config.config["block_sizes"]
+                    for config in bound.config_spec.compiler_seed_configs
+                ]
+
+                if expect_seed:
+                    self.assertIn(
+                        TritonSkinnyGemmHeuristic.name,
+                        bound.config_spec.autotuner_heuristics,
+                    )
+                    self.assertTrue(
+                        heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+                    )
+                    seed_config = heuristic.get_seed_config(
+                        bound.env, bound.host_function.device_ir
+                    )
+                    assert seed_config is not None
+                    self.assertEqual(
+                        seed_config.config["block_sizes"],
+                        seed_block_sizes,
+                    )
+                    self.assertIn(seed_block_sizes, compiler_seed_block_sizes)
+                    assert_skinny_gemm_seeded(config_gen.random_population(2))
+                else:
+                    self.assertFalse(
+                        heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+                    )
+                    self.assertNotIn(
+                        TritonSkinnyGemmHeuristic.name,
+                        bound.config_spec.autotuner_heuristics,
+                    )
+
+
+class TestRopePointwiseSeed(TestCase):
+    """Rope (split/join rotate) is handled by the pointwise seed: its heavy untiled
+    [heads, head_dim] slab collapses the tunable tile, while a plain elementwise kernel
+    of the same dtype gets a bandwidth-sized tile.
+    """
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_rope_collapses_tile_elementwise_does_not(self) -> None:
+        @helion.kernel(backend="triton")
+        def rope_like(
+            q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        ) -> torch.Tensor:
+            batch, heads, seq_len, head_dim = q.size()
+            half_dim = head_dim // 2
+            out = torch.empty_like(q)
+            for tile_b, tile_t in hl.tile([batch, seq_len]):
+                cos_pair = (
+                    cos[tile_b, tile_t, :]
+                    .to(torch.float32)
+                    .reshape([tile_b, tile_t, 2, half_dim])
+                    .permute(0, 1, 3, 2)
+                )
+                cos_first, cos_second = hl.split(cos_pair)
+                q_pair = (
+                    q[tile_b, :, tile_t, :]
+                    .to(torch.float32)
+                    .reshape([tile_b, heads, tile_t, 2, half_dim])
+                    .permute(0, 1, 2, 4, 3)
+                )
+                q_first, q_second = hl.split(q_pair)
+                out[tile_b, :, tile_t, :] = (
+                    hl.join(
+                        q_first * cos_first[:, None, :, :],
+                        q_second * cos_second[:, None, :, :],
+                    )
+                    .permute(0, 1, 2, 4, 3)
+                    .reshape([tile_b, heads, tile_t, head_dim])
+                    .to(out.dtype)
+                )
+            return out
+
+        @helion.kernel(backend="triton")
+        def elementwise(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n] * y[tile_m, tile_n]
+            return out
+
+        q = torch.randn(2, 8, 256, 64, device=DEVICE, dtype=HALF_DTYPE)
+        angles = torch.randn(2, 256, 64, device=DEVICE, dtype=HALF_DTYPE)
+        rope = rope_like.bind((q, torch.cos(angles), torch.sin(angles)))
+        self.assertTrue(
+            TritonPointwiseSeedHeuristic.is_eligible(
+                rope.env, rope.host_function.device_ir
+            )
+        )
+        with rope.env:
+            rope_seed = TritonPointwiseSeedHeuristic.get_seed_config(
+                rope.env, rope.host_function.device_ir
+            )
+        # Heavy untiled [heads, head_dim] slab → the tunable tile collapses (not tiled past ~1).
+        self.assertLessEqual(math.prod(rope_seed.config["block_sizes"]), 8)
+
+        xy = (
+            torch.randn(512, 512, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(512, 512, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        ew = elementwise.bind(xy)
+        self.assertTrue(
+            TritonPointwiseSeedHeuristic.is_eligible(ew.env, ew.host_function.device_ir)
+        )
+        with ew.env:
+            ew_seed = TritonPointwiseSeedHeuristic.get_seed_config(
+                ew.env, ew.host_function.device_ir
+            )
+        # Plain elementwise (no slab) → a bandwidth-sized tile, not collapsed.
+        self.assertGreater(math.prod(ew_seed.config["block_sizes"]), 8)
+
+
+class TestTritonStandardReductionHeuristic(TestCase):
+    """Triton standard row-reduction heuristic: seeds the "one row per program"
+    skeleton with an rnumel-scaled ``num_warps`` ramp and faithful per-slot load
+    eviction, fires only for a canonical row reduction, and its persistent seed
+    survives flatten/unflatten (the config_spec sentinel round-trip fix).
+    """
+
+    def _reduction_spec(
+        self,
+        *,
+        reduction_size_hint: int,
+        num_load: int = 1,
+        itemsize: int = 4,
+        row_reread: bool = False,
+    ) -> ConfigSpec:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.reduction_loops.append(
+            ReductionLoopSpec(block_id=1, size_hint=reduction_size_hint)
+        )
+        # The deepened heuristic reads the primary ReductionDescriptor (the workload facts it
+        # keys the warp ramp / eviction / persist decision on) off the ReductionKernelFact; the
+        # reduction axis is block_id=1 (the rolled reduction loop above, so a FULL_SLICE), the
+        # row/grid axis is block_id=0.
+        desc = ReductionDescriptor(
+            category=ReductionCategory.FULL_SLICE,
+            block_id=1,
+            graph_id=0,
+            size_hint=reduction_size_hint,
+            itemsize=itemsize,
+            input_load_itemsize=itemsize,
+            row_reread=row_reread,
+            num_load=num_load,
+        )
+        spec.reduction_kernel_fact = ReductionKernelFact(
+            reductions=(desc,),
+            coresidency_groups=(
+                CoResidencyGroup(
+                    graph_id=0,
+                    descriptor_indices=(0,),
+                    # The resident live tiles of a one-row reduction (softmax/rms_norm-like): the
+                    # ``[grid_M, rdim]`` read/compute tile + a ``[grid_M]`` scalar carry. The grid
+                    # axis (block_id 0) APPEARS in a live tile -> it is register-RESIDENT, so
+                    # ``_has_reduced_away_grid`` is False (it is NOT a grad-parameter ``.sum(0)``
+                    # collapse). Without this the grid axis is in no tile and the residency test
+                    # wrongly flags a collapse, tripping the num_warps>=8 grad-param floor.
+                    live_tiles=((0, 1), (0,)),
+                ),
+            ),
+            grid_axis_block_ids=(0,),
+        )
+        return spec
+
+    def _reduction_env(self, spec: ConfigSpec) -> MagicMock:
+        # The deepened heuristic reads env.backend.max_tensor_numel (the structural
+        # persistent cap) — provide the real Triton cap so a sub-cap rnumel stays
+        # persistent.
+        from types import SimpleNamespace
+
+        from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+
+        env = MagicMock()
+        env.backend_name = "triton"
+        env.backend.max_tensor_numel = TRITON_MAX_TENSOR_NUMEL
+        env.config_spec = spec
+        env.device = DEVICE
+        # ``_primary_descriptor_selected`` filters the sized descriptors to the BACKED axes
+        # (``free_unbacked_symbols(env.block_sizes[bid].size)``), so the descriptor axes'
+        # ``env.block_sizes[bid].size`` must be a real (backed) int — a bare MagicMock can't be
+        # fed to sympy. Resolve each descriptor's block_id to its static ``size_hint``. For any
+        # OTHER block_id (the grid/M axis) keep a non-int so ``_grid_rows`` returns 0 (no static
+        # grid -> the occupancy-gated narrow-w1 warps lever stays disabled, as it was when the
+        # mock had no configured sizes at all).
+        sizes = {d.block_id: d.size_hint for d in spec.reduction_kernel_fact.reductions}
+        env.block_sizes.__getitem__.side_effect = lambda bid: SimpleNamespace(
+            size=sizes[bid] if bid in sizes else MagicMock()
+        )
+        return env
+
+    def test_seed_is_persistent_one_row(self) -> None:
+        # The structural seed: one row per program + persistent reduction. The
+        # deepened heuristic ALSO seeds num_warps via the rnumel ramp (rnumel=1024
+        # -> 4 warps) and num_stages=1, rather than leaving them to the autotuner.
+        env = self._reduction_env(self._reduction_spec(reduction_size_hint=1024))
+        # The mock env has no real GPU device, so patch hardware info / SM count (this
+        # heuristic only fires on GPU in production and the SM count is irrelevant here).
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                env, MagicMock()
+            )
+        self.assertEqual(seed.config["block_sizes"], [1])
+        self.assertEqual(seed.config["reduction_loops"], [None])
+        # rnumel ramp: 1024 falls in the <=1024 band -> 4 warps.
+        self.assertEqual(seed.config["num_warps"], 4)
+        self.assertEqual(seed.config["num_stages"], 1)
+
+    def test_single_load_seeds_stream_eviction_over_load_slots(self) -> None:
+        # A single-load streaming reduction (num_load==1: e.g. sum) is read once
+        # and never reused, so every load slot -> 'first' (evict_first frees L2),
+        # broadcast over the spec's load slots. Build the fragment explicitly so
+        # the test does not depend on the host backend's eviction choices.
+        from helion.autotuner.config_fragment import EnumFragment
+        from helion.autotuner.config_fragment import ListOf
+
+        spec = self._reduction_spec(reduction_size_hint=1024, num_load=1)
+        spec.load_eviction_policies = ListOf(
+            EnumFragment(choices=("", "first", "last")), length=4
+        )
+        env = self._reduction_env(spec)
+        # The mock env has no real GPU device, so patch hardware info / SM count (this
+        # heuristic only fires on GPU in production and the SM count is irrelevant here).
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                env, MagicMock()
+            )
+        self.assertEqual(
+            seed.config["load_eviction_policies"],
+            ["first", "first", "first", "first"],
+        )
+
+    def test_persistent_seed_round_trips_through_config_generation(self) -> None:
+        # reduction_loops=[None] (persistent) MUST survive flatten/unflatten. For
+        # a wide reduction (size_hint 32000) a sentinel < size_hint would decode
+        # back to the SLOW looped family this heuristic exists to avoid; the
+        # config_spec fix encodes None as the fragment's ``high`` (>= size_hint).
+        # row_reread=True makes the wide reduction persist under the read-once persist
+        # gate (read-once reductions deliberately loop), so there is a [None] to round-trip.
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._reduction_spec(reduction_size_hint=32000, row_reread=True)
+        env = self._reduction_env(spec)
+        # The mock env has no real GPU device, so patch hardware info / SM count (this
+        # heuristic only fires on GPU in production and the SM count is irrelevant here).
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                env, MagicMock()
+            )
+        spec.compiler_seed_configs = [seed]
+        pairs = ConfigGeneration(spec).seed_flat_config_pairs()
+        self.assertEqual(len(pairs), 1)
+        _flat, normalized = pairs[0]
+        self.assertEqual(normalized.config["reduction_loops"], [None])
+
+    def test_not_eligible_without_single_reduction_tile(self) -> None:
+        env = MagicMock()
+        # Pin the sm90 target so this exercises the STRUCTURAL gate, not the hardware gate
+        # (is_eligible now checks hardware first).
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            # No reduction loop -> not a reduction.
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+            env.config_spec = spec
+            self.assertFalse(
+                TritonStandardReductionHeuristicSM90.is_eligible(env, MagicMock())
+            )
+            # A matmul fact disqualifies even a 1-tile/1-reduction shape.
+            spec_mm = self._reduction_spec(reduction_size_hint=1024)
+            spec_mm.matmul_facts = [MagicMock()]
+            env.config_spec = spec_mm
+            self.assertFalse(
+                TritonStandardReductionHeuristicSM90.is_eligible(env, MagicMock())
+            )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_fires_for_reduction_not_matmul(self) -> None:
+        @helion.kernel(backend="triton")
+        def row_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                shifted = row - torch.amax(row, dim=-1, keepdim=True)
+                out[tile_m] = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+            return out
+
+        @helion.kernel(backend="triton")
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        red = row_reduction.bind(
+            (torch.randn(1024, 1024, device=DEVICE, dtype=HALF_DTYPE),)
+        )
+        mm = matmul.bind(
+            (
+                torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
+                torch.randn(256, 256, device=DEVICE, dtype=HALF_DTYPE),
+            )
+        )
+        # Pin the sm90/H100 target so the sm90 heuristic is exercised regardless of the CI
+        # runner's GPU: the hardware gate now lives in ``is_eligible`` (sm100/B200 routes to
+        # ``TritonStandardReductionHeuristicSM100``, other GPUs to the narrow fallback), so on a
+        # B200 runner the unpatched ``is_eligible`` would be False.
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            self.assertTrue(
+                TritonStandardReductionHeuristicSM90.is_eligible(
+                    red.env, red.host_function.device_ir
+                )
+            )
+            seed = TritonStandardReductionHeuristicSM90.get_seed_config(
+                red.env, red.host_function.device_ir
+            )
+            # A matmul is not a reduction, so the reduction seed declines even on its own target.
+            self.assertFalse(
+                TritonStandardReductionHeuristicSM90.is_eligible(
+                    mm.env, mm.host_function.device_ir
+                )
+            )
+        self.assertEqual(seed.config["block_sizes"], [1])
+        self.assertEqual(seed.config["reduction_loops"], [None])
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_exactly_one_reduction_track_eligible_per_hardware(self) -> None:
+        # The hardware gate lives in ``is_eligible``: for a standard reduction, EXACTLY one of
+        # the three standard-track classes fires per GPU — sm90 -> SM90, sm100 -> SM100, anything
+        # else -> the narrow fallback — and none of them return None-for-deferral from
+        # ``get_seed_config``. This is the invariant the class split exists to guarantee.
+        @helion.kernel(backend="triton")
+        def row_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, _ = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                row = x[tile_m, :]
+                shifted = row - torch.amax(row, dim=-1, keepdim=True)
+                out[tile_m] = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+            return out
+
+        red = row_reduction.bind(
+            (torch.randn(1024, 1024, device=DEVICE, dtype=HALF_DTYPE),)
+        )
+        env, device_ir = red.env, red.host_function.device_ir
+        # (hardware, the one class expected to fire).
+        cases = [
+            (HOPPER_HARDWARE, TritonStandardReductionHeuristicSM90),
+            (BLACKWELL_HARDWARE, TritonStandardReductionHeuristicSM100),
+            (
+                HardwareInfo(
+                    device_kind="cuda",
+                    hardware_name="NVIDIA A10G",
+                    runtime_version="12.8",
+                    compute_capability="sm86",
+                ),
+                TritonNarrowReductionHeuristic,
+            ),
+        ]
+        tracks = [
+            TritonStandardReductionHeuristicSM90,
+            TritonStandardReductionHeuristicSM100,
+            TritonNarrowReductionHeuristic,
+        ]
+        for hardware, expected in cases:
+            with (
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+                patch("helion.runtime.get_num_sm", return_value=132),
+            ):
+                eligible = [t for t in tracks if t.is_eligible(env, device_ir)]
+                self.assertEqual(
+                    eligible,
+                    [expected],
+                    f"{hardware.compute_capability}: expected only {expected.__name__}",
+                )
+                # The eligible class always yields a real Config (never None-for-deferral).
+                seed = expected.get_seed_config(env, device_ir)
+                self.assertIsNotNone(seed)
+                self.assertEqual(seed.config["block_sizes"], [1])
+
+
+_FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
+_FP8_SKINNY_M_SEED_NUM_THREADS = [0, 32]
+_FP8_SKINNY_M_SEED_VECTOR_WIDTHS = [4, 8]
+
+
+class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
+    """Skinny-M FP8 GEMM heuristic: fires only for a single FP8 matmul with
+    static M <= 16 and seeds the [1, 256] / nt=[0, 32] / vec=[4, 8] config that
+    the full autotune converges to for the decode / small-batch regime.
+    """
+
+    def _make_cute_env(self) -> MagicMock:
+        spec = ConfigSpec(backend=CuteBackend())
+        env = MagicMock()
+        env.backend_name = "cute"
+        env.config_spec = spec
+        env.device = DEVICE
+        env.settings = Settings()
+        return env
+
+    def _matmul_fact(
+        self,
+        *,
+        static_m: int = 1,
+        static_n: int = 4096,
+        static_k: int = 4096,
+        lhs_dtype: torch.dtype = torch.float8_e4m3fn,
+        rhs_dtype: torch.dtype = torch.float8_e4m3fn,
+    ) -> MatmulFact:
+        return MatmulFact(
+            lhs_ndim=2,
+            rhs_ndim=2,
+            m_block_id=0,
+            n_block_id=1,
+            k_block_id=2,
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=lhs_dtype,
+            rhs_dtype=rhs_dtype,
+        )
+
+    def test_eligibility_cases(self) -> None:
+        # (name, facts, expected_eligible)
+        cases = (
+            ("m1_fp8", [self._matmul_fact(static_m=1)], True),
+            ("m16_fp8", [self._matmul_fact(static_m=16)], True),
+            ("e5m2_fp8", [self._matmul_fact(lhs_dtype=torch.float8_e5m2)], True),
+            ("m17_too_large", [self._matmul_fact(static_m=17)], False),
+            ("m1024_gemm", [self._matmul_fact(static_m=1024)], False),
+            (
+                "bf16_not_fp8",
+                [self._matmul_fact(lhs_dtype=torch.bfloat16, rhs_dtype=torch.bfloat16)],
+                False,
+            ),
+            ("mixed_fp8_bf16", [self._matmul_fact(rhs_dtype=torch.bfloat16)], False),
+            ("dynamic_m", [self._matmul_fact(static_m=None)], False),
+            ("no_matmul", [], False),
+            ("two_matmuls", [self._matmul_fact(), self._matmul_fact()], False),
+        )
+        for name, facts, expected in cases:
+            env = self._make_cute_env()
+            env.config_spec.matmul_facts.extend(facts)
+            with self.subTest(name=name):
+                self.assertEqual(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(env, MagicMock()),
+                    expected,
+                )
+
+    def test_seed_config_contents(self) -> None:
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
+        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
+        self.assertEqual(seed.config["num_threads"], _FP8_SKINNY_M_SEED_NUM_THREADS)
+        self.assertEqual(
+            seed.config["cute_vector_widths"], _FP8_SKINNY_M_SEED_VECTOR_WIDTHS
+        )
+
+    def test_compiler_seed_configs_records_heuristic(self) -> None:
+        # The heuristic must be wired into the cute backend registry so the
+        # generic compiler_seed_configs() path emits its seed and records it.
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
+        configs = compiler_seed_configs(env, MagicMock())
+        self.assertIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [config.config["block_sizes"] for config in configs],
+        )
+        self.assertIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            env.config_spec.autotuner_heuristics,
+        )
+
+    def test_compiler_seed_configs_skips_large_m(self) -> None:
+        env = self._make_cute_env()
+        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1024))
+        configs = compiler_seed_configs(env, MagicMock())
+        self.assertNotIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            env.config_spec.autotuner_heuristics,
+        )
+        self.assertNotIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [config.config["block_sizes"] for config in configs],
+        )
+
+    @onlyBackends(["cute"])
+    @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
+    def test_seed_in_initial_population_for_skinny_m(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True)
+        def fp8_gemm_skinny_m(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            for tile_n in hl.tile(n):
+                acc = hl.zeros([m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
+                acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
+                out[:, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        m, k, n = 1, 4096, 4096
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(
+            torch.float8_e4m3fn
+        )
+        scale_a = torch.ones([m, n], device=DEVICE)
+        scale_b = torch.ones([n], device=DEVICE)
+
+        with patch_cute_mma_support():
+            bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b))
+
+        device_ir = bound.host_function.device_ir
+        self.assertTrue(CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir))
+        self.assertIn(
+            CuteFp8GemmSkinnyMHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
+        self.assertIn(
+            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
+            [
+                config.config["block_sizes"]
+                for config in bound.config_spec.compiler_seed_configs
+            ],
+        )
+
+
+class TestCuteTcgen05ClusterM2Heuristic(TestCase):
+    def _assert_cute_tcgen05_cluster_m2_seeded(
+        self,
+        configs: list[helion.Config],
+        *,
+        expected_block_k: int,
+        expected_indexing_length: int,
+    ) -> dict[str, object]:
+        seeded = [
+            config.config
+            for config in configs
+            if config.config["tcgen05_cluster_m"] == 2
+        ]
+        # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
+        # Callers decide whether both are expected in the supplied population;
+        # every cluster_m=2 seed must still match the common tile envelope.
+        self.assertGreaterEqual(len(seeded), 1)
+        for seed in seeded:
+            self.assertEqual(
+                seed["block_sizes"][:3],
+                [
+                    TCGEN05_TWO_CTA_BLOCK_M,
+                    TCGEN05_TWO_CTA_BLOCK_N,
+                    expected_block_k,
+                ],
+            )
+            self.assertEqual(
+                seed["indexing"],
+                ["tensor_descriptor"] * expected_indexing_length,
+            )
+            self.assertEqual(seed["pid_type"], "persistent_interleaved")
+            self.assertEqual(seed["tcgen05_num_epi_warps"], 4)
+        return seeded[0]
+
+    def _assert_cute_tcgen05_edge_k_tail_seed_overrides(
+        self,
+        config: dict[str, object],
+        *,
+        expected_l2_grouping: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING,
+        expected_l2_swizzle_size: int = TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE,
+    ) -> None:
+        self.assertEqual(
+            config["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        )
+        self.assertEqual(
+            config["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+        )
+        self.assertEqual(
+            config["tcgen05_c_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        )
+        self.assertEqual(
+            config["l2_groupings"],
+            [expected_l2_grouping],
+        )
+        self.assertEqual(
+            config["tcgen05_l2_swizzle_size"],
+            expected_l2_swizzle_size,
+        )
+        self.assertEqual(
+            config[TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY],
+            TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
+        )
+        self.assertEqual(
+            config[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY],
+            TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
+        )
+
+    def _expected_clc_aux_tma_range_knobs(
+        self, spec: ConfigSpec
+    ) -> tuple[list[bool | None], list[bool | None], list[bool | None]]:
+        self.assertEqual(len(spec.matmul_facts), 1)
+        k_block_id = spec.matmul_facts[0].k_block_id
+        assert k_block_id is not None
+        k_range_index = spec.range_flattens.block_id_to_index(k_block_id)
+        self.assertEqual(
+            k_range_index,
+            spec.range_multi_buffers.block_id_to_index(k_block_id),
+        )
+        self.assertEqual(
+            k_range_index,
+            spec.range_warp_specialize.block_id_to_index(k_block_id),
+        )
+        range_flattens: list[bool | None] = [None for _ in spec.range_flattens]
+        range_multi_buffers: list[bool | None] = [
+            None for _ in spec.range_multi_buffers
+        ]
+        range_warp_specializes: list[bool | None] = [
+            None for _ in spec.range_warp_specialize
+        ]
+        range_flattens[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_FLATTEN
+        )
+        range_multi_buffers[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_MULTI_BUFFER
+        )
+        range_warp_specializes[k_range_index] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_K_RANGE_WARP_SPECIALIZE
+        )
+        return range_flattens, range_multi_buffers, range_warp_specializes
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_seed_heuristic(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+
+            heuristic = CuteTcgen05ClusterM2Heuristic
+            self.assertIn(
+                CuteTcgen05ClusterM2Heuristic.name,
+                bound.config_spec.autotuner_heuristics,
+            )
+            self.assertTrue(
+                heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            )
+            seed_config = heuristic.get_seed_config(
+                bound.env, bound.host_function.device_ir
+            )
+            assert seed_config is not None
+            self._assert_cute_tcgen05_cluster_m2_seeded(
+                [seed_config],
+                expected_block_k=128,
+                expected_indexing_length=3,
+            )
+            self.assertEqual(
+                seed_config.config["l2_groupings"], [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+            )
+
+        with patch_cute_mma_support(default_cute_mma_support(tcgen05_f16bf16=False)):
+            unsupported_args = (
+                torch.empty([2048, 2048], device=DEVICE, dtype=HALF_DTYPE),
+                torch.empty([2048, 2048], device=DEVICE, dtype=HALF_DTYPE),
+            )
+            unsupported_bound = cute_matmul_mma.bind(unsupported_args)
+            self.assertFalse(
+                heuristic.is_eligible(
+                    unsupported_bound.env,
+                    unsupported_bound.host_function.device_ir,
+                )
+            )
+            self.assertNotIn(
+                CuteTcgen05ClusterM2Heuristic.name,
+                unsupported_bound.config_spec.autotuner_heuristics,
+            )
+
+    def test_cute_flash_accepts_extra_knobs(self) -> None:
+        self.assertIn(FLASH_MMA_INTERLEAVE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_Q_TILE_COUNT_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_PERSISTENT_CTAS_PER_SM_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_P_STORE_REP_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_S_LOAD_REP_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_PRECOMPUTE_QK_DESC_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_RECOMPUTE_TILE_COORDS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_FIRST_LOAD_ORDER_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_KV_ORDER_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SOFTMAX_DISC_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_EPI_STG_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_EPI_STG_STORE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_EPI_STG_GMEM_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CORR_TILE_SIZE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_RESCALE_CHUNK_COLS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SKIP_RESCALE_STATS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_HEADS_PER_BATCH_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_PDL_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CLC_STAGES_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_LOCAL_TMA_PARTITION_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_TENSOR_4D_TMA_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SOFTMAX_REGS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_CORR_REGS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_OTHER_REGS_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_MASKED_E2E_SCHEDULE_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_ROLE_MAP_KEY, FLASH_CONFIG_KEYS)
+        self.assertIn(FLASH_SMALL_BIASED_KEY, FLASH_CONFIG_KEYS)
+
+    def test_cute_flash_seed_helper_dense_hd64_families(self) -> None:
+        for num_kv in (16, 32, 62):
+            seed = flash_attention_seed_config(64, num_kv)
+            assert seed is not None
+            config = seed.config
+            self.assertEqual(config["block_sizes"], [1, 128, 128])
+            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_KV_STAGE_KEY], 3)
+            self.assertTrue(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], 2)
+            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], 2)
+            self.assertTrue(config[FLASH_SOFTMAX_DISC_KEY])
+            self.assertEqual(config[FLASH_DISC_PIPE_KEY], 4)
+            self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
+            self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
+            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+            self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], 0)
+            self.assertEqual(config[FLASH_KV_ORDER_KEY], "ascending")
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], 184)
+            self.assertEqual(config[FLASH_OTHER_REGS_KEY], 48)
+            self.assertTrue(config[FLASH_EPI_TMA_KEY])
+            self.assertFalse(config[FLASH_EPI_STG_KEY])
+            self.assertEqual(config[FLASH_CORR_TILE_SIZE_KEY], 16)
+            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+            self.assertFalse(config[FLASH_SKIP_RESCALE_STATS_KEY])
+            self.assertFalse(config[FLASH_PACKED_REDUCE_KEY])
+            self.assertFalse(config[FLASH_CLC_KEY])
+            self.assertFalse(config[FLASH_LOCAL_TMA_PARTITION_KEY])
+            self.assertFalse(config[FLASH_TENSOR_4D_TMA_KEY])
+
+        for (
+            num_kv,
+            e2e_schedule,
+            offset,
+            offset0,
+            disc_pipe,
+            epi_tma,
+            rescale_threshold,
+            rescale_chunk_cols,
+            skip_rescale_stats,
+            persistent_ctas_per_sm,
+            kv_order,
+            corr_tile_size,
+            softmax_disc,
+            first_load_order,
+            softmax_regs,
+            corr_regs,
+            other_regs,
+            local_tma_partition,
+            cga2_local,
+            clc,
+            clc_heads_per_batch,
+        ) in (
+            (
+                64,
+                "8/2",
+                2,
+                2,
+                3,
+                True,
+                8.0,
+                16,
+                False,
+                1,
+                "ascending",
+                16,
+                True,
+                0,
+                184,
+                64,
+                48,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                128,
+                "8/2",
+                3,
+                2,
+                3,
+                False,
+                8.0,
+                16,
+                False,
+                1,
+                "ascending",
+                16,
+                True,
+                0,
+                184,
+                64,
+                48,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                256,
+                "8/2",
+                0,
+                1,
+                1,
+                True,
+                8.0,
+                8,
+                False,
+                1,
+                "descending",
+                8,
+                False,
+                0,
+                200,
+                64,
+                40,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                384,
+                "8/2",
+                0,
+                3,
+                1,
+                True,
+                32.0,
+                8,
+                False,
+                1,
+                "ascending",
+                8,
+                False,
+                0,
+                200,
+                72,
+                32,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                512,
+                "8/2",
+                0,
+                0,
+                3,
+                False,
+                8.0,
+                8,
+                False,
+                1,
+                "descending",
+                8,
+                False,
+                0,
+                200,
+                72,
+                32,
+                False,
+                False,
+                False,
+                0,
+            ),
+            (
+                1024,
+                "16/4",
+                0,
+                0,
+                1,
+                True,
+                8.0,
+                8,
+                False,
+                1,
+                "descending",
+                8,
+                False,
+                0,
+                200,
+                72,
+                40,
+                False,
+                False,
+                True,
+                32,
+            ),
+        ):
+            seed = flash_attention_seed_config(64, num_kv)
+            assert seed is not None
+            config = seed.config
+            self.assertEqual(config["block_sizes"], [1, 128, 128])
+            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
+            self.assertTrue(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(
+                config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], persistent_ctas_per_sm
+            )
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], e2e_schedule)
+            self.assertEqual(config[FLASH_E2E_OFFSET0_KEY], offset0)
+            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
+            self.assertEqual(config[FLASH_SOFTMAX_DISC_KEY], softmax_disc)
+            self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
+            self.assertEqual(config[FLASH_P_STORE_REP_KEY], 16)
+            self.assertEqual(config[FLASH_S_LOAD_REP_KEY], 32)
+            self.assertFalse(config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+            self.assertFalse(config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+            self.assertEqual(config[FLASH_FIRST_LOAD_ORDER_KEY], first_load_order)
+            self.assertEqual(config[FLASH_KV_ORDER_KEY], kv_order)
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], softmax_regs)
+            self.assertEqual(config[FLASH_CORR_REGS_KEY], corr_regs)
+            self.assertEqual(config[FLASH_OTHER_REGS_KEY], other_regs)
+            self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
+            self.assertEqual(config[FLASH_EPI_STG_KEY], num_kv >= 512 and not epi_tma)
+            self.assertEqual(config[FLASH_CORR_TILE_SIZE_KEY], corr_tile_size)
+            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], rescale_threshold)
+            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
+            self.assertEqual(config[FLASH_SKIP_RESCALE_STATS_KEY], skip_rescale_stats)
+            self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
+            self.assertEqual(config[FLASH_CGA2_LOCAL_KEY], cga2_local)
+            self.assertEqual(config[FLASH_CLC_KEY], clc)
+            self.assertEqual(config[FLASH_CLC_HEADS_PER_BATCH_KEY], clc_heads_per_batch)
+            self.assertEqual(config[FLASH_LOCAL_TMA_PARTITION_KEY], local_tma_partition)
+            self.assertFalse(config[FLASH_TENSOR_4D_TMA_KEY])
+
+        very_long_seed = flash_attention_seed_config(64, 2048)
+        assert very_long_seed is not None
+        very_long_config = very_long_seed.config
+        self.assertEqual(very_long_config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(very_long_config[FLASH_KV_STAGE_KEY], 3)
+        self.assertEqual(very_long_config[FLASH_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(very_long_config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(very_long_config[FLASH_E2E_OFFSET0_KEY], 0)
+        self.assertEqual(very_long_config[FLASH_DISC_PIPE_KEY], 1)
+        self.assertFalse(very_long_config[FLASH_SPLIT_P_ARRIVE_KEY])
+        self.assertFalse(very_long_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+        self.assertFalse(very_long_config[FLASH_RECOMPUTE_TILE_COORDS_KEY])
+        self.assertEqual(very_long_config[FLASH_FIRST_LOAD_ORDER_KEY], 4)
+        self.assertEqual(very_long_config[FLASH_KV_ORDER_KEY], "descending")
+        self.assertEqual(very_long_config[FLASH_SOFTMAX_REGS_KEY], 192)
+        self.assertEqual(very_long_config[FLASH_CORR_REGS_KEY], 80)
+        self.assertEqual(very_long_config[FLASH_OTHER_REGS_KEY], 32)
+        self.assertFalse(very_long_config[FLASH_EPI_TMA_KEY])
+        self.assertTrue(very_long_config[FLASH_EPI_STG_KEY])
+        self.assertEqual(very_long_config[FLASH_CORR_TILE_SIZE_KEY], 8)
+        self.assertEqual(very_long_config.get(FLASH_ROLE_MAP_KEY, "helion"), "helion")
+        self.assertEqual(very_long_config[FLASH_RESCALE_THRESHOLD_KEY], 32.0)
+        self.assertEqual(very_long_config[FLASH_RESCALE_CHUNK_COLS_KEY], 8)
+        self.assertTrue(very_long_config[FLASH_PACKED_REDUCE_KEY])
+        self.assertFalse(very_long_config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(very_long_config[FLASH_TENSOR_4D_TMA_KEY])
+
+        dense_sp_seed = flash_attention_seed_config(
+            64,
+            256,
+            seed_kind="dense_sp",
+        )
+        assert dense_sp_seed is not None
+        dense_sp_config = dense_sp_seed.config
+        self.assertFalse(dense_sp_config[FLASH_SOFTMAX_DISC_KEY])
+        self.assertFalse(dense_sp_config[FLASH_SPLIT_P_ARRIVE_KEY])
+        self.assertEqual(dense_sp_config[FLASH_P_STORE_REP_KEY], 32)
+        self.assertEqual(dense_sp_config[FLASH_S_LOAD_REP_KEY], 32)
+        self.assertTrue(dense_sp_config[FLASH_PRECOMPUTE_QK_DESC_KEY])
+        self.assertEqual(dense_sp_config[FLASH_FIRST_LOAD_ORDER_KEY], 1)
+        self.assertEqual(dense_sp_config[FLASH_KV_ORDER_KEY], "descending")
+        self.assertEqual(dense_sp_config[FLASH_CORR_REGS_KEY], 80)
+        self.assertEqual(dense_sp_config[FLASH_OTHER_REGS_KEY], 32)
+        self.assertFalse(dense_sp_config[FLASH_CGA2_LOCAL_KEY])
+        self.assertTrue(dense_sp_config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertTrue(dense_sp_config[FLASH_TENSOR_4D_TMA_KEY])
+        dense_sp_512_seed = flash_attention_seed_config(
+            64,
+            512,
+            seed_kind="dense_sp",
+        )
+        assert dense_sp_512_seed is not None
+        dense_sp_512_config = dense_sp_512_seed.config
+        self.assertFalse(dense_sp_512_config[FLASH_EPI_TMA_KEY])
+        self.assertTrue(dense_sp_512_config[FLASH_EPI_STG_KEY])
+        dense_sp_2048_seed = flash_attention_seed_config(
+            64,
+            2048,
+            seed_kind="dense_sp",
+        )
+        assert dense_sp_2048_seed is not None
+        dense_sp_2048_config = dense_sp_2048_seed.config
+        self.assertEqual(dense_sp_2048_config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+        self.assertEqual(dense_sp_2048_config[FLASH_SOFTMAX_REGS_KEY], 200)
+        self.assertIsNone(flash_attention_seed_config(64, 128, seed_kind="dense_sp"))
+
+        short_seed = flash_attention_seed_config(64, 8)
+        assert short_seed is not None
+        self.assertEqual(short_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, short_seed.config)
+
+        sparse_seed = flash_attention_seed_config(
+            64,
+            64,
+            has_kv_tile_pruning=True,
+            requires_ws_overlap=True,
+        )
+        assert sparse_seed is not None
+        self.assertEqual(sparse_seed.config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertTrue(sparse_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, sparse_seed.config)
+
+        small_seed = flash_attention_seed_config(
+            64,
+            1,
+            small_biased_candidate=True,
+        )
+        assert small_seed is not None
+        self.assertTrue(small_seed.config[FLASH_SMALL_BIASED_KEY])
+
+    def test_cute_flash_seed_helper_causal_lpt_family(self) -> None:
+        expected = {
+            32: (0, 2, 200, 8, "inherit", "helion", True, 16),
+            64: (0, 2, 200, 8, "inherit", "helion", True, 16),
+            128: (0, 2, 192, 8, "16/4", "fa4", True, 16),
+            256: (1, 4, 184, 4, "16/4", "helion", False, 16),
+            512: (9, 4, 184, 1, "16/4", "helion", False, 32),
+            1024: (9, 4, 184, 1, "16/4", "helion", False, 32),
+            4096: (9, 4, 184, 1, "16/4", "helion", False, 32),
+        }
+        for (
+            num_kv,
+            (
+                offset,
+                disc_pipe,
+                softmax_regs,
+                swizzle,
+                masked_schedule,
+                role_map,
+                epi_tma,
+                rescale_chunk_cols,
+            ),
+        ) in expected.items():
+            seed = flash_attention_seed_config(
+                64,
+                num_kv,
+                is_causal=True,
+                seed_kind="causal_lpt",
+            )
+            assert seed is not None
+            config = seed.config
+            self.assertEqual(config["block_sizes"], [1, 128, 128])
+            self.assertEqual(config[FLASH_TOPOLOGY_KEY], "fa4")
+            self.assertEqual(config[FLASH_S_STAGE_KEY], 2)
+            self.assertEqual(config[FLASH_KV_STAGE_KEY], 2)
+            self.assertFalse(config[FLASH_PERSISTENT_KEY])
+            self.assertEqual(config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+            self.assertEqual(config[FLASH_MASKED_E2E_SCHEDULE_KEY], masked_schedule)
+            self.assertEqual(config[FLASH_ROLE_MAP_KEY], role_map)
+            self.assertEqual(config[FLASH_E2E_OFFSET_KEY], offset)
+            self.assertEqual(config[FLASH_DISC_PIPE_KEY], disc_pipe)
+            self.assertEqual(config[FLASH_EPI_TMA_KEY], epi_tma)
+            self.assertEqual(config[FLASH_RESCALE_CHUNK_COLS_KEY], rescale_chunk_cols)
+            self.assertEqual(config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+            self.assertTrue(config[FLASH_PACKED_REDUCE_KEY])
+            self.assertEqual(config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], swizzle)
+            self.assertEqual(config[FLASH_CAUSAL_KV_ORDER_KEY], "descending")
+            self.assertEqual(config[FLASH_SOFTMAX_REGS_KEY], softmax_regs)
+
+        self.assertIsNone(
+            flash_attention_seed_config(64, 16, is_causal=True, seed_kind="causal_lpt")
+        )
+        self.assertIsNone(
+            flash_attention_seed_config(64, 96, is_causal=True, seed_kind="causal_lpt")
+        )
+        self.assertIsNone(
+            flash_attention_seed_config(
+                64,
+                64,
+                is_causal=True,
+                requires_ws_overlap=True,
+                seed_kind="causal_lpt",
+            )
+        )
+        split_seed = flash_attention_seed_config(
+            64, 64, is_causal=True, seed_kind="causal_split"
+        )
+        assert split_seed is not None
+        lpt_seed = flash_attention_seed_config(
+            64, 64, is_causal=True, seed_kind="causal_lpt"
+        )
+        assert lpt_seed is not None
+        self.assertNotEqual(split_seed, lpt_seed)
+        self.assertEqual(split_seed.config[FLASH_KV_STAGE_KEY], 2)
+        self.assertEqual(split_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(split_seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(split_seed.config[FLASH_ROLE_MAP_KEY], "fa4")
+        self.assertTrue(split_seed.config[FLASH_CAUSAL_LOOP_SPLIT_KEY])
+        self.assertEqual(split_seed.config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(split_seed.config[FLASH_E2E_OFFSET0_KEY], 0)
+        self.assertEqual(split_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertEqual(split_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 8)
+        split_seed_256 = flash_attention_seed_config(
+            64, 256, is_causal=True, seed_kind="causal_split"
+        )
+        assert split_seed_256 is not None
+        self.assertEqual(split_seed_256.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "16/4")
+        self.assertEqual(split_seed_256.config[FLASH_E2E_OFFSET0_KEY], 11)
+        self.assertEqual(split_seed_256.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertEqual(split_seed_256.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 4)
+        self.assertEqual(len(flash_attention_seed_configs(64, 64, is_causal=True)), 3)
+
+    @onlyBackends(["cute"])
+    def test_cute_flash_attention_seed_heuristic(self) -> None:
+        # The flash seed promotes block_sizes=[1, 128, 128] for a detected
+        # fp16 dense/causal online-softmax attention kernels so the autotuner
+        # exercises the fused tcgen05 flash path. fp32 attention is NOT eligible
+        # and keeps the scalar path.
+        @helion.kernel(backend="cute", static_shapes=True)
+        def flash_attn(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> torch.Tensor:
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                    qk = qk - m_ij[:, :, None]
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def causal_flash_attn(
+            q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+        ) -> torch.Tensor:
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    qk = torch.where(
+                        tile_m.index[None, :, None] >= tile_n.index[None, None, :],
+                        qk,
+                        float("-inf"),
+                    )
+                    m_ij_keepdim = torch.maximum(
+                        m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+                    )
+                    qk = qk - m_ij_keepdim
+                    m_ij = m_ij_keepdim.squeeze(-1)
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        heuristic = CuteFlashAttentionHeuristic
+        fp16_args = tuple(
+            torch.randn(2, 32, 1024, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        bound = flash_attn.bind(fp16_args)
+        self.assertIn(
+            CuteFlashAttentionHeuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        self.assertTrue(heuristic.is_eligible(bound.env, bound.host_function.device_ir))
+        seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None
+        self.assertEqual(seed.config["block_sizes"], [1, 128, 128])
+        self.assertEqual(seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertNotIn(FLASH_E2E_OFFSET_KEY, seed.config)
+        self.assertIn(seed, bound.config_spec.compiler_seed_configs)
+        self.assertIsNone(bound.config_spec.compiler_default_config)
+
+        dense_2048_args = tuple(
+            torch.empty(1, 1, 2048, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        dense_2048_bound = flash_attn.bind(dense_2048_args)
+        dense_2048_seed = heuristic.get_seed_config(
+            dense_2048_bound.env, dense_2048_bound.host_function.device_ir
+        )
+        assert dense_2048_seed is not None
+        self.assertEqual(dense_2048_seed.config[FLASH_S_STAGE_KEY], 2)
+        self.assertEqual(dense_2048_seed.config[FLASH_KV_STAGE_KEY], 3)
+        self.assertTrue(dense_2048_seed.config[FLASH_PERSISTENT_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+        self.assertEqual(dense_2048_seed.config[FLASH_KV_ORDER_KEY], "ascending")
+        self.assertEqual(dense_2048_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(dense_2048_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
+        self.assertEqual(dense_2048_seed.config[FLASH_DISC_PIPE_KEY], 4)
+        self.assertEqual(dense_2048_seed.config[FLASH_OTHER_REGS_KEY], 48)
+        self.assertTrue(dense_2048_seed.config[FLASH_EPI_TMA_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_EPI_STG_KEY])
+        self.assertEqual(dense_2048_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
+        self.assertEqual(dense_2048_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertFalse(dense_2048_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_CLC_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(dense_2048_seed.config[FLASH_TENSOR_4D_TMA_KEY])
+        self.assertIn(
+            dense_2048_seed, dense_2048_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(dense_2048_bound.config_spec.compiler_default_config)
+
+        dense_8192_args = tuple(
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        dense_8192_bound = flash_attn.bind(dense_8192_args)
+        dense_8192_seed = heuristic.get_seed_config(
+            dense_8192_bound.env, dense_8192_bound.host_function.device_ir
+        )
+        assert dense_8192_seed is not None
+        self.assertEqual(dense_8192_seed.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(dense_8192_seed.config[FLASH_E2E_OFFSET0_KEY], 2)
+        self.assertEqual(dense_8192_seed.config[FLASH_DISC_PIPE_KEY], 3)
+        self.assertEqual(dense_8192_seed.config[FLASH_PERSISTENT_CTAS_PER_SM_KEY], 1)
+        self.assertEqual(dense_8192_seed.config[FLASH_KV_ORDER_KEY], "ascending")
+        self.assertEqual(dense_8192_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
+        self.assertEqual(dense_8192_seed.config[FLASH_OTHER_REGS_KEY], 48)
+        self.assertEqual(dense_8192_seed.config[FLASH_CORR_REGS_KEY], 64)
+        self.assertTrue(dense_8192_seed.config[FLASH_EPI_TMA_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_EPI_STG_KEY])
+        self.assertEqual(dense_8192_seed.config[FLASH_CORR_TILE_SIZE_KEY], 16)
+        self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_CHUNK_COLS_KEY], 16)
+        self.assertEqual(dense_8192_seed.config[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+        self.assertTrue(dense_8192_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_CLC_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_LOCAL_TMA_PARTITION_KEY])
+        self.assertFalse(dense_8192_seed.config[FLASH_TENSOR_4D_TMA_KEY])
+        self.assertNotIn(FLASH_CAUSAL_LPT_SWIZZLE_KEY, dense_8192_seed.config)
+        dense_8192_gen = ConfigGeneration(dense_8192_bound.config_spec)
+        dense_8192_roundtrip = dense_8192_gen.unflatten(
+            dense_8192_gen.flatten(dense_8192_seed)
+        )
+        self.assertEqual(
+            dense_8192_roundtrip.config[FLASH_SOFTMAX_REGS_KEY],
+            184,
+        )
+        self.assertEqual(
+            dense_8192_roundtrip.config[FLASH_CORR_REGS_KEY],
+            64,
+        )
+        self.assertEqual(
+            dense_8192_roundtrip.config[FLASH_OTHER_REGS_KEY],
+            48,
+        )
+
+        causal_hd64_bound = causal_flash_attn.bind(fp16_args)
+        causal_hd64_seed = heuristic.get_seed_config(
+            causal_hd64_bound.env, causal_hd64_bound.host_function.device_ir
+        )
+        assert causal_hd64_seed is not None
+        self.assertEqual(causal_hd64_seed.config["block_sizes"], [1, 128, 128])
+        self.assertEqual(causal_hd64_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertTrue(causal_hd64_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            causal_hd64_seed, causal_hd64_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(causal_hd64_bound.config_spec.compiler_default_config)
+
+        causal_8192_args = tuple(
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        causal_8192_bound = causal_flash_attn.bind(causal_8192_args)
+        self.assertIn(
+            CuteFlashAttentionCausalLptHeuristic.name,
+            causal_8192_bound.config_spec.autotuner_heuristics,
+        )
+        causal_lpt_seed = CuteFlashAttentionCausalLptHeuristic.get_seed_config(
+            causal_8192_bound.env, causal_8192_bound.host_function.device_ir
+        )
+        assert causal_lpt_seed is not None
+        self.assertEqual(causal_lpt_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 8)
+        self.assertEqual(
+            causal_lpt_seed.config[FLASH_CAUSAL_KV_ORDER_KEY], "descending"
+        )
+        self.assertEqual(
+            causal_lpt_seed.config[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit"
+        )
+        self.assertEqual(causal_lpt_seed.config[FLASH_ROLE_MAP_KEY], "helion")
+        self.assertEqual(causal_lpt_seed.config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(causal_lpt_seed.config[FLASH_SOFTMAX_REGS_KEY], 200)
+        self.assertTrue(causal_lpt_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            causal_lpt_seed, causal_8192_bound.config_spec.compiler_seed_configs
+        )
+        causal_split_seed = flash_attention_seed_config(
+            64, 64, is_causal=True, seed_kind="causal_split"
+        )
+        assert causal_split_seed is not None
+        self.assertIn(
+            causal_split_seed, causal_8192_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(causal_8192_bound.config_spec.compiler_default_config)
+
+        causal_65536_args = tuple(
+            torch.empty(1, 1, 65536, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        causal_65536_bound = causal_flash_attn.bind(causal_65536_args)
+        self.assertIn(
+            CuteFlashAttentionCausalLptHeuristic.name,
+            causal_65536_bound.config_spec.autotuner_heuristics,
+        )
+        causal_65536_seed = CuteFlashAttentionCausalLptHeuristic.get_seed_config(
+            causal_65536_bound.env, causal_65536_bound.host_function.device_ir
+        )
+        assert causal_65536_seed is not None
+        self.assertEqual(causal_65536_seed.config[FLASH_CAUSAL_LPT_SWIZZLE_KEY], 1)
+        self.assertEqual(causal_65536_seed.config[FLASH_E2E_OFFSET_KEY], 9)
+        self.assertEqual(causal_65536_seed.config[FLASH_SOFTMAX_REGS_KEY], 184)
+        self.assertEqual(causal_65536_seed.config[FLASH_DISC_PIPE_KEY], 4)
+        self.assertTrue(causal_65536_seed.config[FLASH_PACKED_REDUCE_KEY])
+        self.assertIn(
+            causal_65536_seed, causal_65536_bound.config_spec.compiler_seed_configs
+        )
+        self.assertIsNone(causal_65536_bound.config_spec.compiler_default_config)
+        causal_65536_gen = ConfigGeneration(causal_65536_bound.config_spec)
+        causal_65536_default = causal_65536_gen.unflatten(
+            causal_65536_gen.default_flat()
+        )
+        self.assertEqual(
+            causal_65536_default.config[FLASH_SOFTMAX_REGS_KEY],
+            184,
+        )
+        self.assertEqual(causal_65536_default.config[FLASH_E2E_OFFSET_KEY], 9)
+        causal_65536_roundtrip = causal_65536_gen.unflatten(
+            causal_65536_gen.flatten(causal_65536_seed)
+        )
+        self.assertEqual(
+            causal_65536_roundtrip.config[FLASH_SOFTMAX_REGS_KEY],
+            184,
+        )
+
+        causal_hd128_args = tuple(
+            torch.randn(2, 32, 1024, 128, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        causal_hd128_bound = causal_flash_attn.bind(causal_hd128_args)
+        causal_hd128_seed = heuristic.get_seed_config(
+            causal_hd128_bound.env, causal_hd128_bound.host_function.device_ir
+        )
+        assert causal_hd128_seed is not None
+        self.assertEqual(causal_hd128_seed.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(causal_hd128_seed.config[FLASH_KV_STAGE_KEY], 2)
+
+        # fp32 attention is not flash-eligible (the kernel hardcodes fp16).
+        fp32_args = tuple(
+            torch.randn(2, 32, 1024, 64, dtype=torch.float32, device=DEVICE)
+            for _ in range(3)
+        )
+        fp32_bound = flash_attn.bind(fp32_args)
+        self.assertFalse(
+            heuristic.is_eligible(fp32_bound.env, fp32_bound.host_function.device_ir)
+        )
+        self.assertNotIn(
+            CuteFlashAttentionHeuristic.name,
+            fp32_bound.config_spec.autotuner_heuristics,
+        )
+
+        with patch_cute_mma_support(default_cute_mma_support(tcgen05_f16bf16=False)):
+            unsupported_args = tuple(
+                torch.randn(1, 16, 512, 64, dtype=torch.float16, device=DEVICE)
+                for _ in range(3)
+            )
+            unsupported_bound = flash_attn.bind(unsupported_args)
+            self.assertFalse(
+                heuristic.is_eligible(
+                    unsupported_bound.env,
+                    unsupported_bound.host_function.device_ir,
+                )
+            )
+            self.assertNotIn(
+                CuteFlashAttentionHeuristic.name,
+                unsupported_bound.config_spec.autotuner_heuristics,
+            )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_full_tile_ffi_seed_config(self) -> None:
+        # The generalized FFI direct-entry seed drives ANY eligible bf16
+        # full-tile CtaGroup.TWO matmul (it replaced the bank of per-shape
+        # ``_target{N}`` seeds). The seed itself now lives on the
+        # ConfigSpec/CuteTcgen05Config and is emitted into the autotuner
+        # population by ``CuteTcgen05ClusterM2FfiHeuristic``; it is no longer
+        # part of ``autotune_seed_configs()`` (that chain is now only the
+        # c-input family). This asserts the eligibility gate + the generalized
+        # seed envelope plus the surviving search projection behavior.
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            bound = cute_matmul_mma.bind(args)
+        spec = bound.config_spec
+        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        seed_config = spec._tcgen05_full_tile_direct_entry_seed_config()
+        self.assertIsNotNone(seed_config)
+        seed = seed_config.config
+        self.assertIs(seed[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
+        self.assertEqual(
+            seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
+            Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
+        )
+        bk = spec._tcgen05_full_tile_direct_entry_seed_bk()
+        self.assertIsNotNone(bk)
+        self.assertEqual(
+            seed["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+        self.assertEqual(seed["tcgen05_ab_stages"], 3)
+        self.assertEqual(seed["tcgen05_cluster_m"], 2)
+        self.assertEqual(seed["tcgen05_cluster_n"], 1)
+        self.assertEqual(seed["tcgen05_c_stages"], 2)
+        self.assertEqual(seed["num_warps"], 8)
+        self.assertEqual(seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY], 128)
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY], 32)
+        self.assertEqual(seed[TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY], 32)
+        self.assertIs(seed[TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY], True)
+
+        # An ordinary cluster_m=2 candidate remains on the DEFAULT-layout path
+        # so the autotuner can measure it independently from the FFI seed.
+        default_cluster_m2_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+        )
+        bound.config_spec.normalize(default_cluster_m2_config, _fix_invalid=True)
+        self.assertIs(
+            default_cluster_m2_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY],
+            False,
+        )
+        self.assertEqual(
+            default_cluster_m2_config.config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+
+        # An explicit FFI request still projects onto the generalized seed.
+        requested_ffi_config = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        bound.config_spec.normalize(requested_ffi_config, _fix_invalid=True)
+        self.assertIs(
+            requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
+        )
+        self.assertEqual(
+            requested_ffi_config.config["block_sizes"],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+        )
+
+        # ab > 3 is only valid on the TVM-FFI direct-entry path for the
+        # (bk, ab, c) stage tuples the codegen accepts
+        # (``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``: bk=64 admits the deep
+        # (ab=6, c=4) tuple). ab=4 and ab=5 are admitted by NO bk, so they are
+        # rejected everywhere; a bare ab>3 config (no FFI launch) is likewise
+        # rejected. ``_fix_invalid=True`` clamps any such config down to ab=3.
+        def _non_seed_stage_config(requested_ab_stages: int) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 256, 64],
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=1,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=requested_ab_stages,
+            )
+
+        for requested_ab_stages in (4, 5, 6):
+            with self.subTest(requested_ab_stages=requested_ab_stages):
+                fixed = _non_seed_stage_config(requested_ab_stages)
+                bound.config_spec.normalize(fixed, _fix_invalid=True)
+                self.assertEqual(fixed.config["tcgen05_ab_stages"], 3)
+
+                with self.assertRaisesRegex(
+                    helion.exc.InvalidConfig,
+                    "tcgen05_ab_stages > 3 is only supported",
+                ):
+                    bound.config_spec.normalize(
+                        _non_seed_stage_config(requested_ab_stages)
+                    )
+
+        # ab=6 IS accepted on the FFI direct-entry path at bk=64 with c=4: that
+        # is the (ab=6, c=4) tuple ``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``
+        # admits for bk=64. Plain normalize (no ``_fix_invalid``) leaves it at 6.
+        ffi_direct_entry_ab6 = helion.Config(
+            block_sizes=[256, 256, 64],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=4,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        bound.config_spec.normalize(ffi_direct_entry_ab6)
+        self.assertEqual(ffi_direct_entry_ab6.config["tcgen05_ab_stages"], 6)
+
+        # ab=6 is rejected for bk=128 even on the FFI direct-entry path: bk=128
+        # only admits the (ab=3, c=2) tuple.
+        ffi_direct_entry_ab6_bk128 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=4,
+            **{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: True},
+        )
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "tcgen05_ab_stages > 3 is only supported"
+        ):
+            bound.config_spec.normalize(ffi_direct_entry_ab6_bk128)
+
+        search_ab_stages_fragment = bound.config_spec._tcgen05_optional_fragments(
+            for_search=True
+        )["tcgen05_ab_stages"]
+        self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
+        # Cycle 97: the for_search ab cap is BUDGET-AWARE — lifted to 3 wherever
+        # ab=3 is admissible (the SMEM-budget constraints were recorded at bind
+        # time, i.e. bf16/fp16 on a B200-class optin cap), else 2. Conditioning on
+        # the recorded constraints keeps the assertion deterministic across hosts.
+        expected_search_ab_high = (
+            3
+            if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
+            is not None
+            else 2
+        )
+        self.assertEqual(search_ab_stages_fragment.high, expected_search_ab_high)
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_no_ab3_budget(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=0,
+            ),
+        ):
+            no_ab3_budget_bound = cute_matmul_mma_no_ab3_budget.bind(args)
+        # With no recorded SMEM budget the generalized FFI seed is ineligible
+        # (ab=3 cannot fit) and the for_search ab cap stays at 2.
+        self.assertFalse(
+            no_ab3_budget_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+        )
+        no_budget_ab_stages_fragment = (
+            no_ab3_budget_bound.config_spec._tcgen05_optional_fragments(
+                for_search=True
+            )["tcgen05_ab_stages"]
+        )
+        self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
+        self.assertEqual(no_budget_ab_stages_fragment.high, 2)
+
+        # An fp16 matmul IS eligible for the FFI seed: the direct-entry TMA
+        # descriptors / SMEM layout / epilogue tile are dtype-general for any
+        # 16-bit operand, so fp16 (matching operand dtypes) at a structurally
+        # valid shape is admitted exactly like bf16. Only fp32 stays excluded.
+        fp16_args = (
+            torch.empty([1024, 1024], device=DEVICE, dtype=torch.float16),
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.float16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            fp16_bound = cute_matmul_mma.bind(fp16_args)
+        self.assertTrue(
+            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+        )
+        self.assertIsNotNone(
+            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_config()
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_full_tile_ffi_seed_rejects_structurally_invalid_shape(
+        self,
+    ) -> None:
+        # The structural shape guard for the generalized FFI seed lives entirely
+        # in ``_tcgen05_full_tile_direct_entry_seed_eligible`` (the per-shape
+        # TargetN codegen gate and the runtime direct-entry validator were
+        # removed). A shape whose N is not a multiple of the 256 CtaGroup.TWO
+        # CTA tile is not a full-tile matmul, so the seed must be ineligible and
+        # emit no config even though the dtype is a supported 16-bit type.
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        # N = 4080 is not divisible by the 256 CTA tile -> edge tile, not a
+        # full-tile CtaGroup.TWO matmul.
+        invalid_args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 4080], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+        ):
+            invalid_bound = cute_matmul_mma.bind(invalid_args)
+        spec = invalid_bound.config_spec
+        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertIsNone(spec._tcgen05_full_tile_direct_entry_seed_config())
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_edge_k_tail_bk_requires_tail(self) -> None:
+        valid_tail = Tcgen05ClusterM2SearchConstraints(
+            static_k=5000,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+            allow_edge_k_tail_family=True,
+        )
+        self.assertTrue(
+            CuteTcgen05Config.cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                valid_tail,
+            )
+        )
+        self.assertTrue(
+            CuteTcgen05Config.cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+                valid_tail,
+            )
+        )
+        for static_k in (64, 128, 256):
+            with self.subTest(static_k=static_k):
+                constraints = Tcgen05ClusterM2SearchConstraints(
+                    static_k=static_k,
+                    max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+                    allow_edge_k_tail_family=True,
+                )
+                self.assertFalse(
+                    CuteTcgen05Config.cluster_m2_bk_is_valid(
+                        TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+                        constraints,
+                    )
+                )
+
+        k_fragment = MagicMock()
+        k_fragment.low = 16
+        k_fragment.high = TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
+        spec = MagicMock()
+        spec._tcgen05_matmul_block_fragments.return_value = (
+            MagicMock(),
+            MagicMock(),
+            k_fragment,
+        )
+        spec._tcgen05_cluster_m2_bk_is_valid.side_effect = (
+            CuteTcgen05Config.cluster_m2_bk_is_valid
+        )
+        spec._tcgen05_cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
+            static_k=128,
+            max_k_tiles=TCGEN05_TWO_CTA_MAX_K_TILES,
+            allow_edge_k_tail_family=True,
+        )
+        env = MagicMock()
+        env.config_spec = spec
+        self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_seed_heuristic_for_edge_k_tail_family(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        (
+            expected_clc_aux_tma_range_flattens,
+            expected_clc_aux_tma_range_multi_buffers,
+            expected_clc_aux_tma_range_warp_specializes,
+        ) = self._expected_clc_aux_tma_range_knobs(spec)
+        self.assertIn(CuteTcgen05ClusterM2Heuristic.name, spec.autotuner_heuristics)
+        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        constraints = spec._tcgen05_cluster_m2_search_constraints
+        assert constraints is not None
+        self.assertTrue(constraints.allow_edge_k_tail_family)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, flat_keys)
+        self.assertIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        direct_seed = CuteTcgen05ClusterM2Heuristic.get_seed_config(
+            bound.env, bound.host_function.device_ir
+        ).config
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(direct_seed)
+        raw_seeded = [
+            config.config
+            for config in spec.compiler_seed_configs
+            if config.config.get("tcgen05_cluster_m") == 2
+        ]
+        self.assertEqual(len(raw_seeded), 6)
+        raw_seed = next(
+            config
+            for config in raw_seeded
+            if config.get("tcgen05_strategy")
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        raw_scheduler_seed = next(
+            config
+            for config in raw_seeded
+            if config.get("tcgen05_strategy")
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            and TCGEN05_AUX_LOAD_MODE_CONFIG_KEY not in config
+        )
+        raw_aux_tma_seed = next(
+            config
+            for config in raw_seeded
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        raw_clc_seeds = [
+            config
+            for config in raw_seeded
+            if config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ]
+        self.assertEqual(len(raw_clc_seeds), 3)
+        raw_wide_clc_aux_tma_seed = next(
+            config
+            for config in raw_clc_seeds
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and config["block_sizes"][1] == TCGEN05_TWO_CTA_BLOCK_N
+        )
+        raw_narrow_clc_aux_tma_seed = next(
+            config
+            for config in raw_clc_seeds
+            if config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        )
+        self.assertEqual(
+            raw_seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(raw_seed["pid_type"], "persistent_interleaved")
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(raw_seed)
+        self.assertEqual(
+            raw_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
+        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            raw_scheduler_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
+        self.assertEqual(raw_scheduler_seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(raw_scheduler_seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            raw_aux_tma_seed["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(raw_aux_tma_seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(raw_aux_tma_seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            raw_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+
+        c_input_seeds = [
+            config.config
+            for config in spec.autotune_seed_configs()
+            if config.config.get("tcgen05_warp_spec_c_input_warps") == 1
+        ]
+        self.assertEqual(len(c_input_seeds), 5)
+        c_input_seed = next(
+            seed
+            for seed in c_input_seeds
+            if seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) != TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        aux_tma_seed = next(
+            seed
+            for seed in c_input_seeds
+            if seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        self.assertEqual(
+            c_input_seed["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(c_input_seed["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(c_input_seed["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            c_input_seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            c_input_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
+        self.assertEqual(
+            c_input_seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
+        )
+        self.assertEqual(aux_tma_seed["block_sizes"], c_input_seed["block_sizes"])
+        self.assertEqual(aux_tma_seed["pid_type"], c_input_seed["pid_type"])
+        self.assertEqual(
+            aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            raw_wide_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["block_sizes"],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING],
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        self.assertEqual(
+            raw_narrow_clc_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(
+            {
+                seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt")
+                for seed in raw_clc_seeds
+            },
+            {"simt", TCGEN05_AUX_LOAD_MODE_TMA},
+        )
+
+        config_gen = spec.create_config_generation()
+        seed_pairs = config_gen.seed_flat_config_pairs()
+        self.assertEqual(len(seed_pairs), 6)
+        normalized_seeds = [normalized.config for _flat, normalized in seed_pairs]
+        normalized_seed = next(
+            config
+            for config in normalized_seeds
+            if config["tcgen05_strategy"]
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        normalized_scheduler_seed = next(
+            config
+            for config in normalized_seeds
+            if config["tcgen05_strategy"]
+            == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        normalized_aux_tma_seed = next(
+            config
+            for config in normalized_seeds
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        normalized_clc_seeds = [
+            config
+            for config in normalized_seeds
+            if config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        ]
+        self.assertEqual(len(normalized_clc_seeds), 3)
+        normalized_wide_clc_aux_tma_seed = next(
+            config
+            for config in normalized_clc_seeds
+            if config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and config["block_sizes"][1] == TCGEN05_TWO_CTA_BLOCK_N
+        )
+        projected_wide_clc_aux_tma_config = dict(raw_wide_clc_aux_tma_seed)
+        projected_wide_clc_aux_tma_config["block_sizes"] = [128, 64, 64]
+        projected_wide_clc_aux_tma_config["pid_type"] = "flat"
+        projected_wide_clc_aux_tma_config["tcgen05_acc_stages"] = (
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES
+        )
+        projected_wide_clc_aux_tma_config["l2_groupings"] = [
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_GROUPING
+        ]
+        projected_wide_clc_aux_tma_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
+        for key in (
+            "range_flattens",
+            "range_multi_buffers",
+            "range_warp_specializes",
+        ):
+            projected_wide_clc_aux_tma_config.pop(key, None)
+        spec._cute_tcgen05_config.fix_search_config(projected_wide_clc_aux_tma_config)
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY],
+            1,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY],
+            1,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            projected_wide_clc_aux_tma_config["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        for flat_seed, _normalized_seed in seed_pairs:
+            config_gen.encode_config(flat_seed)
+        persistence_indices, _ = config_gen._key_to_flat_indices[
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+        ]
+        legacy_scheduler_seed = dict(raw_scheduler_seed)
+        legacy_scheduler_seed.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
+        legacy_flat = config_gen.flatten(helion.Config(**legacy_scheduler_seed))
+        legacy_normalized = config_gen.unflatten([*legacy_flat]).config
+        self.assertEqual(
+            legacy_flat[persistence_indices[0]],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertEqual(
+            legacy_normalized["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(legacy_normalized["tcgen05_warp_spec_scheduler_warps"], 1)
+        self.assertEqual(legacy_normalized["tcgen05_warp_spec_c_input_warps"], 1)
+        self.assertEqual(
+            legacy_normalized[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        legacy_minimal_scheduler_seed = dict(raw_scheduler_seed)
+        legacy_minimal_scheduler_seed.pop("pid_type", None)
+        legacy_minimal_scheduler_seed.pop(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, None)
+        legacy_minimal_flat = config_gen.flatten(
+            helion.Config(**legacy_minimal_scheduler_seed)
+        )
+        legacy_minimal_normalized = config_gen.unflatten([*legacy_minimal_flat]).config
+        self.assertEqual(
+            legacy_minimal_flat[persistence_indices[0]],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertEqual(
+            legacy_minimal_normalized["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(
+            legacy_minimal_normalized["pid_type"], "persistent_interleaved"
+        )
+        self.assertEqual(
+            legacy_minimal_normalized[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        invalid_pid_seed_flat = config_gen.flatten(
+            helion.Config(pid_type="not_a_valid_pid_type")
+        )
+        self.assertEqual(
+            invalid_pid_seed_flat[persistence_indices[0]],
+            Tcgen05PersistenceModel.NON_PERSISTENT.value,
+        )
+        pid_override_gen = spec.create_config_generation(
+            overrides={"pid_type": "persistent_interleaved"}
+        )
+        pid_override_config = pid_override_gen.unflatten(
+            pid_override_gen.default_flat()
+        ).config
+        self.assertEqual(pid_override_config["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            pid_override_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        clc_flat_seed = next(
+            flat
+            for flat, normalized in seed_pairs
+            if normalized.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+            == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+        )
+        pid_override_clc_config = pid_override_gen.unflatten([*clc_flat_seed]).config
+        self.assertEqual(pid_override_clc_config["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            pid_override_clc_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+        explicit_bad_override_gen = spec.create_config_generation(
+            overrides={
+                "pid_type": "persistent_interleaved",
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                    Tcgen05PersistenceModel.NON_PERSISTENT.value
+                ),
+            }
+        )
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "contradicts pid_type='persistent_interleaved'",
+        ):
+            explicit_bad_override_gen.unflatten(
+                explicit_bad_override_gen.default_flat()
+            )
+        self.assertEqual(normalized_seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            normalized_seed["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(normalized_seed)
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            normalized_scheduler_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(
+            normalized_aux_tma_seed,
+            expected_l2_swizzle_size=(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
+            ),
+        )
+        self.assertEqual(
+            normalized_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            normalized_wide_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        normalized_narrow_clc_aux_tma_seed = next(
+            config
+            for config in normalized_clc_seeds
+            if config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING],
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["tcgen05_acc_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_ACC_STAGES,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        self.assertEqual(
+            normalized_narrow_clc_aux_tma_seed[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(
+            {
+                seed.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, "simt")
+                for seed in normalized_clc_seeds
+            },
+            {"simt", TCGEN05_AUX_LOAD_MODE_TMA},
+        )
+        for seed in normalized_clc_seeds:
+            self.assertEqual(
+                seed["tcgen05_strategy"],
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            )
+            self.assertEqual(seed["tcgen05_warp_spec_scheduler_warps"], 1)
+            self.assertEqual(seed["tcgen05_warp_spec_c_input_warps"], 1)
+            self.assertEqual(seed["tcgen05_cluster_m"], 2)
+            self.assertEqual(seed["tcgen05_cluster_n"], 1)
+            self.assertEqual(
+                seed["indexing"], ["tensor_descriptor"] * spec.indexing.length
+            )
+
+        configs = config_gen.random_population(7)
+        self.assertEqual(configs[0].config["tcgen05_cluster_m"], 1)
+        cluster_m2_population = [
+            config.config
+            for config in configs
+            if config.config["tcgen05_cluster_m"] == 2
+        ]
+        self.assertEqual(len(cluster_m2_population), 6)
+        self.assertTrue(
+            any(
+                config["block_sizes"][1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+                for config in cluster_m2_population
+            )
+        )
+        population_seed = next(
+            config
+            for config in cluster_m2_population
+            if config.get("tcgen05_strategy")
+            != Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+        )
+        self.assertEqual(
+            population_seed["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(population_seed["pid_type"], "persistent_interleaved")
+        self.assertEqual(population_seed["tcgen05_num_epi_warps"], 4)
+        self.assertEqual(
+            population_seed["indexing"],
+            ["tensor_descriptor"] * spec.indexing.length,
+        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(population_seed)
+        self.assertTrue(
+            any(
+                config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for config in cluster_m2_population
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_clc_search_normalizes_valid_and_invalid_cases(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            # target_device_capability is memoized (is_hip / _is_hip pattern),
+            # so torch.cuda.get_device_capability alone no longer reaches its
+            # consumers. Patch each seam the bind path reads: the bound-kernel
+            # cache key (runtime.kernel) and the ConfigSpec arch capability,
+            # which CompileEnvironment captures onto config_spec at build time.
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(10, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(10, 0),
+            ),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            patch(
+                "helion.runtime.kernel.target_device_capability",
+                return_value=(9, 0),
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(9, 0),
+            ),
+        ):
+            sm90_bound = cute_matmul_bias_residual_gelu.bind(args)
+        self.assertIsNot(sm90_bound, bound)
+        (
+            expected_clc_aux_tma_range_flattens,
+            expected_clc_aux_tma_range_multi_buffers,
+            expected_clc_aux_tma_range_warp_specializes,
+        ) = self._expected_clc_aux_tma_range_knobs(bound.config_spec)
+
+        valid_config: dict[str, object] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+            "indexing": ["tensor_descriptor"] * bound.config_spec.indexing.length,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            ),
+        }
+        bound.config_spec.normalize(valid_config, _fix_invalid=True)
+        self.assertEqual(
+            valid_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+
+        def make_minimal_preprojection_clc_aux_tma_config() -> dict[str, object]:
+            return {
+                "block_sizes": [128, 64, 64],
+                "indexing": ["tensor_descriptor"] * bound.config_spec.indexing.length,
+                "pid_type": "flat",
+                "tcgen05_cluster_m": 2,
+                "tcgen05_cluster_n": 1,
+                "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 0,
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                ),
+            }
+
+        minimal_preprojection_clc_aux_tma_config = (
+            make_minimal_preprojection_clc_aux_tma_config()
+        )
+        bound.config_spec.normalize(
+            minimal_preprojection_clc_aux_tma_config,
+            _fix_invalid=True,
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["range_flattens"],
+            expected_clc_aux_tma_range_flattens,
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["range_multi_buffers"],
+            expected_clc_aux_tma_range_multi_buffers,
+        )
+        self.assertEqual(
+            minimal_preprojection_clc_aux_tma_config["range_warp_specializes"],
+            expected_clc_aux_tma_range_warp_specializes,
+        )
+        unresolved_range_clc_aux_tma_config = (
+            make_minimal_preprojection_clc_aux_tma_config()
+        )
+        with patch.object(
+            bound.config_spec._cute_tcgen05_config,
+            "_clc_aux_tma_matmul_k_range_index",
+            return_value=None,
+        ):
+            bound.config_spec.normalize(
+                unresolved_range_clc_aux_tma_config,
+                _fix_invalid=True,
+            )
+        self.assertEqual(
+            unresolved_range_clc_aux_tma_config["l2_groupings"],
+            [TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_L2_GROUPING],
+        )
+        self.assertNotIn("range_flattens", unresolved_range_clc_aux_tma_config)
+        self.assertNotIn("range_multi_buffers", unresolved_range_clc_aux_tma_config)
+        self.assertNotIn("range_warp_specializes", unresolved_range_clc_aux_tma_config)
+
+        invalid_cluster_n_config = dict(valid_config)
+        invalid_cluster_n_config["tcgen05_cluster_n"] = 2
+        bound.config_spec.normalize(invalid_cluster_n_config, _fix_invalid=True)
+        self.assertEqual(
+            invalid_cluster_n_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        narrow_invalid_cluster_n_config = dict(valid_config)
+        narrow_invalid_cluster_n_config["block_sizes"] = [
+            TCGEN05_TWO_CTA_BLOCK_M,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+        ]
+        narrow_invalid_cluster_n_config["tcgen05_cluster_n"] = 2
+        narrow_invalid_cluster_n_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = (
+            TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        bound.config_spec.normalize(narrow_invalid_cluster_n_config, _fix_invalid=True)
+        self.assertEqual(
+            narrow_invalid_cluster_n_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            narrow_invalid_cluster_n_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        reset_config = dict(valid_config)
+        reset_config["pid_type"] = "flat"
+        bound.config_spec._cute_tcgen05_config.normalize_strategy(
+            reset_config,
+            fix_invalid=True,
+        )
+        self.assertEqual(
+            reset_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.NON_PERSISTENT.value,
+        )
+
+        sm90_config = dict(valid_config)
+        sm90_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        sm90_bound.config_spec.normalize(sm90_config, _fix_invalid=True)
+        self.assertEqual(
+            sm90_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+        )
+        self.assertEqual(
+            sm90_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY],
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        sm90_flat_keys = {
+            key
+            for key, _count, _is_sequence in sm90_bound.config_spec.flat_key_layout()
+        }
+        sm90_seeds = sm90_bound.config_spec.autotune_seed_configs()
+        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, sm90_flat_keys)
+        self.assertFalse(
+            any(
+                seed.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for seed in sm90_seeds
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_narrow_n_seed_requires_n_edge_at_128(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        # N=4224 is an edge for block_n=256 but a full tile for block_n=128.
+        # Keep the narrow-N seed out of this family so aux-TMA never turns the
+        # validated double-output-edge + K-tail split into M-edge + K-tail.
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 4224], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4224], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 4224], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        seed_block_sizes = [
+            config.config.get("block_sizes") for config in spec.autotune_seed_configs()
+        ]
+        self.assertFalse(
+            any(
+                isinstance(block_sizes, list)
+                and len(block_sizes) > 1
+                and block_sizes[1] == TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
+                for block_sizes in seed_block_sizes
+            )
+        )
+
+        narrow_config: dict[str, object] = {
+            "block_sizes": [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+            "indexing": ["tensor_descriptor"] * spec.indexing.length,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_strategy": Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+            "tcgen05_warp_spec_scheduler_warps": 1,
+            "tcgen05_warp_spec_c_input_warps": 1,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.CLC_PERSISTENT.value
+            ),
+        }
+        spec.normalize(narrow_config, _fix_invalid=True)
+        self.assertEqual(
+            narrow_config["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            narrow_config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.CLC_PERSISTENT.value,
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_clc_force_persistent_hides_persistence_flat_axis(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute", autotune_force_persistent=True)
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertEqual(spec.allowed_pid_types, ("persistent_interleaved",))
+        flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        self.assertFalse(
+            any(
+                seed.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for seed in spec.autotune_seed_configs()
+            )
+        )
+
+        config_gen = spec.create_config_generation()
+        default_flat = config_gen.default_flat()
+        pid_indices, _ = config_gen._key_to_flat_indices["pid_type"]
+        self.assertEqual(default_flat[pid_indices[0]], "persistent_interleaved")
+        minimal_seed_flat = config_gen.flatten(helion.Config())
+        self.assertEqual(minimal_seed_flat[pid_indices[0]], "persistent_interleaved")
+        config = config_gen.unflatten([*default_flat])
+        # Force-persistent removes "flat" from the pid fragment, so flattening
+        # encodes persistent_interleaved. Unflatten normalization rewrites the
+        # cluster_m=1 persistent pid back to flat, which derives NON_PERSISTENT.
+        # The CLC persistence axis is hidden for this non-identity path.
+        self.assertEqual(
+            config.config["pid_type"],
+            "flat",
+        )
+        self.assertEqual(
+            config.config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY],
+            Tcgen05PersistenceModel.NON_PERSISTENT.value,
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_requires_exact_shape_aux(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+        self.assertNotIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, flat_keys)
+        self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY)
+                == Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_mixed_exact_aux_dtype(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_two_residuals(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_bf16: torch.Tensor,
+            residual_fp32: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (
+                    acc + residual_bf16[tile_m, tile_n] + residual_fp32[tile_m, tile_n]
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=torch.float32),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_two_residuals.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_unrelated_exact_aux_store(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_and_elementwise_store(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            aux_out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+                aux_out[tile_m, tile_n] = (residual[tile_m, tile_n] + 1).to(x.dtype)
+            return out, aux_out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_and_elementwise_store.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_partial_rank2_aux_load(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_partial_residual(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, 0][:, None]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_partial_residual.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_scrambled_exact_aux_index(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_scrambled_residual(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_n, tile_m]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_scrambled_residual.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_seed_rejects_multi_store_exact_aux(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_fanout(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual_a: torch.Tensor,
+            residual_b: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            _, n = y.size()
+            out_a = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_b = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out_a[tile_m, tile_n] = (acc + residual_a[tile_m, tile_n]).to(x.dtype)
+                out_b[tile_m, tile_n] = (acc + residual_b[tile_m, tile_n]).to(x.dtype)
+            return out_a, out_b
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_residual_fanout.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.compiler_seed_configs
+            )
+        )
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_aux_tma_full_tile_search_projection(self) -> None:
+        # Cycle 88 (Workstream B): on the residual full-tile cluster_m=2
+        # family (T20-shape 6144³ bf16 residual_add), the search projection
+        # ``_fix_aux_tma_full_tile_search_config`` forces cluster_m=2 SIMT
+        # candidates onto the validated aux-TMA producer regime so the
+        # +14 pp aux-TMA gain is banked deterministically. cluster_m=1
+        # candidates stay untouched.
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_add(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        # Mock the SMEM budget to the B200 value at bind time (when
+        # ``allow_ab_stages_three_search`` records the budget into the
+        # constraints) so the c=4 lift's ``c_stages_fits`` gate is deterministic
+        # on any cute host (``@onlyBackends`` does not imply B200).
+        b200_budget = 232448 - 28 * 1024
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=b200_budget,
+            ),
+        ):
+            bound = cute_matmul_residual_add.bind(args)
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertTrue(spec._cute_tcgen05_config._aux_tma_full_tile_search_enabled())
+        # The aux-TMA seed is present in the compiler seed pool.
+        self.assertTrue(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+                for config in spec.autotune_seed_configs()
+            )
+        )
+        # A cluster_m=2 SIMT monolithic ab=3 candidate is projected onto the
+        # aux-TMA regime (role_local_with_scheduler + warps + ab=2 + tma).
+        cm2 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        # The budget was recorded into the constraints at bind time (mocked to
+        # B200 above), so ``c_stages_fits`` is deterministic here.
+        spec.normalize(cm2, _fix_invalid=True)
+        self.assertEqual(
+            cm2.config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY], TCGEN05_AUX_LOAD_MODE_TMA
+        )
+        self.assertEqual(
+            cm2.config["tcgen05_strategy"],
+            Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value,
+        )
+        self.assertEqual(cm2.config["tcgen05_ab_stages"], 2)
+        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY], 1)
+        self.assertEqual(cm2.config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY], 1)
+        # Cycle 90 (Workstream A Stage 2): the same projection deepens the C
+        # ring to 4 (foundation for the Stage-4 store-warp split). At ab=2 the
+        # c=4 ring fits under the 232 KB B200 cap, so the budget gate admits it.
+        self.assertEqual(cm2.config["tcgen05_c_stages"], 4)
+        # A cluster_m=1 candidate is left in its own regime (not forced to TMA),
+        # and the deeper C ring is NOT projected onto it.
+        cm1 = helion.Config(
+            block_sizes=[128, 256, 64],
+            indexing=["pointer", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="flat",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        spec.normalize(cm1, _fix_invalid=True)
+        self.assertEqual(cm1.config["tcgen05_cluster_m"], 1)
+        self.assertNotEqual(
+            cm1.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY),
+            TCGEN05_AUX_LOAD_MODE_TMA,
+        )
+        self.assertEqual(cm1.config["tcgen05_c_stages"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_c_stages_budget_gate(self) -> None:
+        # Cycle 90 (Workstream A Stage 2): the budget-aware ``c_stages_fits``
+        # check sums AB + C SMEM against the same 232 KB B200 envelope as the
+        # ab=3 gate, using the REAL DEFAULT epilogue tile — which depends on
+        # source-C presence: 256x256 16-bit is (128, 64) WITH source C (residual
+        # family, 16 KB/stage) but (128, 32) WITHOUT one (plain matmul, 8
+        # KB/stage). At the canonical 256x256x128 cluster_m=2 tile: ab=2 + c=4
+        # fits (the foundation depth); ab=3 + c=4 overflows (matching the
+        # cycle-90 probe where a directly sampled 256x256 ab=3 + c=4 hit a raw
+        # ``ptxas: too much shared`` error). Uses a plain (no-epilogue) matmul so
+        # the residual aux-TMA projection (which forces ab=2) does not claim the
+        # sampled candidate — the admission gate is the only thing acting on c=4.
+        # The SMEM budget is MOCKED to the B200 value so the gate is exercised
+        # deterministically on any cute host (``@onlyBackends`` does not imply
+        # B200).
+        #
+        # An fp16 (NOT bf16) matmul is used so the generalized TVM-FFI
+        # direct-entry seed — which is bf16-only — is INELIGIBLE here. On a
+        # bf16-eligible shape ``_fix_target1_tvm_ffi_search_config`` claims every
+        # cluster_m=2 candidate and projects it onto the validated FFI envelope
+        # (ab=3, c=2), which would shadow the c-stages gate before it could act.
+        # fp16 still records the ab=3 SMEM-budget constraints (16-bit), so the
+        # c-stages gate is exercised in isolation at the canonical cluster_m=2
+        # 256x256x128 tile.
+        b200_budget = 232448 - 28 * 1024  # optin cap - ab=3 reservation
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_plain(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.float16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.float16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=b200_budget,
+            ),
+        ):
+            bound = cute_matmul_plain.bind(args)
+        spec = bound.config_spec
+        tcfg = spec._cute_tcgen05_config
+        # The DEFAULT epilogue tile for a 256x256 16-bit tile depends on
+        # source-C presence (N shrinks when no C tile competes for SMEM).
+        self.assertEqual(
+            tcgen05_default_epilogue_tile_size(
+                256, 256, elem_width_d=16, elem_width_c=16
+            ),
+            (128, 64),
+        )
+        self.assertEqual(
+            tcgen05_default_epilogue_tile_size(
+                256, 256, elem_width_d=16, elem_width_c=None
+            ),
+            (128, 32),
+        )
+        # With source-C (residual family, 16 KB/stage): ab=2 + c=4 = 192 KB fits;
+        # ab=3 + c=4 = 256 KB overflows.
+        self.assertTrue(
+            tcfg.c_stages_fits(
+                bm=256,
+                bn=256,
+                bk=128,
+                cluster_m=2,
+                ab_stages=2,
+                c_stages=4,
+                has_source_c=True,
+            )
+        )
+        self.assertFalse(
+            tcfg.c_stages_fits(
+                bm=256,
+                bn=256,
+                bk=128,
+                cluster_m=2,
+                ab_stages=3,
+                c_stages=4,
+                has_source_c=True,
+            )
+        )
+        # Without source-C (plain matmul, 8 KB/stage): ab=3 + c=4 = 224 KB still
+        # overflows the conservative budget (the cycle-90 probe confirmed the
+        # plain 256x256 ab=3 + c=4 hits raw ptxas ``too much shared``).
+        self.assertFalse(
+            tcfg.c_stages_fits(
+                bm=256,
+                bn=256,
+                bk=128,
+                cluster_m=2,
+                ab_stages=3,
+                c_stages=4,
+                has_source_c=False,
+            )
+        )
+        # True admission gate: a DIRECTLY sampled 256x256 ab=3 + c=4 candidate
+        # (no projection claims it — plain matmul, no aux) is demoted to c=2 so
+        # tuning never reaches the raw ptxas overflow. ab=3 alone fits, so the
+        # ab-stages gate keeps it — only c is demoted.
+        #
+        # Exercise the c-stages admission gate (``_fix_c_stages_search_config``)
+        # DIRECTLY rather than through the full ``fix_search_config`` chain.
+        # Since the generalized TVM-FFI direct-entry seed is now eligible for
+        # ANY structurally-valid 16-bit shape (including fp16 6144³), the FFI
+        # projection in ``fix_search_config`` would otherwise claim every
+        # cluster_m=2 candidate and project it onto the validated (ab=3, c=2)
+        # EXPLICIT_EPI_TILE envelope — shadowing the DEFAULT-layout c-stages
+        # gate. Calling the gate directly keeps the test focused on the
+        # c-stages budget demotion it is meant to validate.
+        tcfg.search_enabled = True
+        ab3_c4 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        # The budget is already recorded in the constraints from bind (mocked to
+        # B200 above), so the gate is deterministic here.
+        tcfg._fix_c_stages_search_config(ab3_c4.config)
+        self.assertEqual(ab3_c4.config["tcgen05_ab_stages"], 3)
+        self.assertEqual(ab3_c4.config["tcgen05_c_stages"], 2)
+        # ab=2 + c=4 (fits) is preserved by the gate.
+        ab2_c4 = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        tcfg._fix_c_stages_search_config(ab2_c4.config)
+        self.assertEqual(ab2_c4.config["tcgen05_c_stages"], 4)
+        # Fail CLOSED: with no recorded SMEM budget (non-B200 / CPU host, where
+        # ``ab_stages_three_search_constraints`` is None) a sampled c=4 cannot be
+        # proven to fit, so it is demoted to 2 rather than left to overflow.
+        tcfg.ab_stages_three_search_constraints = None
+        ab2_c4_no_budget = helion.Config(
+            block_sizes=[256, 256, 128],
+            indexing=["tensor_descriptor", "tensor_descriptor", "tensor_descriptor"],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=4,
+            tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+            tcgen05_persistence_model="static_persistent",
+        )
+        tcfg._fix_c_stages_search_config(ab2_c4_no_budget.config)
+        self.assertEqual(ab2_c4_no_budget.config["tcgen05_c_stages"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_ab_stages_budget_gate(self) -> None:
+        # Cycle 97: ab=3 is BUDGET-AWARE-SEARCHABLE. The for_search ab cap is
+        # lifted to 3 wherever ab=3 is admissible (constraints recorded), and
+        # ``_fix_ab_stages_search_config`` demotes a sampled ab=3 that does not fit
+        # — fail-CLOSED, mirroring the c-stages budget gate. The new dimension over
+        # the bare-AB gate is REAL source-C presence, keyed on the PRECISE
+        # ``exact_shape_aux_kernel_detected`` (rank-2 exact-shape residual_add), NOT
+        # the broad ``aux_kernel_detected`` (which is also True for a rowvec bias
+        # that has no source-C ring). A real source-C kernel materializes the larger
+        # (128, 64) C ring, so AB(ab=3) + C overflows the 232 KiB B200 cap even at
+        # c=2 and MUST demote; the plain / rowvec-bias family (no source-C ring)
+        # keeps the calibrated bare-AB admission so its ab=3 cluster_m=2 winner stays
+        # searchable (cycle-97 force-config: bias 256x256x128 cluster_m=2 ab=3
+        # compiles + runs, T16 639.7 / T2 460.1 TF). The SMEM budget is MOCKED to the
+        # B200 value so the gate is deterministic on any cute host.
+        b200_budget = 232448 - 28 * 1024  # optin cap - ab=3 reservation
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_plain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="cute")
+        def cute_matmul_residual_add(
+            x: torch.Tensor, y: torch.Tensor, residual: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+            return out
+
+        plain_args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        bias_args = (
+            torch.empty([1024, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096, 1024], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([1024], device=DEVICE, dtype=torch.bfloat16),
+        )
+        # T16 shape (4096x4096x512): K=512 -> bk=128 -> 4 divisible k-tiles, so
+        # cluster_m=2 search IS admitted (passes ``cluster_m2_bk_is_valid``). Used
+        # for the END-TO-END bias guard below — unlike the 1024x4096x1024 bias
+        # above (cluster_m=2 search OFF -> reprojects to cluster_m=1).
+        bias_t16_args = (
+            torch.empty([4096, 512], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([512, 4096], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([4096], device=DEVICE, dtype=torch.bfloat16),
+        )
+        residual_args = (
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([6144, 6144], device=DEVICE, dtype=torch.bfloat16),
+        )
+        with (
+            patch_cute_mma_support(),
+            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config,
+                "per_cta_ab_smem_budget_bytes",
+                return_value=b200_budget,
+            ),
+        ):
+            plain_bound = cute_matmul_plain.bind(plain_args)
+            bias_bound = cute_matmul_bias.bind(bias_args)
+            bias_t16_bound = cute_matmul_bias.bind(bias_t16_args)
+            residual_bound = cute_matmul_residual_add.bind(residual_args)
+
+        plain_tcfg = plain_bound.config_spec._cute_tcgen05_config
+        bias_tcfg = bias_bound.config_spec._cute_tcgen05_config
+        bias_t16_tcfg = bias_t16_bound.config_spec._cute_tcgen05_config
+        residual_tcfg = residual_bound.config_spec._cute_tcgen05_config
+        # Plain: no aux at all. Bias: broad aux True but NO source-C ring (rowvec).
+        # Residual: real rank-2 exact-shape source-C.
+        self.assertFalse(plain_tcfg.aux_kernel_detected)
+        self.assertFalse(plain_tcfg.exact_shape_aux_kernel_detected)
+        self.assertTrue(bias_tcfg.aux_kernel_detected)
+        self.assertFalse(bias_tcfg.exact_shape_aux_kernel_detected)
+        self.assertTrue(residual_tcfg.aux_kernel_detected)
+        self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
+
+        # The for_search ab fragment is lifted to 3 (the budget was recorded at
+        # bind via the mocked B200 cap) for every family.
+        for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
+            ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
+            self.assertEqual(ab_fragment.high, 3)
+
+        def _ab3_config(cluster_m: int = 2) -> helion.Config:
+            return helion.Config(
+                block_sizes=[256, 256, 128],
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=cluster_m,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=3,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+                tcgen05_persistence_model="static_persistent",
+            )
+
+        # PLAIN (no source-C): the bare AB pipeline (192 KiB at cluster_m=2) fits
+        # the 199 KiB budget and the small no-source-C epilogue D ring rides the
+        # non-AB reservation — the ab=3 winner is PRESERVED.
+        plain_ab3 = _ab3_config()
+        plain_tcfg.fix_search_config(plain_ab3.config)
+        self.assertEqual(plain_ab3.config["tcgen05_ab_stages"], 3)
+
+        # BIAS (broad-aux True, source-C False): the rowvec bias has NO source-C
+        # ring, so the gate's NON-source-C branch admits the same 192 KiB bare-AB
+        # ab=3 at cluster_m=2. This is the case that exercises the precise-signal
+        # fix — under the old broad ``aux_kernel_detected`` branch the gate would
+        # have wrongly demoted it (cycle-97 force-config proved bias 256x256x128
+        # cluster_m=2 ab=3 fits + runs). Call the gate in ISOLATION because the
+        # full chain's cluster_m=2 projection (``_fix_cluster_m2_search_config``)
+        # can reproject a bias candidate to cluster_m=1 for K-cap reasons unrelated
+        # to this gate; the gate itself must KEEP the bias cluster_m=2 ab=3.
+        bias_ab3 = _ab3_config()
+        bias_tcfg._fix_ab_stages_search_config(bias_ab3.config)
+        self.assertEqual(bias_ab3.config["tcgen05_ab_stages"], 3)
+
+        # BIAS END-TO-END (the P2 guard): on a bias shape where cluster_m=2 search
+        # is genuinely admitted (T16 = 4096x4096x512, K=512 -> 4 divisible k-tiles),
+        # the FULL ``fix_search_config`` chain must KEEP a cluster_m=2 256x256x128
+        # ab=3 bias candidate at ab=3 cluster_m=2 — NOT reprojected to cluster_m=1
+        # (the cluster_m=2 projection accepts it) and NOT demoted to ab=2 (no
+        # source-C ring). This locks in the bias-family "now admits cluster_m=2 ab=3"
+        # claim that GATE 2 confirmed empirically (T5/T9/T16), guarding it against a
+        # future regression the way the plain/silu winner is already covered.
+        self.assertTrue(bias_t16_tcfg.aux_kernel_detected)
+        self.assertFalse(bias_t16_tcfg.exact_shape_aux_kernel_detected)
+        self.assertIsNotNone(bias_t16_tcfg.cluster_m2_search_constraints)
+        bias_t16_ab3 = _ab3_config()
+        bias_t16_tcfg.fix_search_config(bias_t16_ab3.config)
+        self.assertEqual(bias_t16_ab3.config["tcgen05_ab_stages"], 3)
+        self.assertEqual(bias_t16_ab3.config["tcgen05_cluster_m"], 2)
+        self.assertEqual(bias_t16_ab3.config["block_sizes"][:3], [256, 256, 128])
+
+        # RESIDUAL source-C branch, in ISOLATION. The exact-shape aux-TMA full-tile
+        # projection forces ab=2 on a cluster_m=2 candidate BEFORE the gate runs, so
+        # to exercise the gate's source-C branch directly we call it on a cluster_m=1
+        # residual candidate (which no projection claims): AB(ab=3) + (128, 64) C
+        # ring overflows even at cluster_m=1, so it DEMOTES to 2.
+        residual_cm1_ab3 = _ab3_config(cluster_m=1)
+        residual_tcfg._fix_ab_stages_search_config(residual_cm1_ab3.config)
+        self.assertEqual(residual_cm1_ab3.config["tcgen05_ab_stages"], 2)
+
+        # And the same residual source-C branch demotes a cluster_m=2 candidate too
+        # (independent of the aux-TMA projection): call the gate in isolation.
+        residual_cm2_ab3 = _ab3_config(cluster_m=2)
+        residual_tcfg._fix_ab_stages_search_config(residual_cm2_ab3.config)
+        self.assertEqual(residual_cm2_ab3.config["tcgen05_ab_stages"], 2)
+
+        # Full chain on the cluster_m=2 residual: the aux-TMA projection forces ab=2
+        # first, and the gate is consistent (still 2).
+        residual_full = _ab3_config(cluster_m=2)
+        residual_tcfg.fix_search_config(residual_full.config)
+        self.assertEqual(residual_full.config["tcgen05_ab_stages"], 2)
+
+        # cluster_m=1 256x256 plain ab=3 overflows bare-AB (384 KiB > budget) and is
+        # demoted even without a source-C.
+        plain_cm1_ab3 = _ab3_config(cluster_m=1)
+        plain_tcfg.fix_search_config(plain_cm1_ab3.config)
+        self.assertEqual(plain_cm1_ab3.config["tcgen05_ab_stages"], 2)
+
+        # Fail CLOSED: with no recorded SMEM budget the sampled plain ab=3 cannot be
+        # proven to fit, so it is demoted to 2 rather than left to overflow.
+        plain_tcfg.ab_stages_three_search_constraints = None
+        plain_ab3_no_budget = _ab3_config()
+        plain_tcfg.fix_search_config(plain_ab3_no_budget.config)
+        self.assertEqual(plain_ab3_no_budget.config["tcgen05_ab_stages"], 2)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_c_input_seed_respects_disable_heuristics(self) -> None:
+        @helion.kernel(backend="cute", disable_autotuner_heuristics=True)
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        self.assertTrue(bound.config_spec.cute_tcgen05_aux_kernel_detected)
+        self.assertEqual(bound.config_spec.compiler_seed_configs, [])
+        self.assertEqual(bound.config_spec.autotuner_heuristics, [])
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_cluster_m2_edge_ab2_seed_ignores_ab3_budget(
+        self,
+    ) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_bias_residual_gelu(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            bias: torch.Tensor,
+            residual: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.nn.functional.gelu(
+                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
+                    approximate="tanh",
+                ).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_bias_residual_gelu.bind(args)
+
+        spec = bound.config_spec
+        self.assertTrue(spec.cute_tcgen05_search_enabled)
+        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        config_dict: dict[str, object] = {
+            "block_sizes": [128, 128, 64],
+            "indexing": ["tensor_descriptor"] * spec.indexing.length,
+            "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
+            "pid_type": "flat",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_ab_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+            "tcgen05_acc_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
+            "tcgen05_c_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
+        }
+        with patch.object(
+            spec._cute_tcgen05_config,
+            "ab_stages_three_fits",
+            return_value=False,
+        ):
+            spec._cute_tcgen05_config.fix_search_config(config_dict)
+
+        self.assertEqual(config_dict["tcgen05_cluster_m"], 2)
+        self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
+        self.assertEqual(
+            config_dict["block_sizes"][:3],
+            [
+                TCGEN05_TWO_CTA_BLOCK_M,
+                TCGEN05_TWO_CTA_BLOCK_N,
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
+            ],
+        )
+        self.assertEqual(
+            config_dict["tcgen05_ab_stages"],
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES,
+        )
+        self._assert_cute_tcgen05_edge_k_tail_seed_overrides(config_dict)
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma.bind(args)
+        self.assertIn(
+            CuteTcgen05ClusterM2Heuristic.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+
+        # fp16 4096³ is now FFI-eligible, so the leading compiler seed is the
+        # generalized TVM-FFI direct-entry cluster_m=2 seed (previously fp16 was
+        # bf16-only for the FFI seed, so the leading seed was the cluster_m=1
+        # universal default). The DEFAULT-layout cluster_m=2 seed is also
+        # emitted and remains distinct after normalization.
+        config_gen = bound.config_spec.create_config_generation()
+        zero_flat = config_gen.random_population_flat(0)
+        self.assertEqual(len(zero_flat), 1)
+        zero_config = config_gen.unflatten(zero_flat[0])
+        self.assertEqual(zero_config.config["tcgen05_cluster_m"], 2)
+        one_flat = config_gen.random_population_flat(1)
+        self.assertEqual(len(one_flat), 1)
+        one_config = config_gen.unflatten(one_flat[0])
+        self.assertEqual(one_config.config["tcgen05_cluster_m"], 2)
+        one_config_population = config_gen.random_population(1)
+        self.assertEqual(len(one_config_population), 1)
+        self.assertEqual(one_config_population[0].config["tcgen05_cluster_m"], 2)
+        seeded_configs = config_gen.random_population(3)
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            seeded_configs,
+            expected_block_k=128,
+            expected_indexing_length=3,
+        )
+        expected_seed_modes = {
+            (Tcgen05LayoutStrategy.DEFAULT.value, False),
+            (Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value, True),
+        }
+        seeded_modes = {
+            (
+                config.config.get("tcgen05_layout_strategy"),
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True,
+            )
+            for config in seeded_configs
+        }
+        self.assertTrue(expected_seed_modes.issubset(seeded_modes))
+
+        acf_config_gen = bound.config_spec.create_config_generation(
+            advanced_controls_files=["/tmp/helion-test.acf"]
+        )
+        acf_configs = acf_config_gen.random_population(2)
+        # Future heuristics may add more compiler seeds; this test only
+        # requires the CuTe cluster-m2 seed to be present.
+        self.assertGreaterEqual(len(acf_configs), 2)
+        self.assertEqual(
+            {config.config["advanced_controls_file"] for config in acf_configs},
+            {"/tmp/helion-test.acf"},
+        )
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            acf_configs,
+            expected_block_k=128,
+            expected_indexing_length=3,
+        )
+
+        with patch.object(
+            PatternSearch, "_find_similar_cached_configs", return_value=[]
+        ):
+            search = PatternSearch(
+                bound,
+                args,
+                initial_population=30,
+                initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+                best_available_pad_random=False,
+            )
+            configs = [
+                search.config_gen.unflatten(flat)
+                for flat in search._generate_initial_population_flat()
+            ]
+        # FROM_BEST_AVAILABLE must retain both compiler-owned strategies so the
+        # autotuner measures the ordinary and direct-entry kernels.
+        self.assertGreaterEqual(len(configs), 2)
+        self._assert_cute_tcgen05_cluster_m2_seeded(
+            configs,
+            expected_block_k=128,
+            expected_indexing_length=3,
+        )
+        best_available_modes = {
+            (
+                config.config.get("tcgen05_layout_strategy"),
+                config.config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True,
+            )
+            for config in configs
+        }
+        self.assertTrue(expected_seed_modes.issubset(best_available_modes))
+
+    @onlyBackends(["cute"])
+    def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:
+        @helion.kernel(backend="cute")
+        def cute_matmul_mma_epilogue(
+            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
+            return out
+
+        args = (
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([4096], device=DEVICE, dtype=HALF_DTYPE),
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_mma_epilogue.bind(args)
+        self.assertGreater(bound.config_spec.indexing.length, 3)
+
+        configs = bound.config_spec.create_config_generation().random_population(2)
+        seeded = [
+            config.config
+            for config in configs
+            if config.config["tcgen05_cluster_m"] == 2
+        ]
+        # The bias epilogue is an FFI-supported family, so both the DEFAULT and
+        # the generalized TVM-FFI cluster_m=2 seeds are emitted; each must carry
+        # an indexing list matching the live spec's (wider-than-3) length.
+        self.assertGreaterEqual(len(seeded), 1)
+        for seed in seeded:
+            self.assertEqual(
+                len(seed["indexing"]),
+                bound.config_spec.indexing.length,
+            )
+
+
+class TestTritonReductionHeuristic(TestCase):
+    """Lock the reduction seed heuristics' branch decisions on two kernels, one per
+    track:
+
+    - rms_norm wide (rnumel=16384): the standard path
+      (``TritonStandardReductionHeuristicSM90``) seeds a persistent reduction
+      (``reduction_loops=[None]``) with the rnumel-ramp warp count.
+    - kl_div wide (rnumel=131072): the Band-B (user-tiled) path
+      (``TritonUserTiledReductionHeuristicSM90``) caps R_BLOCK by the accumulator footprint
+      instead of going full-N persistent, with M at floor 1.
+    """
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_rms_norm_wide_seeds_persistent_with_warps(self) -> None:
+        from examples.rms_norm import rms_norm_fwd
+
+        m, n = 2048, 16384
+        args = (
+            torch.randn([m, n], device=DEVICE, dtype=torch.float32),
+            torch.randn([n], device=DEVICE, dtype=torch.float32),
+            1e-5,
+        )
+        heuristic = TritonStandardReductionHeuristicSM90
+
+        # Pin the kernel to the triton backend: autotuner_heuristics is keyed on
+        # env.backend_name, and the tileir lane (where @onlyBackends(["triton"]) still
+        # runs) has no registered heuristics, so an unpinned kernel yields [] and the
+        # assertIn below fails. Pinning keeps backend_name "triton" on every lane.
+        kernel = helion.kernel(rms_norm_fwd.fn, backend="triton")
+
+        # Force the sm90 deep path so the test exercises the H100-tuned seed on any
+        # runner (off-sm90 a different class fires: SM100 on B200, the narrow fallback
+        # elsewhere).
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            bound = kernel.bind(args)
+
+            # The reduction heuristic registered a single reduction descriptor and fired.
+            kf = bound.config_spec.reduction_kernel_fact
+            self.assertIsNotNone(kf)
+            self.assertEqual(len(kf.reductions), 1)
+            self.assertEqual(kf.reductions[0].size_hint, n)
+            # rms_norm has no separate apply/normalize loop (its apply is over the full
+            # row in the reduction scope), so no reduce-then-apply tile is captured.
+            self.assertEqual(kf.non_reduction_loop_block_ids, ())
+            self.assertIn(
+                TritonStandardReductionHeuristicSM90.name,
+                bound.config_spec.autotuner_heuristics,
+            )
+            self.assertTrue(
+                heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            )
+
+            # Exactly one compiler seed, and it is the *persistent* standard config.
+            seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+        self.assertEqual(len(seeds), 1)
+        seed = seeds[0].config
+        # rnumel ramp: 16384 falls in the (4096, 16384] band -> 16 warps.
+        self.assertEqual(seed["block_sizes"], [1])
+        self.assertEqual(seed["reduction_loops"], [None])
+        self.assertEqual(seed["num_warps"], 16)
+        self.assertEqual(seed["num_stages"], 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_kl_div_wide_seeds_band_b_r_block_cap(self) -> None:
+        from examples.kl_div import kl_div_forward
+
+        m, n = 4096, 131072
+        log_q = torch.log_softmax(torch.randn([m, n], device=DEVICE), dim=-1)
+        p = torch.softmax(torch.randn([m, n], device=DEVICE), dim=-1)
+        args = (log_q, p)
+        heuristic = TritonUserTiledReductionHeuristicSM90
+
+        # Pin the kernel to the triton backend: autotuner_heuristics is keyed on
+        # env.backend_name, and the tileir lane (where @onlyBackends(["triton"]) still
+        # runs) has no registered heuristics, so an unpinned kernel yields [] and the
+        # assertIn below fails. Pinning keeps backend_name "triton" on every lane.
+        kernel = helion.kernel(kl_div_forward.fn, backend="triton")
+
+        # Force the sm90 deep path so the Band-B seed is exercised on any runner
+        # (off-sm90 a different class fires: SM100 on B200; the narrow fallback covers
+        # only the standard track, so user-tiled simply does not seed elsewhere).
+        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
+            bound = kernel.bind(args)
+
+            # Single reduction descriptor carrying a 2D [M, R] tile -> Band B.
+            kf = bound.config_spec.reduction_kernel_fact
+            self.assertIsNotNone(kf)
+            self.assertEqual(len(kf.reductions), 1)
+            fact = kf.reductions[0]
+            self.assertEqual(fact.size_hint, n)
+            self.assertGreaterEqual(fact.carried_2d_count, 1)
+            self.assertEqual(kf.non_reduction_loop_block_ids, ())
+            self.assertIn(
+                TritonUserTiledReductionHeuristicSM90.name,
+                bound.config_spec.autotuner_heuristics,
+            )
+            self.assertTrue(
+                heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            )
+
+            # Exactly one seed; R_BLOCK is capped (NOT full-N persistent) by the ONE budget
+            # allocator, and the grid (M) axis sits at its floor of 1.
+            seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+        self.assertEqual(len(seeds), 1)
+        seed = seeds[0].config
+        # The budget allocator sizes the carried [M_BLOCK, R_BLOCK] tile against ONE group budget
+        # (num_live × itemsize footprint vs the CARRIED budget), NOT a bespoke carried byte cap.
+        # The carried accumulator is live the whole loop with body_live_tiles copies, so the budget
+        # depletes to R_BLOCK = pow2(CARRIED_PERSIST_MAX_BYTES / (num_live × itemsize)). A carried
+        # reduction holds its [M, R] tile resident across the whole loop (not streamed-then-released),
+        # so it sizes against the TIGHTER CARRIED_PERSIST_MAX_BYTES (= ROW_PERSIST // 2 = 122880), a
+        # single budget CONSTANT — the footprint FORMULA is the same uniform num_live × ∏(working
+        # tile) as every other kernel (no buffer-count multiplier: body_live_tiles already counts the
+        # carried buffers). For kl_div (body_live_tiles == 6, fp32) that is pow2(122880 / (6 × 4)) =
+        # pow2(5120) = 4096 — capped well below next_pow2(131072) and M floored to 1 (budget spent).
+        # 4096 is the MEASURED optimum (~+2% vs the old 8192). Floor-vs-resident falls out of
+        # depletion: no carried recognizer, no separate CARRIED_TILE_MAX_BYTES.
+        r_block = seed["block_sizes"][0]
+        self.assertEqual(seed["block_sizes"], [4096, 1])
+        self.assertLess(r_block, n)
+        # rnumel 131072 > the 16384 warps-32 breakpoint -> 32 warps.
+        self.assertEqual(seed["num_warps"], 32)
+        self.assertEqual(seed["num_stages"], 1)
+        # The carried-tile path must NOT use the standard reduction_loops knob.
+        self.assertNotIn("reduction_loops", seed)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
+    def test_t1_reduction_then_normalize_loop_widens_tile(self) -> None:
+        # A standard rollable reduction (hl.sum over the full inner dim) IMMEDIATELY
+        # followed by a SEPARATE non-reduction hl.tile(n) loop that normalizes the row.
+        # No example kernel has this shape, so it pins the standard
+        # non-reduction-loop path:
+        # - the fact captures the normalize loop as non_reduction_loop_block_ids and
+        #   keeps m_block_ids grid-only (the normalize tile is NOT a row axis), and
+        # - the seed emits a full-length block_sizes with that tile widened (without it
+        #   the standard seed would emit a wrong-length [grid_floor] and crash) — for
+        #   BOTH the persistent and the looped (wide-N) reduction cases.
+        # NOTE: this standard+normalize seed is NOT performance-validated (no oracle);
+        # it is only a seed (worse tile => more autotuning, never wrong results), so the
+        # test asserts only that the emitted config is well-formed in both regimes.
+        @helion.kernel(backend="triton")
+        def t1_then_normalize(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                s = torch.sum(x[tile_m, :], dim=-1)
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] / s[:, None]
+            return out
+
+        def check(m: int, n: int, expect_looped: bool) -> None:
+            # Force the sm90 deep path so the standard+normalize seed is exercised on
+            # any runner (off-sm90 the narrow fallback fires instead, which does not
+            # widen the normalize tile).
+            with patch(
+                "helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE
+            ):
+                bound = t1_then_normalize.bind(
+                    (torch.randn([m, n], device=DEVICE, dtype=torch.float32),)
+                )
+                # One reduction descriptor: reduction axis + grid-only row axis + the
+                # normalize loop captured as a non-reduction loop tile (NOT a row axis).
+                kf = bound.config_spec.reduction_kernel_fact
+                self.assertIsNotNone(kf)
+                self.assertEqual(len(kf.reductions), 1)
+                fact = kf.reductions[0]
+                self.assertEqual(fact.size_hint, n)
+                self.assertEqual(kf.grid_axis_block_ids, (0,))
+                self.assertEqual(len(kf.non_reduction_loop_block_ids), 1)
+                self.assertNotIn(fact.block_id, kf.non_reduction_loop_block_ids)
+                self.assertEqual(fact.carried_2d_count, 0)
+                self.assertIn(
+                    TritonStandardReductionHeuristicSM90.name,
+                    bound.config_spec.autotuner_heuristics,
+                )
+                # Exactly one seed; block_sizes has an entry per tiled dim (grid +
+                # normalize loop), the grid axis at its floor and the normalize tile
+                # widened (> 1), and it normalizes without error (the crux: a valid,
+                # full-length config).
+                seeds = compiler_seed_configs(bound.env, bound.host_function.device_ir)
+            self.assertEqual(len(seeds), 1)
+            seed = seeds[0].config
+            self.assertEqual(
+                len(seed["block_sizes"]), len(bound.config_spec.block_sizes)
+            )
+            norm_idx = bound.config_spec.block_sizes.block_id_to_index(
+                kf.non_reduction_loop_block_ids[0]
+            )
+            self.assertGreater(seed["block_sizes"][norm_idx], 1)
+            # Persistent (narrow row) -> reduction_loops=[None]; looped (wide row past
+            # the byte cap) -> reduction_loops=[LOOPED_CHUNK].
+            if expect_looped:
+                self.assertEqual(
+                    seed["reduction_loops"],
+                    [TritonStandardReductionHeuristicSM90.LOOPED_CHUNK],
+                )
+                # At m_block==1 the normalize tile is clamped to the SAME ÷M_BLOCK
+                # register-resident footprint as the reduction tile, NOT left at
+                # next_pow2(N). With m_block==1 / fp32 the budget is prev_pow2(
+                # ROW_PERSIST_MAX_BYTES // (1 * 4)) == 32768, which is < next_pow2(131072).
+                # This is the only test cell that exercises the cap at M_BLOCK==1, so pin
+                # the value (a > 1 check would also pass on the OLD M_BLOCK>1-gated cap that
+                # left this tile uncapped).
+                from helion._utils import prev_power_of_2
+
+                expected_norm = prev_power_of_2(
+                    TritonStandardReductionHeuristicSM90.ROW_PERSIST_MAX_BYTES
+                    // (1 * 4)
+                )
+                self.assertEqual(expected_norm, 32768)
+                self.assertEqual(seed["block_sizes"][norm_idx], expected_norm)
+            else:
+                self.assertEqual(seed["reduction_loops"], [None])
+            # The emitted seed must round-trip through normalize() without raising.
+            bound.config_spec.normalize(dict(seed))
+
+        # 1024x4096: 16 KB/row < 240 KB byte cap -> persistent.
+        check(1024, 4096, expect_looped=False)
+        # 1024x131072: 512 KB/row > 240 KB byte cap -> looped (the case the old guard
+        # wrongly declined into a wrong-length crash; now emits a widened looped seed).
+        check(1024, 131072, expect_looped=True)
+
+    def test_independent_loops_not_floored_by_budget_allocator(self) -> None:
+        # The ONE budget allocator (``size_reduction_tiles``) sizes a USER_TILE reduction
+        # axis AND a co-occurring non-reduction (normalize) loop / secondary reducing axis
+        # so neither FLOORS to 1 (the [..., 1] serialization catastrophe). No example
+        # kernel has a dynamic-extent non-reduction loop, so this pins the behavior on a
+        # constructed spec (bare-spec, no active env — the allocator reads stored hints).
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        H = TritonUserTiledReductionHeuristicSM90
+        size_hint = 4096  # next_pow2(size_hint) == 4096
+
+        def spec_with(reduction_bid: int, norm_bid: int) -> ConfigSpec:
+            spec = ConfigSpec(backend=TritonBackend())
+            # grid (block 0), reduction axis, normalize-loop axis — all block_sizes.
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=reduction_bid, size_hint=size_hint)
+            )
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=norm_bid, size_hint=size_hint)
+            )
+            # USER_TILE reduction (rdim is a block_sizes entry), grid row block 0, and a
+            # non-reduction normalize loop ``norm_bid`` captured on the kernel fact.
+            desc = ReductionDescriptor(
+                category=ReductionCategory.USER_TILE,
+                block_id=reduction_bid,
+                graph_id=0,
+                size_hint=size_hint,
+                itemsize=4,
+                input_load_itemsize=4,
+                num_load=1,
+            )
+            spec.reduction_kernel_fact = ReductionKernelFact(
+                reductions=(desc,),
+                coresidency_groups=(
+                    CoResidencyGroup(graph_id=0, descriptor_indices=(0,)),
+                ),
+                non_reduction_loop_block_ids=(norm_bid,),
+                grid_axis_block_ids=(0,),
+            )
+            return spec
+
+        def pd(reduction_bid: int) -> ReductionDescriptor:
+            return ReductionDescriptor(
+                category=ReductionCategory.USER_TILE,
+                block_id=reduction_bid,
+                graph_id=0,
+                size_hint=size_hint,
+                itemsize=4,
+                input_load_itemsize=4,
+                num_load=1,
+            )
+
+        # The allocator runs without an active CompileEnvironment (it reads stored hints);
+        # device_ir is only consulted for materialized features (none here), so a MagicMock
+        # whose attribute access yields empty iterables is fine.
+        from unittest.mock import MagicMock
+
+        # reduce-then-apply: the reduction axis is sized to its full extent (persistent /
+        # budget-admitted) and the normalize loop is sized to its own extent — NOT 1.
+        spec = spec_with(reduction_bid=1, norm_bid=2)
+        device_ir = MagicMock()
+        device_ir.grid_block_ids = []
+        with (
+            patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE),
+            patch("helion.runtime.get_num_sm", return_value=132),
+        ):
+            alloc = H.size_reduction_tiles(MagicMock(), spec, device_ir, pd(1))
+        red_idx = spec.block_sizes.block_id_to_index(1)
+        norm_idx = spec.block_sizes.block_id_to_index(2)
+        self.assertEqual(alloc.block_sizes[red_idx], 4096)  # rdim sized to extent
+        self.assertEqual(
+            alloc.block_sizes[norm_idx], 4096
+        )  # normalize loop NOT floored
+        self.assertNotEqual(alloc.block_sizes[norm_idx], 1)
+        # grid (M) row axis floored (no widen headroom is required; it just must be valid).
+        self.assertGreaterEqual(alloc.block_sizes[0], 1)

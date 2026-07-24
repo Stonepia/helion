@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch._environment import is_fbcode
 from torch._inductor import inductor_prims
 
 import helion
@@ -22,7 +23,6 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
-from helion._testing import xfailIfCute
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.config import Config
@@ -241,6 +241,7 @@ def _nested_broadcast_rand_expected_3d(
 class TestRNG(RefEagerTestBase, TestCase):
     @xfailIfPallas("implicit rand still hits TPU deferred buffer materialization")
     @skipIfRefEager("compile_config is not supported in ref eager mode")
+    @skipIfXPU("RNG tests timeout on XPU")
     def test_rand(self):
         """Test RNG seeding behavior, reproducibility, output range, and distribution."""
 
@@ -317,6 +318,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("3D aten rand has low uniqueness with fold_in offset collisions")
+    @skipIfXPU("RNG tests timeout on XPU")
     def test_rand_3d_tensor(self):
         """Test 3D RNG with tiled operations."""
 
@@ -544,6 +546,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         _assert_uses_philox(self, _code1)
 
     @xfailIfPallas("implicit randn still hits TPU deferred buffer materialization")
+    @skipIfXPU("RNG tests timeout on XPU")
     def test_randn_different_seeds_tiled(self):
         """Test that different torch.manual_seed values produce different outputs for randn."""
 
@@ -572,6 +575,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         self.assertFalse(torch.allclose(output1, output2))
 
     @xfailIfPallas("implicit randn still hits TPU deferred buffer materialization")
+    @skipIfXPU("RNG tests timeout on XPU")
     def test_randn_normal_distribution(self):
         """Test that torch.randn_like produces normal distribution (mean≈0, std≈1)."""
 
@@ -610,6 +614,7 @@ class TestRNG(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("3D implicit randn still hits TPU materialization failure")
+    @skipIfXPU("RNG tests timeout on XPU")
     def test_randn_3d_tensor(self):
         """Test 3D randn with tiled operations."""
 
@@ -868,9 +873,6 @@ class TestRNG(RefEagerTestBase, TestCase):
 
     @skipIfXPU("RNG with specialized dimensions not supported on XPU")
     @xfailIfPallas("specialized-dimension rand_like hits TPU MLIR refinement mismatch")
-    @xfailIfCute(
-        "CuTe matmul plus specialized-dimension rand_like still returns unstable NaNs"
-    )
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
     @skipIfRocm("ROCm Triton worker crashes on specialized-dimension rand_like")
     def test_rand_like_with_specialized_dimension(self):
@@ -925,9 +927,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         self.assertFalse(torch.allclose(result, result3))
         _assert_uses_philox(self, code)
 
-    @xfailIfCute(
-        "CuTe still rejects nested RNG tiles that require a fourth thread axis"
-    )
     @xfailIfPallas("nested rand_like tiles hit TPU MLIR refinement mismatch")
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
     def test_rand_like_nested_tiles_issue_1208(self):
@@ -1290,6 +1289,10 @@ class TestPallasRNGRegression(TestCase):
 
 @onlyBackends(["triton", "cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe Python DSL")
+@unittest.skipIf(
+    is_fbcode(),
+    "fbcode's CuTe DSL version differs from OSS and does not lower Helion RNG stores",
+)
 @skipIfRefEager("compiled backend parity checks are not applicable in ref eager mode")
 class TestRNGBackendParity(TestCase):
     def test_triton_and_cute_match_explicit_seeded_rand(self):

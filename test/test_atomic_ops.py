@@ -14,6 +14,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -454,6 +455,131 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected, atol=0.1, rtol=0.05)
 
+    @onlyBackends(["pallas"])
+    def test_pallas_structural_atomic_add_shared_tile(self):
+        @helion.kernel(static_shapes=True)
+        def pallas_structural_atomic_add_kernel(x: torch.Tensor) -> torch.Tensor:
+            """Structurally shared output tile: contributor dim is leading K."""
+            k, m, n = x.shape
+            out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+            for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+                value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_add(out, [tile_m, tile_n], value)
+            return out
+
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        for loop_type in ("unroll", "fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                code, result = code_and_output(
+                    pallas_structural_atomic_add_kernel,
+                    (x,),
+                    block_sizes=[1, 8, 128],
+                    pallas_loop_type=loop_type,
+                )
+                expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=0)
+                torch.testing.assert_close(result, expected)
+
+    def test_structural_atomic_add_two_contributor_dims(self):
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_add_2_contributor_kernel(
+            x: torch.Tensor,
+        ) -> torch.Tensor:
+            """Two contributor dims both update the same output tile."""
+            r, k, m, n = x.shape
+            out = torch.ones([m, n], dtype=x.dtype, device=x.device)
+            for tile_r, tile_k, tile_m, tile_n in hl.tile([r, k, m, n]):
+                value = torch.sum(
+                    torch.sum(x[tile_r, tile_k, tile_m, tile_n], dim=0), dim=0
+                )
+                hl.atomic_add(out, [tile_m, tile_n], value)
+            return out
+
+        x = torch.randn(3, 4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        code, result = code_and_output(
+            structural_atomic_add_2_contributor_kernel,
+            (x,),
+            block_sizes=[1, 1, 8, 128],
+        )
+
+        expected = torch.ones(16, 128, device=DEVICE) + x.sum(dim=(0, 1))
+        torch.testing.assert_close(result, expected)
+
+    def test_structural_atomic_add_multiple_outputs(self):
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_add_two_outputs_kernel(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            k, m, n = x.shape
+            out_x = torch.ones([m, n], dtype=x.dtype, device=x.device)
+            out_y = torch.full([m, n], 2.0, dtype=y.dtype, device=y.device)
+            for tile_k, tile_m, tile_n in hl.tile([k, m, n]):
+                x_value = torch.sum(x[tile_k, tile_m, tile_n], dim=0)
+                y_value = torch.sum(y[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_add(out_x, [tile_m, tile_n], x_value)
+                hl.atomic_add(out_y, [tile_m, tile_n], y_value)
+            return out_x, out_y
+
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        code, (out_x, out_y) = code_and_output(
+            structural_atomic_add_two_outputs_kernel,
+            (x, y),
+            block_sizes=[1, 8, 128],
+        )
+
+        torch.testing.assert_close(
+            out_x, torch.ones(16, 128, device=DEVICE) + x.sum(dim=0)
+        )
+        torch.testing.assert_close(
+            out_y, torch.full([16, 128], 2.0, device=DEVICE) + y.sum(dim=0)
+        )
+
+    def test_structural_atomic_max_min_shared_tile(self):
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_max_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.full(
+                [x.size(1), x.size(2)], -1000.0, dtype=x.dtype, device=x.device
+            )
+            for tile_k, tile_m, tile_n in hl.tile(x.size()):
+                value = torch.amax(x[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_max(out, [tile_m, tile_n], value)
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def structural_atomic_min_kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.full(
+                [x.size(1), x.size(2)], 1000.0, dtype=x.dtype, device=x.device
+            )
+            for tile_k, tile_m, tile_n in hl.tile(x.size()):
+                value = torch.amin(x[tile_k, tile_m, tile_n], dim=0)
+                hl.atomic_min(out, [tile_m, tile_n], value)
+            return out
+
+        x = torch.randn(4, 16, 128, device=DEVICE, dtype=torch.float32)
+
+        code_max, result_max = code_and_output(
+            structural_atomic_max_kernel,
+            (x,),
+            block_sizes=[1, 8, 128],
+        )
+        expected_max = torch.maximum(
+            torch.full([16, 128], -1000.0, device=DEVICE), x.amax(dim=0)
+        )
+        torch.testing.assert_close(result_max, expected_max)
+
+        code_min, result_min = code_and_output(
+            structural_atomic_min_kernel,
+            (x,),
+            block_sizes=[1, 8, 128],
+        )
+        expected_min = torch.minimum(
+            torch.full([16, 128], 1000.0, device=DEVICE), x.amin(dim=0)
+        )
+        torch.testing.assert_close(result_min, expected_min)
+
     def test_atomic_add_code_generation(self):
         """Test that the generated code contains atomic_add."""
         x = torch.zeros(10, device=DEVICE)
@@ -687,6 +813,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_atomic_add_per_op_indexing(self):
         """Test per-op atomic_indexing list: first op pointer, second op tensor_descriptor."""
 
@@ -725,6 +852,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_atomic_ops_tensor_descriptor(self):
         """Test all TMA-supported atomic ops generate desc.atomic_{op} codegen."""
         M, N = 128, 64
@@ -797,6 +925,71 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             )
             self.assertIn("tl.atomic_xchg", code)
             self.assertNotIn("desc.atomic_xchg", code)
+
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_dynamic_atomic_add_tensor_descriptor(self):
+        """Dynamic shape atomics should register TD layout guards."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=False,
+        )
+        def atomic_add_dynamic_td(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            for i, j in hl.tile([x.size(0), x.size(1)]):
+                hl.atomic_add(x, [i, j], y[i, j])
+            return x
+
+        x = torch.zeros(128, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.ones(128, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(atomic_add_dynamic_td, (x, y))
+        torch.testing.assert_close(result, torch.ones_like(x))
+        self.assertIn("x_desc.atomic_add(", code)
+        self.assertNotIn("tl.atomic_add(", code)
+
+    @onlyBackends("triton")
+    @skipIfRocm("Tensor descriptor not supported on ROCm")
+    @skipIfTileIR("TileIR does not support descriptor atomics")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_atomic_td_scalar_symint(self):
+        """Composite scalar SymInts should not prevent descriptor atomics."""
+
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[64, 64],
+                indexing="tensor_descriptor",
+                atomic_indexing="tensor_descriptor",
+            ),
+            static_shapes=True,
+        )
+        def batched_atomic_add(
+            x: torch.Tensor, y: torch.Tensor, start: int
+        ) -> torch.Tensor:
+            B, M, N = x.size()
+            for tile_b in hl.tile(B - start, block_size=1):
+                for tile_m, tile_n in hl.tile([M, N]):
+                    batch = start + tile_b.begin
+                    hl.atomic_add(
+                        x,
+                        [batch, tile_m, tile_n],
+                        y[batch, tile_m, tile_n],
+                    )
+            return x
+
+        x = torch.zeros(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.ones(4, 64, 64, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(batched_atomic_add, (x, y, 1))
+        expected = torch.zeros_like(x)
+        expected[1:] = 1
+        torch.testing.assert_close(result, expected)
+        self.assertIn("desc.atomic_add(", code)
+        self.assertNotIn("tl.atomic_add(", code)
 
 
 if __name__ == "__main__":

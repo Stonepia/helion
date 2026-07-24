@@ -19,6 +19,8 @@ from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import _normalize_spec_key_str
 from helion.autotuner.config_fragment import Category
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -302,6 +304,84 @@ class TestBestAvailable(unittest.TestCase):
         restored = config_gen.unflatten(flat)
         re_flat = config_gen.flatten(restored)
         self.assertEqual(re_flat, flat)
+
+    def test_flatten_persistent_reduction_loop_roundtrip(self):
+        """Persistent reductions normalize to None but must round-trip to the flat sentinel."""
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=128))
+
+        config_gen = ConfigGeneration(config_spec)
+        default_flat = config_gen.default_flat()
+        rl_indices, rl_is_seq = config_gen._key_to_flat_indices["reduction_loops"]
+        self.assertTrue(rl_is_seq)
+        self.assertEqual(len(rl_indices), 1)
+        self.assertEqual(default_flat[rl_indices[0]], 128)
+
+        config = config_gen.unflatten(default_flat)
+        self.assertEqual(config.config["reduction_loops"], [None])
+
+        roundtripped = config_gen.flatten(config)
+        self.assertEqual(roundtripped, default_flat)
+
+    def test_flatten_persistent_reduction_loop_roundtrip_large_rnumel(self):
+        """Persistent (None) must round-trip through flatten/unflatten for rnumel>4096.
+
+        Regression guard: the encode sentinel must be the fragment max
+        (``.high`` == next_power_of_2(size_hint)) so it decodes back to None for every
+        size_hint. The fragment default is capped at max_reduction_loop (4096), which is
+        < size_hint when rnumel>4096 and would degrade [None] to a looped chunk. The
+        <=4096 cases guard that the fix keeps the already-working path.
+        """
+        # rnumel>4096: the broken cases (encode default capped at 4096 < hint).
+        for size_hint in (8192, 65536, 262144):
+            config_spec = ConfigSpec(backend=TritonBackend())
+            config_spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+            )
+            config_spec.reduction_loops.append(
+                ReductionLoopSpec(block_id=1, size_hint=size_hint)
+            )
+            config_gen = ConfigGeneration(config_spec)
+
+            config = config_spec.default_config()
+            config.config["reduction_loops"] = [None]  # persistent
+            config_spec.normalize(config.config)
+
+            flat = config_gen.flatten(config)
+            restored = config_gen.unflatten(flat)
+            self.assertEqual(
+                restored.config["reduction_loops"],
+                [None],
+                f"persistent must round-trip for rnumel={size_hint} "
+                f"(got {restored.config['reduction_loops']})",
+            )
+            # flatten/unflatten is idempotent at the flat level too.
+            self.assertEqual(config_gen.flatten(restored), flat)
+
+        # rnumel<=4096: guard that the fix keeps the already-working path.
+        for size_hint in (256, 4096):
+            config_spec = ConfigSpec(backend=TritonBackend())
+            config_spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+            )
+            config_spec.reduction_loops.append(
+                ReductionLoopSpec(block_id=1, size_hint=size_hint)
+            )
+            config_gen = ConfigGeneration(config_spec)
+
+            config = config_spec.default_config()
+            config.config["reduction_loops"] = [None]
+            config_spec.normalize(config.config)
+
+            restored = config_gen.unflatten(config_gen.flatten(config))
+            self.assertEqual(
+                restored.config["reduction_loops"],
+                [None],
+                f"persistent must still round-trip for rnumel={size_hint}",
+            )
 
 
 class TestCacheMatching(unittest.TestCase):
@@ -619,6 +699,247 @@ class TestCacheMatching(unittest.TestCase):
             self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
 
 
+def _make_entry_json(
+    hardware: str,
+    spec_key: str,
+    config_dict: dict[str, object],
+    config_spec_hash: str,
+    flat_config: list[object],
+) -> str:
+    """Build a .best_config JSON string matching the on-disk format."""
+    return json.dumps(
+        {
+            "key": {
+                "fields": {
+                    "hardware": hardware,
+                    "specialization_key": spec_key,
+                    "config_spec_hash": config_spec_hash,
+                }
+            },
+            "config": json.dumps(config_dict),
+            "flat_config": json.dumps(flat_config),
+        }
+    )
+
+
+class TestRemoteCacheMerging(unittest.TestCase):
+    """Tests for _find_similar_cached_configs merging remote entries via RemoteCacheBackend.list()."""
+
+    def _make_mock_search(self, hardware: str, spec_key: str, fp_hash: str):
+        mock_search = MagicMock()
+        mock_search._skip_cache = False
+        mock_search.settings = MagicMock()
+        mock_search.settings.autotune_best_available_max_cache_scan = 500
+        mock_search.settings.autotune_search_acf = None
+        mock_search._get_current_hardware_and_specialization = MagicMock(
+            return_value=(hardware, spec_key)
+        )
+        mock_search.config_spec = MagicMock()
+        mock_search.config_spec.structural_fingerprint_hash = MagicMock(
+            return_value=fp_hash
+        )
+        return mock_search
+
+    def test_remote_entries_returned_when_local_empty(self):
+        """When local has no matches, remote entries seed warm-start."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+        hardware = "NVIDIA GeForce RTX 4090"
+        spec_key = "('tensor_spec',)"
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [64]}, fp_hash, [64]
+                    )
+                ]
+
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ),
+            patch(
+                "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                return_value=StubBackend(),
+            ),
+        ):
+            entries = PopulationBasedSearch._find_similar_cached_configs(
+                self._make_mock_search(hardware, spec_key, fp_hash), max_configs=10
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].config.config["block_sizes"], [64])
+
+    def test_remote_dedups_against_local(self):
+        """Remote entries duplicating a local match (including nested lists in flat_config) are dropped."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+        hardware = "NVIDIA GeForce RTX 4090"
+        spec_key = "('tensor_spec',)"
+
+        # Nested list inside flat_config — common shape for block_sizes etc.
+        # The dedup machinery must not crash with "unhashable type: 'list'".
+        flat_a = [[16, 32], 4]
+        flat_b = [[64, 128], 8]
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [16, 32]}, fp_hash, flat_a
+                    ),
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [64, 128]}, fp_hash, flat_b
+                    ),
+                ]
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            # Local entry matches flat_a — remote duplicate must be skipped.
+            data = {
+                "key": {
+                    "fields": {
+                        "hardware": hardware,
+                        "specialization_key": spec_key,
+                        "config_spec_hash": fp_hash,
+                    }
+                },
+                "config": json.dumps({"block_sizes": [16, 32]}),
+                "flat_config": json.dumps(flat_a),
+            }
+            with open(os.path.join(cache_dir, "local.best_config"), "w") as f:
+                json.dump(data, f)
+
+            with (
+                patch(
+                    "helion.autotuner.local_cache.get_helion_cache_dir",
+                    return_value=Path(cache_dir),
+                ),
+                patch(
+                    "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                    return_value=StubBackend(),
+                ),
+            ):
+                entries = PopulationBasedSearch._find_similar_cached_configs(
+                    self._make_mock_search(hardware, spec_key, fp_hash),
+                    max_configs=10,
+                )
+
+        flats = [e.flat_config for e in entries]
+        # Local entry (a) appears first; remote (a) is deduped; remote (b) is kept.
+        self.assertEqual(flats, [([16, 32], 4), ([64, 128], 8)])
+
+    def test_remote_entries_filtered_by_hardware(self):
+        """Remote entries with non-matching hardware are skipped."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    _make_entry_json(
+                        "NVIDIA A100", "('s',)", {"block_sizes": [128]}, fp_hash, [128]
+                    ),
+                ]
+
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ),
+            patch(
+                "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                return_value=StubBackend(),
+            ),
+        ):
+            entries = PopulationBasedSearch._find_similar_cached_configs(
+                self._make_mock_search("NVIDIA GeForce RTX 4090", "('s',)", fp_hash),
+                max_configs=10,
+            )
+
+        self.assertEqual(entries, [])
+
+    def test_remote_malformed_entries_skipped(self):
+        """Malformed remote entries are silently skipped, valid ones still returned."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        fp_hash = "abc123"
+        hardware = "NVIDIA GeForce RTX 4090"
+        spec_key = "('s',)"
+
+        class StubBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+            def list(self, max_results=None):
+                return [
+                    "not valid json",
+                    json.dumps({"config": "minimal payload, missing key.fields"}),
+                    _make_entry_json(
+                        hardware, spec_key, {"block_sizes": [16]}, fp_hash, [16]
+                    ),
+                ]
+
+        with (
+            tempfile.TemporaryDirectory() as cache_dir,
+            patch(
+                "helion.autotuner.local_cache.get_helion_cache_dir",
+                return_value=Path(cache_dir),
+            ),
+            patch(
+                "helion.autotuner.remote_cache._load_remote_backend_if_configured",
+                return_value=StubBackend(),
+            ),
+        ):
+            entries = PopulationBasedSearch._find_similar_cached_configs(
+                self._make_mock_search(hardware, spec_key, fp_hash), max_configs=10
+            )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].config.config["block_sizes"], [16])
+
+    def test_default_list_returns_empty(self):
+        """Backends that don't override list() use the empty default — no errors, no entries."""
+        from helion.autotuner.remote_cache import RemoteCacheBackend
+
+        class MinimalBackend(RemoteCacheBackend):
+            def get(self, key):
+                return None
+
+            def put(self, key, data):
+                pass
+
+        # The default impl returns an empty tuple; just verify the contract holds.
+        self.assertEqual(list(MinimalBackend().list()), [])
+
+
 class TestIterCacheEntries(unittest.TestCase):
     """Tests for the iter_cache_entries() module-level API in local_cache."""
 
@@ -798,6 +1119,7 @@ class TestSpecKeyNormalization(unittest.TestCase):
             mock_cache.key = key
             mock_cache._get_local_cache_path.return_value = cache_path
             mock_cache.kernel.backend_cache_key.return_value = None
+            mock_cache.autotuner.settings = Settings()
             # Make flatten() return a JSON-serializable list
             mock_cache.kernel.config_spec.create_config_generation.return_value.flatten.return_value = [
                 64,
@@ -812,6 +1134,65 @@ class TestSpecKeyNormalization(unittest.TestCase):
             # put() stores raw str(v), so code object reprs are present
             self.assertIn("<code object", spec_key_str)
             self.assertIn("tensor_spec", spec_key_str)
+
+    def test_put_stores_acf_aware_flat_config(self):
+        """ACF cache keys and stored flat configs use the same flat layout."""
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        acf_files = ["/tmp/helion-test.acf"]
+        config = Config(
+            block_sizes=[64],
+            num_warps=4,
+            num_stages=3,
+            advanced_controls_file="/tmp/helion-test.acf",
+        )
+        acf_config_gen = config_spec.create_config_generation(
+            advanced_controls_files=acf_files
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "acf.best_config"
+            key = LooseAutotuneCacheKey(
+                specialization_key=("tensor_spec",),
+                extra_results=(),
+                kernel_source_hash="abc123",
+                hardware="test_hw",
+                runtime_name="1.0",
+                backend="triton",
+                config_spec_hash=config_spec.structural_fingerprint_hash(
+                    advanced_controls_files=acf_files
+                ),
+            )
+
+            mock_cache = MagicMock()
+            mock_cache.key = key
+            mock_cache._get_local_cache_path.return_value = cache_path
+            mock_cache.kernel.config_spec = config_spec
+            mock_cache.kernel.backend_cache_key.return_value = None
+            mock_cache.autotuner.settings = Settings(autotune_search_acf=acf_files)
+
+            LocalAutotuneCache.put(mock_cache, config)
+
+            data = json.loads(cache_path.read_text())
+            stored_flat = json.loads(data["flat_config"])
+            expected_flat = acf_config_gen.flatten(config)
+            self.assertEqual(stored_flat, expected_flat)
+            self.assertEqual(len(stored_flat), len(acf_config_gen.flat_spec))
+            entries = list(iter_cache_entries(Path(tmpdir)))
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].to_mutable_flat_config(), expected_flat)
+
+            roundtripped = acf_config_gen.unflatten(entries[0].to_mutable_flat_config())
+            self.assertEqual(
+                roundtripped.config["advanced_controls_file"],
+                "/tmp/helion-test.acf",
+            )
+            self.assertEqual(
+                data["key"]["fields"]["config_spec_hash"],
+                key.config_spec_hash,
+            )
 
 
 class TestStructuralFingerprint(unittest.TestCase):
@@ -848,6 +1229,33 @@ class TestStructuralFingerprint(unittest.TestCase):
 
         self.assertEqual(
             spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
+        )
+
+    def test_enum_choices_change_fingerprint(self):
+        """Enum search-space changes should invalidate exact-cache entries."""
+        spec_a = ConfigSpec(backend=TritonBackend())
+        spec_a.user_defined_tunables["mode"] = EnumFragment(("a", "b"))
+        spec_a.user_defined_tunables["indexed_mode"] = ListOf(
+            EnumFragment((1, 2)), length=2
+        )
+
+        spec_b = ConfigSpec(backend=TritonBackend())
+        spec_b.user_defined_tunables["mode"] = EnumFragment(("a", "b", "c"))
+        spec_b.user_defined_tunables["indexed_mode"] = ListOf(
+            EnumFragment((1, 2)), length=2
+        )
+
+        spec_c = ConfigSpec(backend=TritonBackend())
+        spec_c.user_defined_tunables["mode"] = EnumFragment(("a", "b"))
+        spec_c.user_defined_tunables["indexed_mode"] = ListOf(
+            EnumFragment((1, 2, 3)), length=2
+        )
+
+        self.assertNotEqual(
+            spec_a.structural_fingerprint(), spec_b.structural_fingerprint()
+        )
+        self.assertNotEqual(
+            spec_a.structural_fingerprint(), spec_c.structural_fingerprint()
         )
 
     def test_different_range_fields_count(self):
@@ -969,6 +1377,9 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         mock_search.settings = Settings()
         mock_search.log = MagicMock()
         mock_search.log.debug = MagicMock()
+        mock_search.args = ()
+        mock_search.kernel = None
+        mock_search._autotune_seed_configs = MagicMock(return_value=[])
         mock_search._find_similar_cached_configs = MagicMock(return_value=entries)
         return mock_search
 
@@ -985,7 +1396,7 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(result[0], config_gen.default_flat())
 
     def test_cached_configs_added(self):
-        """Cached configs are added after default."""
+        """Cached configs are added after seed/default configs."""
         config_gen = self._make_config_gen()
         cached = [
             Config(block_sizes=[32, 64], num_warps=8, num_stages=2),
@@ -1003,6 +1414,43 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         num_warps_idx = config_gen._key_to_flat_indices["num_warps"][0][0]
         self.assertEqual(result[1][num_warps_idx], 8)
         self.assertEqual(result[2][num_warps_idx], 2)
+
+    def test_compiler_seed_precedes_default(self):
+        """Compiler seeds are benchmarked before the raw fragment default.
+
+        This keeps FROM_BEST_AVAILABLE from spending a long time on a slow raw
+        default when a backend heuristic has supplied a known fast seed but the
+        seed was not promoted to compiler_default_config.
+        """
+        config_gen = self._make_config_gen()
+        seed = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        config_gen.config_spec.compiler_seed_configs = [seed]
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 2)
+        normalized_seed = config_gen.unflatten(config_gen.flatten(seed))
+        self.assertEqual(config_gen.unflatten(result[0]), normalized_seed)
+        self.assertEqual(result[1], config_gen.default_flat())
+
+    def test_best_available_seed_precedes_default(self):
+        """Caller-provided best-available seeds also precede the raw default."""
+        config_gen = self._make_config_gen()
+        seed = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+        mock_search._best_available_seed_configs = [seed]
+
+        result = PopulationBasedSearch._generate_best_available_population_flat(
+            mock_search
+        )
+
+        self.assertEqual(len(result), 2)
+        normalized_seed = config_gen.unflatten(config_gen.flatten(seed))
+        self.assertEqual(config_gen.unflatten(result[0]), normalized_seed)
+        self.assertEqual(result[1], config_gen.default_flat())
 
     def test_duplicate_configs_deduplicated(self):
         """Duplicate cached configs are discarded."""

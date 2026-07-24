@@ -21,6 +21,14 @@ on:
       alias:
         required: true
         type: string
+      suite:
+        required: false
+        type: string
+        default: tritonbench
+      backend:
+        required: false
+        type: string
+        default: triton
       kernels:
         required: true
         type: string
@@ -39,6 +47,11 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
+      HELION_BACKEND: ${{ inputs.backend }}
+      # Per-shape autotune convergence cutoff (90 min): healthy searches finish
+      # well under it (slowest ~69 min); non-converging runaways are stopped with
+      # best-so-far.
+      HELION_AUTOTUNE_BUDGET_SECONDS: "5400"
 
     container:
       image: ${{ inputs.image }}
@@ -78,10 +91,10 @@ jobs:
           apt-get install -y git
 
       - name: Check out code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ inputs.python-version }}
 
@@ -95,13 +108,22 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U "torch==2.11.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+
+          # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
+
+      - name: Install CUTLASS CuTe DSL
+        if: inputs.backend == 'cute'
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
         if: startsWith(inputs.image, 'nvidia')
@@ -124,7 +146,8 @@ jobs:
           print(f'All {n} devices healthy')
           "
 
-      - name: Install Benchmark Requirements
+      - name: Install TritonBench Requirements
+        if: inputs.suite == 'tritonbench'
         run: |
           set -x
           source .venv/bin/activate
@@ -133,14 +156,35 @@ jobs:
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
           pushd tritonbench/
+          git checkout $(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/tritonbench.txt)
           git submodule update --init --recursive
           uv pip install -r requirements.txt
           python install.py --liger
+          if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
+            uv pip install einops
+            MAX_JOBS=4 uv pip install "mamba-ssm==2.3.2.post1" --no-build-isolation --no-deps
+            uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
+          fi
           uv pip install -e . --no-deps
           popd
           popd
 
-      - name: Run Benchmark
+      - name: Install Linear-Attention Requirements
+        if: inputs.suite == 'linattn'
+        run: |
+          set -x
+          source .venv/bin/activate
+          # Newer FLA allows gated backward on Hopper with Triton 3.7.1+;
+          # torch 2.12.1 provides that Triton version.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.12.1" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          uv pip install einops transformers
+          uv pip install "git+https://github.com/fla-org/flash-linear-attention@6bd90692588c81fe102ee6e12ac70686359658a2" --no-deps
+          python -c "from packaging.version import Version; import torch, triton; print('torch', torch.__version__, 'triton', triton.__version__); assert torch.cuda.is_available(); assert Version(triton.__version__) >= Version('3.7.1'), triton.__version__"
+          python -c "import fla; print('fla', fla.__name__)"
+
+      - name: Run TritonBench Benchmark
+        if: inputs.suite == 'tritonbench'
         run: |
           rm -rf /tmp/torchinductor_*/ || true
 
@@ -172,27 +216,20 @@ jobs:
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
 
-            # Do autotuning but do not record the results
-            ${{ inputs.env-vars }} python benchmarks/run.py \
+            # Single inline pass (autotune + codegen + compile), so
+            # --measure-compile-time is end-to-end. HELION_AUTOTUNE_LOG is
+            # per-kernel (the sink appends, accumulating input shapes) and sits
+            # under $TEST_REPORTS_DIR, so its .csv/.log ride out in the
+            # artifact. The detailed dataset .meta.jsonl (identity + configs
+            # keyed by config_id) is opt-in via HELION_AUTOTUNE_LOG_DETAILS=1;
+            # set it manually when collecting the cost-model dataset. It is
+            # intentionally left off here to keep CI artifacts small.
+            # --autotune-metrics-json: per-run summary, overwrite-safe.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+            HELION_AUTOTUNE_LOG="$TEST_REPORTS_DIR/autotune-$kernel" \
+            python benchmarks/run.py \
                 --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
-                --input-sample-mode equally-spaced-k \
-                --keep-going \
-                ${{ inputs.custom-args }}
-
-            # Relax the GPU
-            sleep 2m
-
-            # Run again with cache and record results
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
-                --op $kernel \
+                --helion-backend "${{ inputs.backend }}" \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
                 --latency-measure-mode triton_do_bench \
@@ -205,11 +242,47 @@ jobs:
                 --input-sample-mode equally-spaced-k \
                 --output "$TEST_REPORTS_DIR/helionbench.json" \
                 --append-to-output \
+                --autotune-metrics-json "$TEST_REPORTS_DIR/autotune-metrics-$kernel.json" \
                 --keep-going \
                 ${{ inputs.custom-args }}
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done
+
+          if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
+            echo "❌ helionbench.json is missing or empty"
+            exit 1
+          fi
+          cat "$TEST_REPORTS_DIR/helionbench.json"
+
+      - name: Run Linear-Attention Benchmark
+        if: inputs.suite == 'linattn'
+        run: |
+          rm -rf /tmp/torchinductor_*/ || true
+
+          source .venv/bin/activate
+
+          TEST_REPORTS_DIR=$(pwd)/test/test-reports
+          mkdir -p "$TEST_REPORTS_DIR"
+          echo "$TEST_REPORTS_DIR"
+
+          KERNELS="${{ inputs.kernels }}"
+          if [[ "$KERNELS" == "all" || -z "$KERNELS" ]]; then
+            KERNEL_FLAG=()
+          else
+            KERNEL_FLAG=(--kernel "$KERNELS")
+          fi
+
+          echo "=========================================="
+          echo "Linear-Attention Benchmark"
+          echo "Kernels: ${KERNELS:-all}"
+          echo "=========================================="
+
+          ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+          python -m benchmarks.run_linattn \
+              "${KERNEL_FLAG[@]}" \
+              --output "$TEST_REPORTS_DIR/helionbench.json" \
+              ${{ inputs.custom-args }}
 
           if [[ ! -s "$TEST_REPORTS_DIR/helionbench.json" ]]; then
             echo "❌ helionbench.json is missing or empty"

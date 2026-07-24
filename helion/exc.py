@@ -318,6 +318,14 @@ class MissingEnableTile(BaseError):
     )
 
 
+class CuteBackendUnavailable(BaseError):
+    message = (
+        "The 'cute' backend cannot run in this environment: {0}\n"
+        "The cute backend requires nvidia-cutlass-dsl >= 4.5.1, the "
+        "apache-tvm-ffi package, and CUDA >= 13."
+    )
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 
@@ -483,7 +491,7 @@ class TiledKMatmulAccumulationWarning(BaseWarning):
 class NoAOTHeuristicWarning(BaseWarning):
     message = (
         "No AOT heuristic found for kernel '{0}'. Using default config. "
-        "Use `python -m helion.experimental.aot_runner` to generate tuned configs."
+        "Use `python -m helion.autotuner.aot_runner` to generate tuned configs."
     )
 
 

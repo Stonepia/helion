@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
@@ -15,9 +14,10 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.helper_function import CombineFunction
-    from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import Origin
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.helper_function import CombineFunctionBasic
+    from .._compiler.helper_function import CombineFunctionTuple
+    from .._compiler.type_info import Origin
+    from .._compiler.type_info import TypeInfo
 
 
 __all__ = ["associative_scan", "cumprod", "cumsum"]
@@ -106,9 +106,34 @@ def _(
     dim: int,
     reverse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    return higher_order_ops.associative_scan(
-        combine_fn, input_tensor, dim, reverse=reverse
+    # Eager inclusive scan. Ref mode must not call torch's associative_scan HOP: it
+    # runs Dynamo, which breaks under Helion's active RefMode TorchFunctionMode.
+    from .._compiler.helper_function import create_combine_function_wrapper
+
+    is_tuple = isinstance(input_tensor, (tuple, list))
+    leaves = tuple(input_tensor) if is_tuple else (input_tensor,)
+    combine = create_combine_function_wrapper(
+        combine_fn, is_tuple_input=is_tuple, target_format="tuple"
     )
+
+    scan_dim = dim % leaves[0].ndim
+    length = leaves[0].size(scan_dim)
+    order = reversed(range(length)) if reverse else range(length)
+
+    acc: tuple[torch.Tensor, ...] | None = None
+    out: list[tuple[torch.Tensor, ...]] = [()] * length
+    for k in order:
+        cur = tuple(leaf.select(scan_dim, k) for leaf in leaves)
+        if acc is None:
+            acc = cur
+        elif is_tuple:
+            acc = tuple(cast("CombineFunctionTuple", combine)(acc, cur))
+        else:
+            acc = (cast("CombineFunctionBasic", combine)(acc[0], cur[0]),)
+        out[k] = acc
+
+    result = tuple(torch.stack(col, dim=scan_dim) for col in zip(*out, strict=True))
+    return result if is_tuple else result[0]
 
 
 @_decorators.register_to_device_ir(associative_scan)
@@ -216,9 +241,9 @@ def _(
     origin: Origin,
 ) -> TypeInfo:
     """Type propagation for associative_scan - output has same type as input."""
-    from .._compiler.type_propagation import CallableType
-    from .._compiler.type_propagation import SequenceType
-    from .._compiler.type_propagation import TensorType
+    from .._compiler.type_info import CallableType
+    from .._compiler.type_info import SequenceType
+    from .._compiler.type_info import TensorType
 
     # Validate that combine_fn is callable
     if not isinstance(combine_fn, CallableType):
@@ -326,88 +351,3 @@ def _(
         return tuple(torch.empty_like(t) for t in input_tensor)
     assert isinstance(input_tensor, torch.Tensor), input_tensor
     return torch.empty_like(input_tensor)
-
-
-@_decorators.codegen(_associative_scan, "triton")
-def _(state: CodegenState) -> ast.AST | list[ast.AST]:
-    """Generate code for associative scan with combine function."""
-
-    combine_graph_id = state.proxy_arg(0)
-    dim = state.proxy_arg(2)
-    reverse = state.proxy_arg(3)
-    is_tuple_input = state.proxy_arg(4)
-
-    input_tensor = _get_input_tensor_ast(state, bool(is_tuple_input))
-    helper_func_name = _register_helper_function(state, cast("int", combine_graph_id))
-    scan_expr = _create_scan_expression(
-        input_tensor, cast("int", dim), helper_func_name, bool(reverse)
-    )
-
-    if is_tuple_input:
-        return _create_tuple_result_expressions(state, scan_expr)
-    return scan_expr
-
-
-def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
-    """Get the input tensor AST, handling tuple inputs specially."""
-    if not is_tuple_input:
-        return state.ast_arg(1)
-
-    raw_input = state.ast_args[1]
-    if isinstance(raw_input, tuple):
-        from .._compiler.ast_extension import create
-
-        tuple_elts = [
-            elt if isinstance(elt, ast.AST) else ast.Constant(value=elt)
-            for elt in raw_input
-        ]
-        return create(ast.Tuple, elts=tuple_elts, ctx=ast.Load())
-    return state.ast_arg(1)
-
-
-def _register_helper_function(state: CodegenState, combine_graph_id: int) -> str:
-    """Register the helper function and return its final name."""
-    from .._compiler.device_ir import HelperFunctionGraphInfo
-
-    helper_graph_info = state.get_graph(combine_graph_id)
-    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
-    state.codegen.device_function.register_helper_function(helper_graph_info)
-    # Get the final name from the helper manager (which uses the namespace)
-    return state.codegen.device_function.helper_manager.get_final_name(
-        helper_graph_info
-    )
-
-
-def _create_scan_expression(
-    input_tensor: ast.AST, dim: int, helper_func_name: str, reverse: bool
-) -> ast.AST:
-    """Create the tl.associative_scan expression."""
-    from .._compiler.ast_extension import expr_from_string
-
-    template = (
-        f"tl.associative_scan({{input_tensor}}, {{dim_value}}, {helper_func_name}, reverse=True)"
-        if reverse
-        else f"tl.associative_scan({{input_tensor}}, {{dim_value}}, {helper_func_name})"
-    )
-    return expr_from_string(
-        template,
-        input_tensor=input_tensor,
-        dim_value=ast.Constant(value=dim),
-    )
-
-
-def _create_tuple_result_expressions(
-    state: CodegenState, scan_expr: ast.AST
-) -> list[ast.AST]:
-    """Create getitem expressions for tuple results."""
-    from .._compiler.ast_extension import expr_from_string
-
-    raw_input = state.ast_args[1]
-    num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
-
-    return [
-        expr_from_string(
-            "{scan_result}[{index}]", scan_result=scan_expr, index=ast.Constant(value=i)
-        )
-        for i in range(num_elements)
-    ]

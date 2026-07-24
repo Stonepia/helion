@@ -8,6 +8,7 @@ $ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 Example usage:
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
+$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm  # Runs using the CuTe backend
 $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
 
 # On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
@@ -36,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -46,14 +48,20 @@ from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
 from helion._compat import get_device_name
+from helion._compile_time import enable as enable_compile_time
 from helion._compile_time import get_total_time as get_compile_total_time
 from helion._compile_time import reset as reset_compile_time
+from helion._compiler.backend_registry import list_backends
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.metrics import register_post_autotune_hook
+from helion.runtime.settings import _get_backend
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 StrPath = str | os.PathLike[str]
 
@@ -93,6 +101,24 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
+MAMBA2_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
+MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
+
+# These patches mutate TritonBench operator classes, so remember patched classes
+# to avoid wrapping the same methods more than once in a long benchmark process.
+_PATCHED_MAMBA_OPERATOR_CLASSES: set[type[Any]] = set()
+_PATCHED_ROPE_OPERATOR_CLASSES: set[type[Any]] = set()
+_PATCHED_GDN_OPERATOR_CLASSES: set[type[Any]] = set()
+
+_RopeInput = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
 
 @dataclasses.dataclass
@@ -101,6 +127,206 @@ class RunResult:
     device: str
     shape: list[str]
     metrics: dict[str, list[float]]
+
+
+def _mamba_valid_dA_cumsum_like(dt: torch.Tensor) -> torch.Tensor:
+    # TritonBench PR #567 generates arbitrary random dA_cumsum values for the
+    # Mamba2 operators, but mamba_ssm's optimized Triton kernels assume the real
+    # Mamba invariant: dA_cumsum is cumulative negative decay, so it is
+    # non-increasing within each chunk. Patch the pinned benchmark inputs here so
+    # the handwritten baseline is compared on valid Mamba data.
+    return torch.cumsum(-torch.rand_like(dt), dim=-1)
+
+
+def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name not in {"mamba2_chunk_scan", "mamba2_chunk_state"}:
+        return
+    if Operator in _PATCHED_MAMBA_OPERATOR_CLASSES:
+        return
+
+    original_get_input_iter = Operator.get_input_iter
+
+    def get_input_iter(self: object) -> Iterator[tuple[object, ...]]:
+        for example_inputs in original_get_input_iter(self):
+            if operator_name == "mamba2_chunk_scan":
+                cb, x, dt, _dA_cumsum, C, prev_states, D = example_inputs
+                shape = (
+                    x.shape[0],
+                    x.shape[2],
+                    C.shape[2],
+                    x.shape[1],
+                    dt.shape[3],
+                    x.shape[3],
+                    C.shape[3],
+                )
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
+                    free_memory, _ = torch.cuda.mem_get_info(x.device)
+                    # Accuracy checks run TritonBench's eager baseline, which
+                    # expands cb across heads and OOMs below this free-memory level.
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
+                        continue
+                dt = torch.rand_like(dt)
+                dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
+                yield cb, x, dt, dA_cumsum, C, prev_states, D
+            else:
+                B, x, dt, _dA_cumsum = example_inputs
+                shape = (
+                    x.shape[0],
+                    x.shape[2],
+                    B.shape[2],
+                    x.shape[1],
+                    dt.shape[3],
+                    x.shape[3],
+                    B.shape[3],
+                )
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
+                    free_memory, _ = torch.cuda.mem_get_info(x.device)
+                    # Helion autotune for this shape consistently fails on H100
+                    # (~80 GB) after the 5 prior shapes have left behind cached
+                    # buffers and JIT state, even though the kernel + autotune
+                    # work on a freshly-cleared GPU. Gate on free memory so the
+                    # shape still runs on devices with >100 GB free (e.g. B200).
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
+                        continue
+                dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
+                yield B, x, dt, dA_cumsum
+
+    Operator.get_input_iter = get_input_iter
+    _PATCHED_MAMBA_OPERATOR_CLASSES.add(Operator)
+
+
+def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name != "rope":
+        return
+    if Operator in _PATCHED_ROPE_OPERATOR_CLASSES:
+        return
+
+    input_cache: dict[tuple[str, torch.dtype, int, int, int, int], _RopeInput] = {}
+    operator_module = cast("Any", sys.modules[Operator.__module__])
+    original_rotary_embedding = operator_module.LlamaRotaryEmbedding
+    original_prepare_input = Operator.prepare_input
+
+    def llama_rotary_embedding(*args: object, **kwargs: object) -> torch.nn.Module:
+        # pyrefly: ignore [missing-import]
+        from transformers.models.llama.configuration_llama import LlamaConfig
+
+        if args and isinstance(args[0], LlamaConfig):
+            kwargs["config"] = args[0]
+            args = args[1:]
+        return original_rotary_embedding(*args, **kwargs)
+
+    def prepare_input(
+        self: object, hidden_size: int, seq_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # TritonBench's RoPE operator creates fresh random inputs inside each
+        # implementation method. Cache per-shape inputs so accuracy compares all
+        # implementations against the baseline using the same q/k/cos/sin tensors.
+        key = (
+            str(self.device),  # pyrefly: ignore [missing-attribute]
+            self.dtype,  # pyrefly: ignore [missing-attribute]
+            self.num_q_heads,  # pyrefly: ignore [missing-attribute]
+            self.num_kv_heads,  # pyrefly: ignore [missing-attribute]
+            hidden_size,
+            seq_length,
+        )
+        if key not in input_cache:
+            q, k, cos, sin, pos_ids = original_prepare_input(
+                self, hidden_size, seq_length
+            )
+            q.retain_grad()
+            k.retain_grad()
+            input_cache[key] = (
+                q,
+                k,
+                cos,
+                sin,
+                pos_ids,
+                self.dq,  # pyrefly: ignore [missing-attribute]
+                self.dk,  # pyrefly: ignore [missing-attribute]
+            )
+
+        q, k, cos, sin, pos_ids, dq, dk = input_cache[key]
+        self.q = q  # pyrefly: ignore [missing-attribute]
+        self.k = k  # pyrefly: ignore [missing-attribute]
+        self.dq = dq  # pyrefly: ignore [missing-attribute]
+        self.dk = dk  # pyrefly: ignore [missing-attribute]
+        return q, k, cos, sin, pos_ids
+
+    def get_bwd_fn(
+        self: object, fwd_fn: Callable[[], object]
+    ) -> Callable[[], list[torch.Tensor]]:
+        q = self.q  # pyrefly: ignore [missing-attribute]
+        k = self.k  # pyrefly: ignore [missing-attribute]
+        dq = self.dq  # pyrefly: ignore [missing-attribute]
+        dk = self.dk  # pyrefly: ignore [missing-attribute]
+        state: dict[str, object] = {}
+
+        def bwd_fn() -> list[torch.Tensor]:
+            if q.grad is not None:
+                q.grad = None
+            if k.grad is not None:
+                k.grad = None
+            if "outputs" not in state:
+                state["outputs"] = fwd_fn()
+            outputs = cast("tuple[torch.Tensor, torch.Tensor]", state["outputs"])
+            torch.autograd.backward(outputs, (dq, dk), retain_graph=True)
+            return [q, k]
+
+        return bwd_fn
+
+    operator_module.LlamaRotaryEmbedding = llama_rotary_embedding
+    Operator.prepare_input = prepare_input
+    Operator.get_bwd_fn = get_bwd_fn
+    _PATCHED_ROPE_OPERATOR_CLASSES.add(Operator)
+
+
+def patch_gdn_tritonbench(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name != "gdn_fwd_h":
+        return
+    if Operator in _PATCHED_GDN_OPERATOR_CLASSES:
+        return
+
+    original_get_shape_iter = Operator.get_shape_iter
+    limit_mi350_inputs = torch.version.hip is not None and "gfx950" in (
+        get_device_name() or ""
+    )
+
+    def get_shape_iter(self: object) -> Iterator[object]:
+        for input_id, shape in enumerate(original_get_shape_iter(self)):
+            # ROCm 7.1 segfaults when the MI350 benchmark advances to input 2.
+            # Keep the two inputs that completed successfully while preserving
+            # the full input set on other GPUs.
+            if limit_mi350_inputs and input_id >= 2:
+                break
+            yield shape
+
+    def accuracy(
+        self: object,
+        fn: Callable[[], torch.Tensor],
+        baseline_fn: Callable[[], torch.Tensor],
+    ) -> bool:
+        output = fn()
+        baseline_output = baseline_fn()
+
+        if torch.isnan(output).any():
+            return False
+
+        # bf16 reduction order vs the eager fp32 baseline drifts in this
+        # dot-heavy kernel. TritonBench's own GDN accuracy path used the
+        # smaller bf16 tolerance; batch>=16 needs the wider dashboard tolerance
+        # because the 16x longer accumulations drift further.
+        if output.shape[0] >= 16:
+            return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
+        return torch.allclose(output, baseline_output, rtol=0.1, atol=0.3)
+
+    Operator.get_shape_iter = get_shape_iter
+    Operator.accuracy = accuracy
+    _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
+
+
+def helion_benchmark_method_name(func_name: str) -> str:
+    prefix = "helion_"
+    return func_name if func_name.startswith(prefix) else f"{prefix}{func_name}"
 
 
 # Maps tritonbench op names to Helion kernel examples
@@ -181,6 +407,25 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "rms_norm_tritonbench",
         {
             "num_inputs": 5,  # rms_norm-bwd has 6 inputs total but last input raises Triton OOM at default config: https://github.com/pytorch/helion/issues/711
+            "remove_flags": ["--cudagraph"],
+        },
+    ),
+    "rope": (
+        "tritonbench.operators.rope.operator",
+        "examples.rope",
+        "rope_tritonbench",
+        {
+            "num_inputs": 5,  # rope autotune takes long time on Benchmark CI, so use fewer inputs instead.
+        },
+    ),
+    "rope-bwd": (
+        "tritonbench.operators.rope.operator",
+        "examples.rope",
+        "rope_tritonbench",
+        {
+            # tritonbench's torch_compile rope-bwd recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
@@ -242,6 +487,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "layer_norm_tritonbench",
         {
             "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "jagged_softmax": (
@@ -289,7 +535,8 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "examples.welford",
         "welford",
         {
-            "num_inputs": 6,  # welford takes long time on Benchmark CI, so use fewer inputs instead.
+            # Welford autotuning takes ~15+ minutes per shape on MI350.
+            "num_inputs": 3,
         },
     ),
     "gather_gemv": (
@@ -349,6 +596,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.gdn_fwd_h.operator",
         "examples.gdn_fwd_h",
         "helion_gdn_fwd_h_tb",
+        {
+            # GDN is dot-heavy; compare all implementations against PyTorch's
+            # high-throughput CUDA matmul precision instead of strict fp32 einsums.
+            "precision": "tf32",
+        },
     ),
     "flex_attention": (
         "tritonbench.operators.flex_attention.operator",
@@ -448,6 +700,26 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_rms_norm_tritonbench-speedup": "helion_speedup",
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
         "helion_rms_norm_tritonbench-latency": "helion_latency_ms",
+    },
+    "rope": {
+        "apply_rotary_pos_emb": "baseline",
+        "liger_rotary_pos_emb-speedup": "triton_speedup",
+        "liger_rotary_pos_emb-accuracy": "triton_accuracy",
+        "torch_compile_rotary_pos_emb_full_op-speedup": "torch_compile_speedup",
+        "torch_compile_rotary_pos_emb_full_op-accuracy": "torch_compile_accuracy",
+        "helion_rope_tritonbench-speedup": "helion_speedup",
+        "helion_rope_tritonbench-accuracy": "helion_accuracy",
+        "helion_rope_tritonbench-latency": "helion_latency_ms",
+    },
+    "rope-bwd": {
+        "apply_rotary_pos_emb": "baseline",
+        "liger_rotary_pos_emb-speedup": "triton_speedup",
+        "liger_rotary_pos_emb-accuracy": "triton_accuracy",
+        "torch_compile_rotary_pos_emb_full_op-speedup": "torch_compile_speedup",
+        "torch_compile_rotary_pos_emb_full_op-accuracy": "torch_compile_accuracy",
+        "helion_rope_tritonbench-speedup": "helion_speedup",
+        "helion_rope_tritonbench-accuracy": "helion_accuracy",
+        "helion_rope_tritonbench-latency": "helion_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
@@ -614,7 +886,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "helion_jagged_mean_tritonbench-latency": "helion_latency_ms",
     },
     "flash_attention": {
-        "aten": "baseline",
+        "sdpa": "baseline",
         "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
         "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
         "flex_attention-speedup": "torch_compile_speedup",
@@ -712,27 +984,34 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
     },
     "mamba2_chunk_scan": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_mamba2_chunk_scan_kernel_speedup": "helion_speedup",
-        "helion_mamba2_chunk_scan_kernel_accuracy": "helion_accuracy",
-        "helion_mamba2_chunk_scan_kernel_latency": "helion_latency_ms",
+        "mamba_ssm-speedup": "triton_speedup",
+        "mamba_ssm-accuracy": "triton_accuracy",
+        "mamba_ssm-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_scan_kernel-speedup": "helion_speedup",
+        "helion_mamba2_chunk_scan_kernel-accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_scan_kernel-latency": "helion_latency_ms",
     },
     "mamba2_chunk_state": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_mamba2_chunk_state_kernel_speedup": "helion_speedup",
-        "helion_mamba2_chunk_state_kernel_accuracy": "helion_accuracy",
-        "helion_mamba2_chunk_state_kernel_latency": "helion_latency_ms",
+        "mamba_ssm-speedup": "triton_speedup",
+        "mamba_ssm-accuracy": "triton_accuracy",
+        "mamba_ssm-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_state_kernel-speedup": "helion_speedup",
+        "helion_mamba2_chunk_state_kernel-accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_state_kernel-latency": "helion_latency_ms",
     },
     "gdn_fwd_h": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_gdn_fwd_h_speedup": "helion_speedup",
-        "helion_gdn_fwd_h_accuracy": "helion_accuracy",
-        "helion_gdn_fwd_h_latency": "helion_latency_ms",
+        "fla-speedup": "triton_speedup",
+        "fla-accuracy": "triton_accuracy",
+        "fla-latency": "triton_latency_ms",
+        "helion_gdn_fwd_h_tb-speedup": "helion_speedup",
+        "helion_gdn_fwd_h_tb-accuracy": "helion_accuracy",
+        "helion_gdn_fwd_h_tb-latency": "helion_latency_ms",
     },
 }
 
@@ -1003,20 +1282,6 @@ def check_and_setup_tritonbench() -> None:
             check=True,
         )
 
-        print("Installing tritonbench requirements...", file=sys.stderr)
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                "requirements.txt",
-            ],
-            cwd=tritonbench_path,
-            check=True,
-        )
-
         print("Running install.py --liger...", file=sys.stderr)
         subprocess.run(
             [sys.executable, "install.py", "--liger"],
@@ -1031,21 +1296,28 @@ def check_and_setup_tritonbench() -> None:
             check=True,
         )
 
-        importlib.invalidate_caches()
-
         try:
+            importlib.invalidate_caches()
             # pyrefly: ignore [missing-import]
             import tritonbench
 
             print("Tritonbench installed successfully.", file=sys.stderr)
-            if installing_marker.exists():
-                installing_marker.unlink()
         except ImportError:
             print(
                 "Error: Tritonbench package installation failed. The package cannot be imported.",
                 file=sys.stderr,
             )
+            if installing_marker.exists():
+                installing_marker.unlink()
             sys.exit(1)
+
+        if installing_marker.exists():
+            installing_marker.unlink()
+
+        # Re-exec so the freshly-installed package (and all its submodules)
+        # is discovered cleanly by a new Python process.
+        print("Restarting to pick up freshly-installed tritonbench...", file=sys.stderr)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     except subprocess.CalledProcessError as e:
         print(f"Error installing tritonbench: {e}", file=sys.stderr)
@@ -1053,6 +1325,10 @@ def check_and_setup_tritonbench() -> None:
             print(f"stdout: {e.stdout}", file=sys.stderr)
         if e.stderr:
             print(f"stderr: {e.stderr}", file=sys.stderr)
+        # Clean up the marker so the next run doesn't re-trigger a full
+        # clone cycle.  The user can re-run or install manually.
+        if installing_marker.exists():
+            installing_marker.unlink()
         sys.exit(1)
 
 
@@ -1213,6 +1489,9 @@ def run_kernel_variants(
     try:
         operator_module = importlib.import_module(tritonbench_module)
         Operator = operator_module.Operator
+        patch_rope_tritonbench_inputs(operator_name, Operator)
+        patch_mamba2_tritonbench_inputs(operator_name, Operator)
+        patch_gdn_tritonbench(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
@@ -1275,6 +1554,9 @@ def run_kernel_variants(
                     attr = getattr(mod, attr_name)
                     if isinstance(attr, Kernel):
                         attr.reset()
+                        if attr.settings.autotune_cache == "AOTAutotuneCache":
+                            attr.settings.force_autotune = False
+                            continue
                         # Force autotuning unless HELION_AUTOTUNE_EFFORT=none is set
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
@@ -1285,7 +1567,15 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
+                    if operator_name == "flash_attention":
+                        # examples.attention.attention returns (out, lse); the
+                        # tritonbench flash_attention operator only compares the
+                        # output tensor, so unwrap it before wrapping in a list.
+                        measured_func_callable = lambda: [  # noqa: E731
+                            kfunc(*args, **kwargs)[0]
+                        ]
+                    else:
+                        measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution
@@ -1302,7 +1592,17 @@ def run_kernel_variants(
                         nonlocal first_call
                         if first_call:
                             first_call = False
-                            torch.cuda.synchronize()
+                            # Flush previously-queued work before the
+                            # compile-time counter starts (a pre-call counter
+                            # flush, not a result sync -- hence
+                            # accelerator.synchronize here, not the autotuner's
+                            # tensor-level synchronize_device). Bare
+                            # torch.cuda.synchronize() raised "Torch not compiled
+                            # with CUDA enabled" on TPU (torch_tpu builds against
+                            # CPU torch), failing every helion impl under
+                            # --measure-compile-time.
+                            if torch.accelerator.is_available():
+                                torch.accelerator.synchronize()
                             reset_compile_time()
                             try:
                                 result = original()
@@ -1320,8 +1620,7 @@ def run_kernel_variants(
             return helion_method
 
         # Method name for the benchmark
-        variant_name = func_name
-        helion_method_name = f"helion_{variant_name}"
+        helion_method_name = helion_benchmark_method_name(func_name)
 
         # Set up compile time tracking for this variant
         compile_times: list[float] | None = None
@@ -1537,6 +1836,7 @@ def write_results_to_json(
                         "name": "Helion Benchmark",
                         "extra_info": {
                             "device": result.device,
+                            "backend": _get_backend(),
                         },
                     },
                     "model": {
@@ -1678,6 +1978,12 @@ def main() -> None:
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
     )
     parser.add_argument(
+        "--helion-backend",
+        choices=list_backends(),
+        default=None,
+        help="Helion code generation backend to benchmark. Defaults to HELION_BACKEND or triton.",
+    )
+    parser.add_argument(
         "--input-shard",
         type=str,
         help="Run only a subset of inputs for each kernel. Format: M/N where M is the shard number (1-indexed) and N is the total number of shards. For example, --input-shard 1/3 runs the first third of inputs for each kernel.",
@@ -1726,6 +2032,9 @@ def main() -> None:
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
+
+    if args.helion_backend:
+        os.environ["HELION_BACKEND"] = args.helion_backend
 
     # Add default tolerance values if not already specified
     if "--atol" not in tritonbench_args:
@@ -1793,6 +2102,38 @@ def main() -> None:
         assert args.kernel, (
             "--op or --kernel must be specified with --list-impls-for-benchmark-ci"
         )
+
+        # On TPU only a subset of implementations run: Helion (Pallas), the
+        # eager (torch/aten) baseline, and torch.compile. Triton/CUDA-specific
+        # kernels (triton_*, liger_*, mamba_ssm, flash-linear-attention,
+        # cutlass/quack, ...) do not run on TPU. When --device tpu is requested,
+        # filter to the runnable families so Benchmark CI doesn't select impls
+        # that would crash. This is a positive allowlist of TPU-capable
+        # execution modes -- new GPU-only backends are excluded by default;
+        # extend the tuple only when a genuinely new TPU-runnable execution mode
+        # is added.
+        tpu = "tpu" in {
+            tritonbench_args[i + 1]
+            for i, tok in enumerate(tritonbench_args)
+            if tok == "--device" and i + 1 < len(tritonbench_args)
+        } or any(tok == "--device=tpu" for tok in tritonbench_args)
+        tpu_runnable_prefixes = (
+            "helion",  # Pallas
+            "torch",  # torch eager (torch_*) + torch.compile (torch_compile_*)
+            "aten",  # aten eager baseline
+            "naive",  # naive eager baseline (e.g. naive_softmax)
+            "eager",  # eager_* baseline
+            "sdpa",  # torch SDPA baseline
+            "pt2",  # torch.compile (pt2_*)
+            "compile",  # torch.compile variant
+            # The entries below are full impl-name prefixes (not execution-mode
+            # families) for baselines/refs that don't start with a mode token.
+            "llama_rms",  # rms_norm eager baseline
+            "cross_entropy_loss",  # cross_entropy eager baseline
+            "preprocessed_eager",  # int4_gemm eager baseline
+            "preprocessed_torch",  # int4_gemm torch.compile ref (NOT _triton)
+        )
+
         # List implementations for specified kernels to be run on Benchmark CI
         kernel_names = [k.strip() for k in args.kernel.split(",")]
         for kernel in kernel_names:
@@ -1814,8 +2155,32 @@ def main() -> None:
                     impl_name = metric_key[: -len("-speedup")]
                     implementations.append(impl_name)
 
+            if tpu:
+                implementations = [
+                    impl
+                    for impl in implementations
+                    if impl.startswith(tpu_runnable_prefixes)
+                ]
+                # A GPU-only baseline (e.g. fp8_attention's triton baseline)
+                # cannot anchor a TPU run; skip the kernel rather than emit an
+                # impl set that would crash.
+                if baseline_impl and not baseline_impl.startswith(
+                    tpu_runnable_prefixes
+                ):
+                    print(
+                        f"Warning: {kernel} baseline '{baseline_impl}' does not run "
+                        f"on TPU; skipping.",
+                        file=sys.stderr,
+                    )
+                    continue
+
             implementations = sorted(implementations)
-            assert implementations, f"No implementations found for kernel: {kernel}"
+            if not implementations:
+                msg = f"No implementations found for kernel: {kernel}"
+                if tpu:
+                    print(f"Warning: {msg} on TPU, skipping...", file=sys.stderr)
+                    continue
+                raise AssertionError(msg)
             print(
                 f"{kernel}: impls={','.join(implementations)} baseline={baseline_impl}"
             )
@@ -1846,7 +2211,7 @@ def main() -> None:
     results: list[RunResult] = []
 
     if args.measure_compile_time:
-        os.environ["HELION_MEASURE_COMPILE_TIME"] = "1"
+        enable_compile_time()
 
     collected_metrics: list[AutotuneMetrics] = []
     if args.autotune_metrics or args.autotune_metrics_json:

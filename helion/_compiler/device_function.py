@@ -17,7 +17,6 @@ from typing import cast
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
-from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -31,8 +30,10 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_lane_loop_elimination
 from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
+from .cute.device_state import CuteDeviceFunctionState
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
@@ -48,6 +49,8 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
@@ -85,7 +88,6 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
@@ -262,6 +264,7 @@ class DeviceFunction:
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
         self._scratch_args: list[ScratchArg] = []
+        self.wrapper_only_params: list[str] = []
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -280,6 +283,12 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self.dce_vars: list[str] = []
+        # Names of matmul-fallback running-sum accumulators emitted as
+        # ``acc = acc + product`` inside a constexpr V-loop.  The
+        # ``hoist_warp_reduce`` pass reads this to reduce the FINAL value once
+        # (instead of building a per-lane V-fold, which would double-count the
+        # already-accumulated running sum).  See ``_emit_cute_matmul``.
+        self.cute_matmul_running_sums: set[str] = set()
         # Arg names referenced only by fusion placeholder strings
         # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
         # DCE would incorrectly strip them without this exemption.
@@ -291,6 +300,7 @@ class DeviceFunction:
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
+        self._cute_state = CuteDeviceFunctionState()
 
         from .helper_function import HelperFunctionManager
 
@@ -311,10 +321,13 @@ class DeviceFunction:
 
         self.rng_seed_count = 0
         self.device_load_index = 0
+        self.device_load_cache_modifier_index = 0
         self.device_store_index = 0
+        self.device_store_cache_modifier_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
         self.epilogue_subtile_store_indices: dict[str, int] = {}
+        self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
 
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
@@ -328,6 +341,17 @@ class DeviceFunction:
         # dict would then need to support multiple entries per tensor
         # or the tensor would get distinct arg IDs per memory space.
         self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
+        # using pl.ds() that may need host-side padding.
+        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+        # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
+        # the emit_pipeline codegen when the tile is a legal map axis; read by
+        # the store codegen to stitch the boundary across neighbouring groups.
+        self.carry_tiles: dict[int, CarryBoundaryTile] = {}
+        # CarryScratchKey(row block_id, output name) -> carry scratch var name.
+        # One scratch per output buffer (a tile may feed several stores),
+        # allocated at the store.
+        self.carry_scratch: dict[CarryScratchKey, str] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""
@@ -426,6 +450,54 @@ class DeviceFunction:
 
         return self.block_size_var_cache[key]
 
+    def resolved_block_size(self, block_id: int) -> int | torch.SymInt | None:
+        """Resolve a block_id to its concrete size for the current config."""
+        env = CompileEnvironment.current()
+        return env.block_sizes[block_id].from_config(self.config)
+
+    def evaluate_constexpr_condition(self, test: object) -> bool | None:
+        """Resolve a control-flow test to a concrete bool for the current config.
+
+        Block sizes are symbolic during the (single) frontend pass but become
+        concrete integers per-config at codegen time.  A branch condition that
+        depends only on block sizes (and other constants) is therefore a
+        compile-time constant here, even though it could not be folded earlier.
+        Substituting the config's block sizes lets us decide the branch and emit
+        only the live side, which is what makes shape-divergent branches legal.
+
+        Returns the concrete bool, or ``None`` if the test is not a compile-time
+        constant for this config (e.g. it depends on a runtime value).
+        """
+        if isinstance(test, (bool, int)):
+            return bool(test)
+        if not isinstance(test, torch.SymBool):
+            return None
+        # NB: a boolean expression (And/Or/Relational) is a sympy.Basic but not a
+        # sympy.Expr, so we classify its free symbols directly rather than via
+        # find_block_size_symbols (which only handles sympy.Expr).
+        expr = test._sympy_()
+        if not isinstance(expr, sympy.Basic):
+            return None
+        env = CompileEnvironment.current()
+        hf = HostFunction.current()
+        subs: dict[sympy.Basic, sympy.Basic] = {}
+        for symbol in expr.free_symbols:
+            origin_info = hf.expr_to_origin.get(symbol)
+            if origin_info is None or not isinstance(
+                origin_info.origin, BlockSizeOrigin
+            ):
+                return None
+            value = env.block_sizes[origin_info.origin.block_id].from_config(
+                self.config
+            )
+            if not isinstance(value, int):
+                return None
+            subs[symbol] = sympy.Integer(value)
+        resolved = expr.xreplace(subs)
+        if resolved.free_symbols:
+            return None
+        return bool(resolved)
+
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
 
@@ -463,6 +535,13 @@ class DeviceFunction:
         ]
         for n in name_group:
             self._variable_renames[n] = name_group
+
+    def variable_aliases(self, name: str) -> tuple[str, ...]:
+        return tuple(self._variable_renames.get(name, [name]))
+
+    @property
+    def cute_state(self) -> CuteDeviceFunctionState:
+        return self._cute_state
 
     def set_pid(self, pid: ProgramIDs) -> None:
         if self.pid is not None:
@@ -539,6 +618,8 @@ class DeviceFunction:
 
     def literal_expr(self, expr: object) -> str:
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            # SymBool's `_sympy_()` is a boolean, not an Expr that sympy_expr wants.
+            # pyrefly: ignore [bad-argument-type]
             return self.sympy_expr(expr._sympy_())
         if isinstance(expr, sympy.Expr):
             return self.sympy_expr(expr)
@@ -581,7 +662,10 @@ class DeviceFunction:
             env = CompileEnvironment.current()
 
             # Find which dimension has stride==1
-            stride_one_dim = [*map(env.size_hint, fake_value.stride())].index(1)
+            layout_signature = env.tensor_descriptor_layout_signature(fake_value)
+            assert layout_signature is not None
+            stride_one_dim = layout_signature[0]
+            assert stride_one_dim is not None
 
             # Determine if we need permutation (stride==1 dimension is not last)
             permutation = None
@@ -607,6 +691,16 @@ class DeviceFunction:
                 block_size = [block_size[i] for i in permutation]
                 # Update block_size_expr for the permuted order
                 block_size_expr = ", ".join(map(self.literal_expr, block_size))
+
+            descriptor_dims = (
+                permutation if permutation is not None else [*range(fake_value.ndim)]
+            )
+            assert descriptor_dims[-1] == stride_one_dim
+            # The descriptor permutation above makes the last descriptor
+            # dimension the proven stride-one dimension. Triton checks this
+            # predicate at JIT time, so emit it as a literal even when other
+            # dynamic strides are runtime scalars.
+            stride_args[-1] = StaticShape(1)
 
             # Add tl.make_tensor_descriptor call to preamble
             sizes = ", ".join([arg.name for arg in size_args])
@@ -740,7 +834,8 @@ class DeviceFunction:
         ]
 
         args = [arg.arg_def_node() for arg in param_args]
-        # Ordering invariant: [param_args, extra_params, rng_seed, scratch_args].
+        # Ordering invariant:
+        # [param_args, extra_params, rng_seed, scratch_args, wrapper_only_params].
         # codegen_function_call must match this order — it builds positional args
         # from param_args, extends with extra_params, then build_launcher_args
         # appends rng_seed_buffer.
@@ -753,6 +848,7 @@ class DeviceFunction:
         # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
         for scratch_arg in self._scratch_args:
             args.append(create_arg(scratch_arg.name))
+        args.extend(create_arg(name) for name in self.wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -770,6 +866,119 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
+        function_decorator = backend.function_decorator_for_args(param_args)
+        kernel_body: list[ast.stmt] = cast(
+            "list[ast.stmt]",
+            [
+                *scalar_preamble,
+                *self.preamble,
+                *self.body,
+            ],
+        )
+        if backend.name == "cute":
+            from .cute.fuse_two_pass_loads import fuse_two_pass_loads
+
+            # Collect static integer values for constexpr names so the
+            # fusion pass can resolve range(..., step=cutlass.Int32(NAME))
+            # trip counts. Three sources: literal constexpr inlined args,
+            # host-side literal assignments to constexpr-named variables,
+            # and the inlined module-level constexpr decls.
+            constexpr_values: dict[str, int] = {}
+            for arg in constexpr_to_inline:
+                try:
+                    value = int(arg.host_str())
+                except (TypeError, ValueError):
+                    continue
+                constexpr_values[arg.name] = value
+            for stmt in self.codegen.host_statements:
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, int)
+                ):
+                    constexpr_values[stmt.targets[0].id] = stmt.value.value
+            # Pass the per-axis thread dims so the fuser can size
+            # SMEM-backed caches correctly and build a per-thread
+            # linear slot index when ``cache_size`` exceeds the
+            # register-fragment threshold (opt-in via
+            # ``HELION_FUSER_MODE=smem``).
+            try:
+                thread_dims = self.tile_strategy.thread_block_dims()
+                thread_block_dims: tuple[int, int, int] = (
+                    int(thread_dims[0]),
+                    int(thread_dims[1]),
+                    int(thread_dims[2]),
+                )
+            except Exception:
+                thread_block_dims = (1, 1, 1)
+            kernel_body = fuse_two_pass_loads(
+                kernel_body,
+                constexpr_values,
+                thread_block_dims=thread_block_dims,
+            )
+            # Hoist warp reductions out of constexpr V-loops to collapse
+            # 4 per-V-lane warp reductions into 1 V-fold + 1 warp reduce.
+            # For online softmax style kernels this drops per-row reductions
+            # from ~396 to ~99 (4x fewer SHFL trees).
+            from .cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
+
+            kernel_body = hoist_warp_reduce_from_vloop(
+                kernel_body, running_sum_accumulators=self.cute_matmul_running_sums
+            )
+            # Merge adjacent constexpr V-loops that share an identical
+            # statement prefix.  Caches the last common per-V-lane value
+            # into a register fragment so V-loop 2's bitcast/cast chain
+            # disappears and the SASS scheduler can issue V-loop 2's
+            # arithmetic without waiting for V-loop 1's results.
+            from .cute.merge_sibling_v_loops import merge_sibling_v_loops
+
+            kernel_body = merge_sibling_v_loops(kernel_body)
+            # Fuse adjacent per-lane fp8 decodes in the SIMT matmul V-loop
+            # into one ``cvt.rn.f16x2.e4m3x2`` (decode 2 e4m3 bytes per
+            # instruction) — halves the decode instruction count on the
+            # skinny-M fp8 GEMV path.
+            from .cute.fuse_fp8_pair_decode import fuse_fp8_pair_decode
+
+            kernel_body = fuse_fp8_pair_decode(kernel_body)
+            # Hoist loop-invariant floating-point divisions out of inner
+            # tile loops, replacing each ``x / scalar`` with a hoisted
+            # ``inv = 1.0 / scalar`` + ``x * inv`` in the loop body.
+            # B200 div is ~22 cycles vs ~2 for multiply, so the softmax
+            # consume sweep (~12672 divides per row) sees a measured
+            # +20% bench gain on (4096, 12672) fp16.
+            from .cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
+
+            # Pass the post-renames map so the invariance analysis can
+            # treat ``v_1_0`` (which will be renamed to ``mi`` by
+            # ast_rename below) as an assignment to ``mi`` for the
+            # purpose of LICM.  Without this the FMA hoist would
+            # mistakenly classify ``mi`` as loop-invariant in the reduce
+            # loop and capture its stale initial value.
+            rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
+            kernel_body = hoist_loop_invariant_recips(
+                kernel_body, rename_groups=rename_groups
+            )
+            # P18: software-pipeline the per-iteration vec load by one
+            # stage.  Pre-issue iter 0's load above the loop and, inside
+            # the body, issue iter N+1's load BEFORE iter N's compute
+            # runs.  The B200 SASS scheduler can then keep multiple
+            # ld.global instructions in flight, hiding HBM round-trip
+            # latency on softmax/online-reduction inner loops where the
+            # ``load -> compute(mi, di) -> next iter`` sequential
+            # dependency chain dominates the per-iter stall budget.
+            from .cute.pipeline_inner_loads import pipeline_inner_loads
+
+            # Pass the post-rename canonical map so the loop-carried-write
+            # gate can correctly identify writes whose pre-rename target
+            # is an alias (e.g. ``v_1_0 = v_1`` will be renamed to
+            # ``mi = v_1``).  Without this, the gate would mis-classify
+            # the softmax reduce sweep as having no loop-carried write
+            # and incorrectly skip pipelining.
+            kernel_body = pipeline_inner_loads(
+                kernel_body, constexpr_values, rename_groups=rename_groups
+            )
         return [
             *prefix,
             ast_rename(
@@ -777,13 +986,9 @@ class DeviceFunction:
                     ast.FunctionDef,
                     name=self.name,
                     args=create_arguments(args),
-                    body=[
-                        *scalar_preamble,
-                        *self.preamble,
-                        *self.body,
-                    ],
-                    decorator_list=[expr_from_string(backend.function_decorator)]
-                    if backend.function_decorator
+                    body=kernel_body,
+                    decorator_list=[expr_from_string(function_decorator)]
+                    if function_decorator
                     else [],
                     type_params=[],
                 ),
@@ -860,6 +1065,9 @@ class DeviceFunction:
             rw = ReadWrites.from_list([*self.preamble, *self.body])
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
+            dead_lane_loop_elimination(self.body)
+            dead_lane_loop_elimination(self.preamble)
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
 
         # Drop unused args, but keep placeholder_args (fusion-injected tensor
         # pointers referenced only by placeholder strings, not the AST body).
@@ -933,11 +1141,57 @@ class DeviceFunction:
         """
         return None
 
-    def register_dma_semaphore(self, name_hint: str = "sem") -> str:
+    def register_dma_semaphore(
+        self, name_hint: str = "sem", shape: tuple[int, ...] = ()
+    ) -> str:
         """Register a DMA semaphore scratch buffer and return its variable name."""
         return self.register_scratch(
-            (), None, name_hint=name_hint, scratch_type="dma_semaphore"
+            shape, None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
+
+    def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
+        """Returns AST names of read and written tensors"""
+        from helion.language import memory_ops
+        from helion.language import tile_index
+        from helion.language.atomic_ops import ATOMIC_OPS
+
+        read_names: set[str] = set()
+        write_names: set[str] = set()
+        for graph in self.codegen.codegen_graphs:
+            for node in graph.graph.nodes:
+                if node.op != "call_function":
+                    continue
+
+                def _get_tensor_name(node: torch.fx.Node) -> str | None:
+                    tensor_arg = node.args[0]
+                    assert isinstance(tensor_arg, torch.fx.Node)
+                    # tile.index loads operate on a synthesized FakeTensor
+                    # that is not registered in ``tensor_to_origin``; they
+                    # are materialized inline by the load codegen rather
+                    # than referencing a kernel-arg tensor.
+                    if (
+                        tensor_arg.op == "call_function"
+                        and tensor_arg.target == tile_index
+                    ):
+                        return None
+                    tensor_val = tensor_arg.meta.get("val")
+                    assert isinstance(tensor_val, torch.Tensor)
+                    return self.tensor_arg(tensor_val).name
+
+                if node.target is memory_ops.load:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                elif node.target is memory_ops.store:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        write_names.add(name)
+                elif node.target in ATOMIC_OPS:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                        write_names.add(name)
+        return read_names, write_names
 
     def __enter__(self) -> None:
         try:
@@ -954,93 +1208,3 @@ class DeviceFunction:
             return tls.functions[-1]
         except (AttributeError, IndexError):
             raise NoCurrentFunction from None
-
-
-class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that does the following:
-
-    - Avoids wrapping float literals in tl.full().
-     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-     literal, letting downstream type promotion and casts handle dtype.
-
-    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
-      provably non-negative integers. TritonPrinter by default converts
-      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
-      emit u1 // 2 only when the numerator is known to be non-negative and the
-      denominator is a positive integer, so that we keep helper calls for cases
-      that rely on floor semantics with mixed signs.
-    """
-
-    def _print_Float(self, expr: sympy.Expr) -> str:
-        return str(expr)
-
-    def _print_ToFloat(self, expr: sympy.Expr) -> str:
-        assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
-        # pyrefly: ignore [missing-attribute]
-        return f"{self._print(expr.args[0])} + 0.0"
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # Only use // operator when:
-        # 1. RHS is an integer constant
-        # 2. LHS is a constexpr argument (autotune parameter like block size)
-        # This ensures TMA descriptors get compile-time constants while preserving
-        if (
-            isinstance(rhs, sympy.Integer)
-            and getattr(lhs, "name", None) in DeviceFunction.current()._constexpr_args
-        ):
-            # pyrefly: ignore [missing-attribute]
-            lhs_str = self._print(lhs)
-            # pyrefly: ignore [missing-attribute]
-            rhs_str = self._print(rhs)
-            if not (lhs.is_Integer or lhs.is_Symbol):
-                lhs_str = f"({lhs_str})"
-            return f"{lhs_str} // {rhs_str}"
-        return super()._print_FloorDiv(expr)
-
-
-def texpr(expr: sympy.Expr) -> str:
-    return HelionTritonPrinter().doprint(expr)
-
-
-class HelionCutePrinter(HelionTritonPrinter):
-    """CuTe printer that avoids Triton runtime helpers in device expressions."""
-
-    def _print_basic_expr(self, expr: sympy.Basic) -> str:
-        return self.doprint(cast("sympy.Expr", expr))
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
-
-    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
-
-    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        lhs_printed = self._print_basic_expr(lhs)
-        rhs_printed = self._print_basic_expr(rhs)
-        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
-
-    def _print_PythonMod(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
-
-
-def cute_texpr(expr: sympy.Expr) -> str:
-    return HelionCutePrinter().doprint(expr)
-
-
-class HelionPallasPrinter(HelionTritonPrinter):
-    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
-
-    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
-        lhs, rhs = expr.args
-        # pyrefly: ignore [missing-attribute]
-        return f"({self._print(lhs)} // {self._print(rhs)})"
-
-
-def pallas_texpr(expr: sympy.Expr) -> str:
-    return HelionPallasPrinter().doprint(expr)

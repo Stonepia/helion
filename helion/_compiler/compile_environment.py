@@ -15,6 +15,7 @@ import warnings
 import sympy
 import torch
 from torch._dynamo.source import EphemeralSource
+from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
@@ -33,6 +34,7 @@ from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import shape_env_size_hint
+from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend_registry import get_backend_class
@@ -44,6 +46,98 @@ from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 
 log = logging.getLogger(__name__)
+
+TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+
+
+@dataclasses.dataclass
+class TensorDescriptorLayoutGuard:
+    ndim: int
+    element_size: int
+    memory_op_indices: set[int] = dataclasses.field(default_factory=set)
+    atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+
+
+def _is_supported_tensor_descriptor_layout_guard_source(source: Source) -> bool:
+    if isinstance(source, LocalSource):
+        return True
+    if isinstance(source, GetItemSource):
+        return (
+            isinstance(source.index, int)
+            and not source.index_is_slice
+            and _is_supported_tensor_descriptor_layout_guard_source(source.base)
+        )
+    return False
+
+
+def _replay_tensor_descriptor_layout_guard_source(
+    source: Source,
+    root_values: typing.Mapping[str, object],
+) -> object:
+    if isinstance(source, LocalSource):
+        return root_values.get(source.local_name)
+    if isinstance(source, GetItemSource):
+        if not isinstance(source.index, int) or source.index_is_slice:
+            return None
+        base = _replay_tensor_descriptor_layout_guard_source(source.base, root_values)
+        if isinstance(base, (list, tuple)) and 0 <= source.index < len(base):
+            return base[source.index]
+    return None
+
+
+def _find_tensor_descriptor_layout_guard_source(
+    target: torch.Tensor,
+    value: object,
+    source: Source,
+) -> Source | None:
+    if value is target:
+        return source
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            result = _find_tensor_descriptor_layout_guard_source(
+                target,
+                item,
+                GetItemSource(source, index),
+            )
+            if result is not None:
+                return result
+    return None
+
+
+def tensor_descriptor_layout_signature_from_strides(
+    strides: typing.Sequence[int | torch.SymInt | sympy.Integer],
+    element_size: int,
+    size_hint: typing.Callable[[int | torch.SymInt], int] | None = None,
+) -> TensorDescriptorLayoutSignature:
+    """Return the stride layout facts tensor descriptors depend on.
+
+    The signature intentionally records predicates rather than exact strides so
+    dynamic-shape kernels can share code across sizes that have the same tensor
+    descriptor eligibility.
+    """
+    stride_one_dim: int | None = None
+    has_multiple_stride_one_dims = False
+    aligned_dims = []
+    for dim, raw_stride in enumerate(strides):
+        if isinstance(raw_stride, sympy.Integer):
+            stride = int(raw_stride)
+        elif isinstance(raw_stride, int):
+            stride = raw_stride
+        else:
+            if size_hint is None:
+                raise TypeError(
+                    "symbolic tensor descriptor strides require an explicit size_hint"
+                )
+            stride = size_hint(raw_stride)
+        if stride == 1:
+            if stride_one_dim is None:
+                stride_one_dim = dim
+            else:
+                has_multiple_stride_one_dims = True
+        aligned_dims.append((stride * element_size) % 16 == 0)
+    if has_multiple_stride_one_dims:
+        stride_one_dim = None
+    return stride_one_dim, tuple(aligned_dims)
 
 
 def _make_numel_check(
@@ -67,6 +161,9 @@ if TYPE_CHECKING:
     from .. import Config
     from ..runtime.settings import Settings
     from .backend import Backend
+    from .pallas.compact_worklist import CompactWorklistPlan
+    from .pallas.compact_worklist import ResidentCacheDecision
+    from .pallas.compact_worklist import ResidentPrepHoist
 
     class _TLS(Protocol):
         env: CompileEnvironment | None
@@ -138,14 +235,17 @@ class CompileEnvironment:
         )
         self.process_group_name = None
         self._backend = get_backend_class(settings.backend)()
+        self._backend.validate_environment()
         if self._backend.experimental:
             from torch._dynamo.utils import warn_once
 
             warn_once(
                 f"The '{self._backend.name}' backend is experimental and may have limited functionality.",
             )
+        # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
+        # first seen with size 0 or 1 can be reused for larger sizes.
         self.shape_env = ShapeEnv(
-            specialize_zero_one=True,
+            specialize_zero_one=settings.static_shapes,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
         )
@@ -153,28 +253,78 @@ class CompileEnvironment:
         self.fake_mode = FakeTensorMode(shape_env=self.shape_env)
         self.input_sources: dict[torch.Tensor, Source] = {}
         self.block_sizes: list[BlockSizeInfo] = []
-        self.debug_shape_renames: dict[sympy.Expr, sympy.Expr] = {}
+        self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
+        try:
+            from ..runtime import get_num_sm
+
+            _num_sm = get_num_sm(device, reserved_sms=settings.persistent_reserved_sms)
+        except Exception:
+            _num_sm = 1
         self.config_spec = ConfigSpec(
             backend=self.backend,
+            target_device_capability=target_device_capability(device),
+            device=device,
+            num_sm=_num_sm,
         )
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_tensor_sizes: dict[tuple[sympy.Expr, ...], int] = (
             collections.Counter()
         )
+        # TODO(hinriksnaer): tracing state, not env config. move to CompilerState?
         self.kernel_min_element_bits: int = 32  # smallest dtype bits across all tensors
         self.specialized_vars: set[sympy.Symbol] = set()
         self.specialized_strides: set[tuple[str, int]] = set()
+        self.tensor_descriptor_layout_guards: dict[
+            Source, TensorDescriptorLayoutGuard
+        ] = {}
+        self._tensor_descriptor_layout_guard_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
-        self._symint_cache: dict[object, torch.SymInt] = {}
-        self._foreign_symint_cache: dict[tuple[int, sympy.Expr], torch.SymInt] = {}
-        self.device_load_count = (
-            0  # Track number of loads in all device code for eviction policy tuning
+        # Set by the Pallas backend when config["pallas_loop_type"] ==
+        # "compact_worklist" and detect_compact_worklist_plan succeeds; gates the
+        # whole compact-worklist codegen path (see helion/_compiler/pallas/
+        # compact_worklist.py).
+        self.compact_worklist_plan: CompactWorklistPlan | None = None
+        # Final resident-cache decision for this concrete config.  This includes
+        # the cached physical window integer; runtime/codegen consumers must read
+        # this instead of recomputing resident-cache eligibility.
+        self.compact_worklist_resident_cache_decision: ResidentCacheDecision | None = (
+            None
         )
+        # Optional prep-cache descriptors admitted for this concrete config.  Kept
+        # separate from the correctness-bearing resident-window decision.
+        self.compact_worklist_resident_prep_hoists: tuple[ResidentPrepHoist, ...] = ()
+        # Static megablocks upper bound (int) for the compact worklist grid /
+        # metadata, computed at pre_codegen from static shapes.
+        self.compact_worklist_upper: int = 1
+        # Compact-axis tile block size (int), resolved from the config at
+        # pre_codegen; used by the worklist builder and UPPER (NOT max(block_sizes)).
+        self.compact_worklist_block: int = 1
+        # Ordered (reduction) tile block size.  May differ from the compact block
+        # (e.g. compact_block != ordered_block); resident caching sizes its window to a
+        # multiple of THIS so a single ordered tile read always fits the window.
+        self.compact_worklist_ordered_block: int = 1
+        # Offsets-tensor parameter names the generated _build_worklist takes, in
+        # order (set when the builder is emitted); used by the launcher to map
+        # them to host-call arg positions.
+        self.compact_worklist_offset_params: list[str] = []
+        self._symint_cache: dict[object, torch.SymInt] = {}
+        self._foreign_symint_cache: dict[
+            tuple[int, sympy.Expr], int | torch.SymInt
+        ] = {}
         if settings.autotune_force_persistent or dist.is_initialized():
-            for pid_type in ("flat", "xyz"):
+            for pid_type in (
+                "flat",
+                "xyz",
+            ):
                 self.config_spec.disallow_pid_type(pid_type)
 
-        if dist.is_initialized():
+        # CUDA symmetric-memory persistent-kernel sizing only. Guard on CUDA: the
+        # Pallas/TPU backend traces with a cpu-device torch tensor (the torch<->jax
+        # bridge), so under a multi-host (dist-initialized) serve this would call
+        # get_num_sm(cpu) -> "TODO: implement for other devices" and crash the
+        # kernel compile. _SymmetricMemory / SM-multiplier are irrelevant to Pallas.
+        if dist.is_initialized() and device.type == "cuda":
             from torch._C._distributed_c10d import _SymmetricMemory
 
             from .._dist_utils import max_num_blocks_for_symm_mem
@@ -186,7 +336,7 @@ class CompileEnvironment:
                 max_num_blocks_for_symm_mem() // num_sms,
                 self.config_spec.max_num_sm_multiplier,
             )
-            newmax = max(1, 1 << (raw_max.bit_length() - 1))
+            newmax = 1 << (raw_max.bit_length() - 1) if raw_max > 0 else 1
             if newmax < self.config_spec.max_num_sm_multiplier:
                 warnings.warn(
                     f"max_num_sm_multipler is reduced from {self.config_spec.max_num_sm_multiplier} to {newmax} due to the restriction of _SymmetricMemory.signal_pad_size={_SymmetricMemory.signal_pad_size}. Increase the signal pad size to allow autotuner to choose among all possible values in the range.",
@@ -194,6 +344,7 @@ class CompileEnvironment:
                 )
             self.config_spec.max_num_sm_multiplier = newmax
 
+        # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
@@ -205,6 +356,92 @@ class CompileEnvironment:
             # pyrefly: ignore [bad-assignment]
             expr = expr.xreplace(subs)
         return expr
+
+    def register_tensor_descriptor_layout_guard(
+        self,
+        fake_tensor: torch.Tensor,
+        *,
+        memory_op_index: int | None = None,
+        atomic_op_index: int | None = None,
+    ) -> None:
+        """Specialize dynamic kernels on TD-relevant stride layout predicates."""
+        if self.settings.static_shapes:
+            return
+        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
+        if source is None:
+            return
+        guard = self.tensor_descriptor_layout_guards.setdefault(
+            source,
+            TensorDescriptorLayoutGuard(
+                ndim=fake_tensor.ndim,
+                element_size=fake_tensor.element_size(),
+            ),
+        )
+        if memory_op_index is not None:
+            guard.memory_op_indices.add(memory_op_index)
+        if atomic_op_index is not None:
+            guard.atomic_op_indices.add(atomic_op_index)
+
+    def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
+        if self.settings.static_shapes:
+            return True
+        source = self._tensor_descriptor_layout_guard_source(fake_tensor)
+        return source is not None and source in self.tensor_descriptor_layout_guards
+
+    def _tensor_descriptor_layout_guard_source(
+        self, fake_tensor: torch.Tensor
+    ) -> Source | None:
+        cache_key = id(fake_tensor)
+        if cache_key in self._tensor_descriptor_layout_guard_source_cache:
+            return self._tensor_descriptor_layout_guard_source_cache[cache_key]
+
+        source = self.input_sources.get(fake_tensor)
+        from .host_function import HostFunction
+
+        root_values = HostFunction.current().params.arguments
+        if (
+            source is not None
+            and _is_supported_tensor_descriptor_layout_guard_source(source)
+            and _replay_tensor_descriptor_layout_guard_source(source, root_values)
+            is fake_tensor
+        ):
+            result = source
+        else:
+            result = None
+            for local_name, value in root_values.items():
+                candidate = _find_tensor_descriptor_layout_guard_source(
+                    fake_tensor,
+                    value,
+                    LocalSource(local_name, is_input=True),
+                )
+                if candidate is not None:
+                    result = candidate
+                    break
+
+        self._tensor_descriptor_layout_guard_source_cache[cache_key] = result
+        return result
+
+    def tensor_descriptor_layout_signature(
+        self, fake_tensor: torch.Tensor
+    ) -> TensorDescriptorLayoutSignature | None:
+        has_symbolic_stride = False
+        for stride in fake_tensor.stride():
+            if isinstance(stride, int):
+                continue
+            expr = _to_sympy(stride)
+            expr = self.specialize_expr(self.shape_env.replace(expr))
+            if expr.free_symbols:
+                has_symbolic_stride = True
+                break
+        if has_symbolic_stride and not self.has_tensor_descriptor_layout_guard(
+            fake_tensor
+        ):
+            return None
+        return tensor_descriptor_layout_signature_from_strides(
+            fake_tensor.stride(),
+            fake_tensor.element_size(),
+            self.size_hint,
+        )
 
     def add_kernel_tensor_size(
         self,
@@ -267,8 +504,13 @@ class CompileEnvironment:
 
     def _extract_tensor_numel_constraints(self) -> None:
         """Compile per-tensor numel constraints from kernel_tensor_sizes."""
-        from ..autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
         from ..autotuner.config_spec import TensorNumelConstraint
+
+        max_numel = self.backend.max_tensor_numel
+        if max_numel is None:
+            # Backend (e.g. Pallas) has no compile-time per-tile element cap;
+            # VMEM byte budget is enforced separately at runtime.
+            return None
 
         block_sym_to_id: dict[sympy.Symbol, int] = {}
         for bs in self.block_sizes:
@@ -311,7 +553,7 @@ class CompileEnvironment:
             ordered = sorted(involved_syms, key=lambda s: sym_to_cs_idx[s])
             indices = tuple(sym_to_cs_idx[s] for s in ordered)
             # pyrefly: ignore[unsupported-operation]
-            constraint_expr = numel_expr <= TRITON_MAX_TENSOR_NUMEL
+            constraint_expr = numel_expr <= max_numel
             # srepr is more canonical than str() for dedup; a false
             # negative only causes a harmless duplicate, not a missed one.
             dedup_key = sympy.srepr(constraint_expr)
@@ -385,6 +627,11 @@ class CompileEnvironment:
             source_expr = _symint_expr(source.value)
             if isinstance(source_expr, sympy.Symbol):
                 self.shape_env._constrain_unify(source.value, info.var)
+                # Match the block var's hint to the size it is now unified with,
+                # so both agree once the shared range is narrowed.
+                shape_env_var_hints(self.shape_env)[info.symbol()] = sympy.Integer(
+                    self.size_hint(source.value)
+                )
 
         from .host_function import HostFunction
         from .host_function import SymbolOrigin
@@ -461,7 +708,9 @@ class CompileEnvironment:
             # TODO(jansel): I was hoping the above would work, seems like some decomps require concrete values
             #               to determine zeroness.  Figure out a better way to do this.
 
-            shape_env_var_hints(self.shape_env)[sym._sympy_()] = sympy.Integer(hint)
+            shape_env_var_hints(self.shape_env)[_symint_sympy_symbol(sym)] = (
+                sympy.Integer(hint)
+            )
         assert isinstance(sym._sympy_(), sympy.Symbol)
         self.debug_shape_renames[sym._sympy_()] = sympy.Symbol(debug_name, integer=True)
         return sym
@@ -518,7 +767,7 @@ class CompileEnvironment:
             index: The full index list (may contain torch.Tensor or TensorType)
         """
         # Import here to avoid circular import
-        from .type_propagation import TensorType
+        from .type_info import TensorType
 
         positions = [
             i for i, k in enumerate(index) if isinstance(k, (torch.Tensor, TensorType))
@@ -586,7 +835,7 @@ class CompileEnvironment:
         specialized_shape: list[int | torch.SymInt] = []
         for dim in output_shape:
             if isinstance(dim, torch.SymInt):
-                expr = self.specialize_expr(dim._sympy_())
+                expr = self.specialize_expr(_symint_sympy_expr(dim))
                 if not expr.free_symbols:
                     with contextlib.suppress(TypeError, ValueError):
                         specialized_shape.append(int(expr))
@@ -615,7 +864,7 @@ class CompileEnvironment:
                 except NotImplementedError:
                     pass
                 else:
-                    self.shape_env.var_to_sources[sym._sympy_()] = [source]
+                    self.shape_env.var_to_sources[_symint_sympy_symbol(sym)] = [source]
                 return sym
             if isinstance(obj, float):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
@@ -672,7 +921,7 @@ class CompileEnvironment:
             return tuple(self.to_fake(e, origin) for e in obj)
         if isinstance(obj, dict):
             return {k: self.to_fake(e, origin) for k, e in obj.items()}
-        if dataclasses.is_dataclass(obj):
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             return dataclasses.replace(
                 obj,
                 **{
@@ -694,7 +943,9 @@ class CompileEnvironment:
         outer_se = s.node.shape_env
         if outer_se is self.shape_env:
             return s
+        assert outer_se is not None
         expr = s.node.expr
+        assert isinstance(expr, sympy.Expr)
         cache_key = (id(outer_se), expr)
         cached = self._foreign_symint_cache.get(cache_key)
         if cached is not None:
@@ -702,6 +953,7 @@ class CompileEnvironment:
         if free_unbacked_symbols(expr):
             result = self.create_unbacked_symint()
         else:
+            assert isinstance(expr, sympy.Symbol)
             hint = int(shape_env_var_hints(outer_se)[expr])
             new_expr = self.shape_env.create_symbol(
                 hint, source, dynamic_dim=DimDynamic.DYNAMIC
@@ -763,6 +1015,19 @@ class CompileEnvironment:
                     )
         return result
 
+    def try_concretize_symint(self, size: int | torch.SymInt) -> int | torch.SymInt:
+        """Convert a SymInt to a plain int when the value is provably concrete.
+
+        Backed SymInts (whose values are determined by input shapes) are
+        concretized via their size hint.  Unbacked SymInts (e.g. block-size
+        variables) are left symbolic.
+        """
+        if not isinstance(size, torch.SymInt):
+            return size
+        if _has_unbacked(size._sympy_()):
+            return size
+        return self.size_hint(size)
+
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
@@ -819,7 +1084,7 @@ class CompileEnvironment:
         """Deprecated alias for index_type()."""
         return self.index_type()
 
-    def sympy_debug(self, expr: sympy.Expr) -> str:
+    def sympy_debug(self, expr: sympy.Basic) -> str:
         return str(expr.xreplace(self.debug_shape_renames))
 
     def __enter__(self) -> Self:
@@ -882,7 +1147,7 @@ class CompileEnvironment:
                 BlockSizeOrigin,
             ):
                 return origin_info.origin.block_id
-            if origin_info is not None and type(origin_info.origin) is GridOrigin:
+            if origin_info is not None and isinstance(origin_info.origin, GridOrigin):
                 return origin_info.origin.block_id
         return None
 
@@ -1115,7 +1380,7 @@ class BlockSizeInfo:
         expr = _symint_expr(self.var)
         if isinstance(expr, sympy.Symbol):
             return expr
-        return self.var._sympy_()
+        return _symint_sympy_symbol(self.var)
 
     def from_config(self, config: Config) -> int | torch.SymInt | None:
         value = self.block_size_source.from_config(config, self)
@@ -1189,7 +1454,11 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            return max(1, next_power_of_2(block_size_info.size_hint()))
+            size = max(1, block_size_info.size_hint())
+            # Backends override static_rdim_size to control whether the
+            # persistent-reduction extent is rounded up to a power of two
+            # (Triton/CuTe) or kept exact (Pallas).
+            return CompileEnvironment.current().backend.static_rdim_size(size)
         return config.reduction_loops[self.reduction_loop]
 
 
@@ -1207,9 +1476,33 @@ def warning(warning: exc.BaseWarning | type[exc.BaseWarning]) -> None:
         print(f"WARNING[{type(warning).__name__}]: {warning.args[0]}", file=sys.stderr)
 
 
+def _symint_sympy_expr(x: torch.SymInt) -> sympy.Expr:
+    """Narrow ``x._sympy_()`` to ``sympy.Expr``.
+
+    A ``torch.SymInt`` is always backed by a ``sympy.Expr`` at runtime.  Newer
+    torch annotates ``_sympy_()`` as returning the wider ``sympy.Basic``, so this
+    re-establishes the narrower type the rest of the compiler relies on.
+    """
+    expr = x._sympy_()
+    assert isinstance(expr, sympy.Expr)
+    return expr
+
+
+def _symint_sympy_symbol(x: torch.SymInt) -> sympy.Symbol:
+    """Narrow ``x._sympy_()`` to ``sympy.Symbol`` for sites keyed by a bare symbol."""
+    sym = x._sympy_()
+    assert isinstance(sym, sympy.Symbol)
+    return sym
+
+
+def _symint_free_symbols(x: torch.SymInt) -> set[sympy.Symbol]:
+    """Return the free symbols of ``x._sympy_()`` narrowed to ``set[sympy.Symbol]``."""
+    return {s for s in x._sympy_().free_symbols if isinstance(s, sympy.Symbol)}
+
+
 def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
     if isinstance(x, torch.SymInt):
-        return x._sympy_()
+        return _symint_sympy_expr(x)
     if isinstance(x, int):
         return sympy.Integer(x)
     if isinstance(x, sympy.Expr):
@@ -1223,11 +1516,11 @@ def _symint_expr(x: torch.SymInt) -> sympy.Expr | None:
     if isinstance(expr, sympy.Expr):
         return expr
     with contextlib.suppress(Exception):
-        return x._sympy_()
+        return _symint_sympy_expr(x)
     return None
 
 
-def _has_unbacked(expr: sympy.Expr) -> bool:
+def _has_unbacked(expr: sympy.Basic) -> bool:
     # pyrefly: ignore [missing-attribute]
     return any(n.name.startswith("u") for n in expr.free_symbols)
 

@@ -16,9 +16,10 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton", "pallas"])
+@onlyBackends(["triton", "pallas", "cute"])
 class TestViews(RefEagerTestBase, TestCase):
     def test_specialize_reshape(self):
         @helion.kernel()
@@ -212,8 +213,9 @@ class TestViews(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (x,))
         expected = torch.stack((x[:, 1], x[:, 0]), dim=-1)
         torch.testing.assert_close(result, expected)
-        self.assertIn("tl.split", code)
-        self.assertIn("tl.join", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.split", code)
+            self.assertIn("tl.join", code)
 
     @xfailIfPallas("hl.join not supported on pallas")
     def test_join_broadcast_scalar(self):
@@ -232,7 +234,8 @@ class TestViews(RefEagerTestBase, TestCase):
         broadcast_y = torch.broadcast_to(y, x.shape)
         expected = torch.stack((x, broadcast_y), dim=-1)
         torch.testing.assert_close(result, expected)
-        self.assertIn("tl.join", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.join", code)
 
     def test_scalar_broadcast_2d(self):
         """Test that scalars broadcast correctly with 2D tensors."""
@@ -401,7 +404,35 @@ class TestViews(RefEagerTestBase, TestCase):
         x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
         code, result = code_and_output(foo, (x,))
         self.assertEqual(result.numel(), x.numel() // 2)
-        self.assertIn("tl.reshape", code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.reshape", code)
+
+    @skipIfRefEager("ref eager does not support lifted variable")
+    @xfailIfPallas("hl.split and tl.reshape not supported on pallas")
+    def test_view_blocksize_constexpr_pairsum(self):
+        # The split-over-view + compacted-store machinery exercised by
+        # ``test_view_blocksize_constexpr`` (which only checks codegen shape)
+        # must produce genuine ``x.view(N // 2, 2).sum(-1)`` values.  This
+        # variant writes the compacted result to the matching output offset
+        # (``n_tile.begin // 2``) so the result is numerically meaningful.
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def foo(x: torch.Tensor) -> torch.Tensor:
+            N = x.shape[0]
+            N = hl.specialize(N)
+            out = x.new_empty(N // 2)
+            for (n_tile,) in hl.tile([N]):
+                val = x[n_tile]
+                val = val.view(n_tile.block_size // 2, 2)
+                val_a, val_b = hl.split(val)
+                out[n_tile.begin // 2 + hl.arange(0, n_tile.block_size // 2)] = (
+                    val_a + val_b
+                )
+            return out
+
+        x = torch.randn(1024, dtype=torch.float32, device=DEVICE)
+        _code, result = code_and_output(foo, (x,))
+        expected = x.view(x.numel() // 2, 2).sum(-1)
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
     @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_dim0(self):
@@ -483,10 +514,11 @@ class TestViews(RefEagerTestBase, TestCase):
         # Verify that the operation is a bitcast (add 1 to raw bits)
         expected = (x.view(dtype=torch.int16) + 1).view(dtype=torch.bfloat16)
         torch.testing.assert_close(result, expected)
-        self.assertTrue(
-            ".to(tl.int16)" in code or "tl.cast(" in code,
-            "Expected bitcast to int16 via .to() or tl.cast()",
-        )
+        if _get_backend() == "triton":
+            self.assertTrue(
+                ".to(tl.int16)" in code or "tl.cast(" in code,
+                "Expected bitcast to int16 via .to() or tl.cast()",
+            )
 
 
 if __name__ == "__main__":

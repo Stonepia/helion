@@ -22,17 +22,17 @@ from typing import NoReturn
 from typing import cast
 import uuid
 
-import torch
-
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import synchronize_device
+from .kernel_args import load_trusted_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
+from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
 from .progress_bar import iter_with_progress
 
@@ -171,12 +171,13 @@ def _run_kernel_in_subprocess_spawn(
     _cap: list[str] = [""]
     try:
         fn = _load_compiled_fn(fn_spec)
-        args = torch.load(args_path)
+        args = load_trusted_kernel_args(args_path)
         assert isinstance(args, (tuple, list))
-        synchronize_device(None)
+        synchronize_device()
         with capture_output() as _cap:
-            result = fn(*args)
-        synchronize_device(result)
+            # Keep asynchronous device buffers alive until execution completes.
+            _output = fn(*args)
+        synchronize_device()
         _write_result_file(result_path, {"status": "ok"})
     except Exception as exc:
         status = 1
@@ -412,9 +413,18 @@ class PrecompileFuture:
             )
             process.daemon = True
         else:
-            precompiler = _prepare_precompiler_for_fork(
-                fn, args, config, ctx.kernel, decorator, ctx.log
-            )
+            try:
+                precompiler = _prepare_precompiler_for_fork(
+                    fn, args, config, ctx.kernel, decorator, ctx.log
+                )
+            except Exception as e:
+                e.__traceback__ = None
+                if match_unrecoverable_runtime_error(e):
+                    raise
+                action = classify_triton_exception(e)
+                if action == "raise" and not ctx.settings.autotune_ignore_errors:
+                    raise
+                return PrecompileFuture.skip(ctx, config, False)
             if precompiler is None:
                 return PrecompileFuture.skip(ctx, config, True)
             mp_ctx = mp.get_context("fork")
@@ -710,12 +720,7 @@ class PrecompileFuture:
             formatted = (
                 f"{formatted}\nRemote traceback (spawned process):\n{error.traceback}"
             )
-        if classification == "warn":
-            self.ctx.log.warning(formatted)
-            self.ctx.kernel.maybe_log_repro(
-                self.ctx.log.warning, self.ctx.args, self.config
-            )
-        elif not ignore_errors:
+        if not ignore_errors:
             self.ctx.log.debug(formatted)
             self.ctx.kernel.maybe_log_repro(
                 self.ctx.log.debug, self.ctx.args, self.config

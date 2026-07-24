@@ -12,12 +12,14 @@ from pathlib import Path
 import pickle
 import random
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import Callable
 from typing import ClassVar
 from typing import Sequence
 import unittest
 from unittest import skip
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import numpy as np
@@ -29,6 +31,7 @@ from helion import _compat
 from helion import exc
 from helion._compiler.tile_dispatch import BlockIDStrategyMapping
 from helion._compiler.tile_dispatch import TileStrategyDispatch
+from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
@@ -40,35 +43,76 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_fragment import PermutationFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 import helion.language as hl
 from helion.language import loops
 from helion.runtime.settings import Settings
+from helion.runtime.settings import _get_backend
 
 datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
+
+# Pin the arch for config-population goldens: the pointwise seed promotes to the
+# autotune-off default only on PROMOTE_TARGETS (sm90/sm100), so an unpinned test
+# would emit the promoted tile on H100/B200 runners and the base default on
+# others. Fixing the arch keeps the expected journal deterministic everywhere.
+_HOPPER_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA H100",
+    runtime_version="12.8",
+    compute_capability="sm90",
+)
 examples_dir = Path(__file__).parent.parent / "examples"
+
+
+_FINAL_REBENCHMARK_ENV_KEYS = (
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K",
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS",
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED",
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE",
+)
+
+
+@contextmanager
+def clean_final_rebenchmark_env(**overrides: str):
+    saved = {key: os.environ.get(key) for key in _FINAL_REBENCHMARK_ENV_KEYS}
+    try:
+        for key in _FINAL_REBENCHMARK_ENV_KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(overrides)
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _get_examples_matmul():
@@ -108,10 +152,13 @@ class TestAutotuneIgnoreErrors(TestCase):
             format_kernel_decorator=lambda config, s: "decorator",
             to_triton_code=lambda config: "code",
             maybe_log_repro=lambda log_func, args, config=None: None,
+            supports_subprocess_benchmark=lambda: False,
         )
         search.args = args
         search.log = AutotuningLogger(settings)
-        search.config_spec = SimpleNamespace(default_config=dict)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
         search._benchmark_provider_cls = LocalBenchmarkProvider
         search.best_perf_so_far = float("inf")
         search._prepared = False
@@ -164,6 +211,23 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(result, float("inf"))
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
+    def test_cuda_oom_skips_config(self):
+        settings = Settings(
+            autotune_ignore_errors=False,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+        with patch("torch.accelerator.synchronize", autospec=True) as sync:
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
+
+        self.assertEqual(result, float("inf"))
+        self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
     def test_ignore_errors_skips_logging_and_raise(self):
         settings = Settings(
             autotune_ignore_errors=True,
@@ -181,6 +245,133 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(result, float("inf"))
         warn.assert_not_called()
+
+    def test_clear_jit_fast_path_caches(self):
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        calls = []
+
+        class FakeJITFunction:
+            def clear_fast_path_caches(self) -> None:
+                calls.append("cleared")
+
+        def generated_kernel() -> None:
+            return None
+
+        globals_key = f"_helion_{generated_kernel.__name__}"
+        generated_kernel.__globals__[globals_key] = FakeJITFunction()
+        try:
+            search.benchmark_provider._clear_jit_fast_path_caches(generated_kernel)
+        finally:
+            del generated_kernel.__globals__[globals_key]
+
+        self.assertEqual(calls, ["cleared"])
+
+    def test_clear_jit_fast_path_caches_does_not_clear_device_caches(self):
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        class FakeJITFunction:
+            def __init__(self) -> None:
+                self.device_caches = {"compiled": object()}
+
+            def clear_fast_path_caches(self) -> None:
+                return None
+
+        def generated_kernel() -> None:
+            return None
+
+        jit_fn = FakeJITFunction()
+        device_caches = jit_fn.device_caches
+        globals_key = f"_helion_{generated_kernel.__name__}"
+        generated_kernel.__globals__[globals_key] = jit_fn
+        try:
+            search.benchmark_provider._clear_jit_fast_path_caches(generated_kernel)
+        finally:
+            del generated_kernel.__globals__[globals_key]
+
+        self.assertIs(jit_fn.device_caches, device_caches)
+        self.assertEqual(list(jit_fn.device_caches), ["compiled"])
+
+    def test_clear_jit_fast_path_caches_ignores_cleanup_errors(self):
+        settings = Settings(
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        class FakeJITFunction:
+            def clear_fast_path_caches(self) -> None:
+                raise RuntimeError("cleanup failed")
+
+        def generated_kernel() -> None:
+            return None
+
+        globals_key = f"_helion_{generated_kernel.__name__}"
+        generated_kernel.__globals__[globals_key] = FakeJITFunction()
+        try:
+            search.benchmark_provider._clear_jit_fast_path_caches(generated_kernel)
+        finally:
+            del generated_kernel.__globals__[globals_key]
+
+    def test_benchmark_function_clears_jit_fast_path_caches_on_success(self):
+        settings = Settings(
+            autotune_accuracy_check=False,
+            autotune_precompile=None,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        def compiled_fn(*_args):
+            return None
+
+        bench_fn = Mock(return_value=None)
+        search.kernel.env = SimpleNamespace(process_group_name=None)
+        search.kernel.bench_compile_config = Mock(return_value=bench_fn)
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch(
+                "helion.autotuner.benchmark_provider.do_bench",
+                return_value=1.25,
+            ),
+            patch.object(
+                search.benchmark_provider, "_clear_jit_fast_path_caches"
+            ) as clear,
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function("cfg", compiled_fn)
+
+        self.assertEqual(result, 1.25)
+        clear.assert_called_once_with(compiled_fn)
+
+    def test_benchmark_function_clears_jit_fast_path_caches_on_error(self):
+        settings = Settings(
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+
+        def bad_fn(*_args):
+            raise RuntimeError("boom")
+
+        with (
+            patch("torch.accelerator.synchronize", autospec=True) as sync,
+            patch.object(
+                search.benchmark_provider, "_clear_jit_fast_path_caches"
+            ) as clear,
+        ):
+            sync.return_value = None
+            result = search.benchmark_provider._benchmark_function("cfg", bad_fn)
+
+        self.assertEqual(result, float("inf"))
+        clear.assert_called_once_with(bad_fn)
 
     def test_traceback_cleared_str(self):
         """Test that str(e) still has meaningful content after e.__traceback__ = None."""
@@ -287,13 +478,16 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_log_level=logging.CRITICAL,
         )
         logger = AutotuningLogger(settings)
+        config = helion.Config(block_sizes=[32], num_warps=4)
         with logger.autotune_logging():
+            config_id = logger.register_config(config)
             entry = AutotuneLogEntry(
                 generation=5,
                 status="ok",
                 perf_ms=1.234,
                 compile_time=0.5,
-                config=helion.Config(foo=1, bar=[2, 3]),
+                config_id=config_id,
+                config=config,
             )
             logger.record_autotune_entry(entry)
             logger("finalized entry", level=logging.CRITICAL)
@@ -303,11 +497,14 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertTrue(csv_path.exists())
         self.assertTrue(log_path.exists())
         rows = list(csv.reader(csv_path.read_text().splitlines()))
+        self.assertEqual(len(rows), 2)  # header + exactly the one recorded entry
+        header, row = rows[0], rows[1]
         self.assertEqual(
-            rows[0],
+            header,
             [
+                "run_id",
                 "timestamp_s",
-                "config_index",
+                "config_id",
                 "generation",
                 "status",
                 "perf_ms",
@@ -315,10 +512,18 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "config",
             ],
         )
-        self.assertEqual(rows[1][1], "1")
-        self.assertEqual(rows[1][2], "5")
-        self.assertEqual(rows[1][3], "ok")
-        self.assertEqual(rows[1][4], "1.234000")
+
+        def cell(name: str) -> str:
+            return row[header.index(name)]
+
+        # No metadata supplied here, so the run_id join key is empty.
+        self.assertEqual(cell("run_id"), "")
+        self.assertEqual(cell("config_id"), config_id)
+        self.assertEqual(cell("generation"), "5")
+        self.assertEqual(cell("status"), "ok")
+        self.assertEqual(cell("perf_ms"), "1.234000")
+        self.assertEqual(cell("compile_time_s"), "0.50")
+        self.assertEqual(cell("config"), str(config))
         log_text = log_path.read_text()
         self.assertIn("finalized entry", log_text)
 
@@ -379,6 +584,50 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(calls, [[0, 1]])
         self.assertEqual([idx for idx, _ in candidates], [0, 1])
 
+    def test_benchmarked_members_survive_config_mutation(self):
+        # Regression test: _benchmarked_members / _pinned_finalist_members must
+        # not be keyed by Config objects. Config is mutable and hashes on its
+        # contents, so mutating a recorded config in place (as normalize /
+        # neighbor generation does during the search) corrupted the bookkeeping
+        # -> _prune_benchmarked_members raised KeyError, and final verification
+        # could select a config that was never accuracy-validated.
+        search = DifferentialEvolutionSearch.__new__(DifferentialEvolutionSearch)
+        search._benchmarked_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+
+        def make_member(perf: float, num_warps: int) -> PopulationMember:
+            return PopulationMember(
+                lambda *a, **k: None,
+                [perf],
+                [],
+                helion.Config(block_sizes=[64], num_warps=num_warps),
+                status="ok",
+            )
+
+        fast = make_member(1.0, num_warps=4)
+        slow = make_member(2.0, num_warps=8)
+        search._record_best_member_for_config(
+            search._benchmarked_members, fast.config, fast
+        )
+        search._record_best_member_for_config(
+            search._benchmarked_members, slow.config, slow
+        )
+
+        # Mutate the original configs in place *after* they were recorded.
+        fast.config.config["num_warps"] = 999
+        slow.config.config["num_warps"] = 999
+
+        # Pruning to the single fastest config must not raise (the old code did
+        # `del dict[config]` on a config whose hash had changed -> KeyError) and
+        # must keep the fast member with the config it was actually benchmarked
+        # with (snapshot), not the later in-place mutation.
+        search._prune_benchmarked_members(top_k=1)
+        self.assertEqual(len(search._benchmarked_members), 1)
+        kept = next(iter(search._benchmarked_members.values()))
+        self.assertEqual(kept.perfs[0], 1.0)
+        self.assertEqual(kept.config["num_warps"], 4)
+
     @pytest.mark.skipif(
         "fork" not in mp.get_all_start_methods(),
         reason="fork start method is unavailable on this platform",
@@ -426,6 +675,99 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         self.assertEqual(set(lazy_calls), {parent_pid})
 
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_expected_errors_skip_config(self):
+        from torch._inductor.runtime.triton_compat import OutOfResources
+
+        expected_errors = [
+            torch.cuda.OutOfMemoryError("CUDA out of memory"),
+            OutOfResources(128, 64, "shared memory"),
+            RuntimeError("out of resource: shared memory"),
+            RuntimeError("too many resources requested for launch"),
+            RuntimeError("CUDA error: out of memory"),
+            RuntimeError("[CUDA]: out of memory"),
+            RuntimeError("failed to translate module to LLVM IR"),
+        ]
+        for err in expected_errors:
+            with self.subTest(error=type(err).__name__, msg=str(err)):
+                settings = Settings(
+                    autotune_precompile="fork",
+                    autotune_ignore_errors=False,
+                    autotune_log_level=logging.CRITICAL,
+                )
+                search = self._make_search(settings, args=("arg0",))
+
+                def fake_compiled_fn(
+                    *fn_args: object, _launcher: Callable[..., object]
+                ) -> None:
+                    _launcher("fake_kernel", (1,), *fn_args)
+
+                with patch(
+                    "helion.autotuner.precompile_future._prepare_precompiler_for_fork",
+                    side_effect=err,
+                ):
+                    future = search.benchmark_provider._create_precompile_future(
+                        "cfg", fake_compiled_fn
+                    )
+
+                self.assertFalse(future.ok)
+
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_illegal_memory_access_raises(self):
+        settings = Settings(
+            autotune_precompile="fork",
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        def fake_compiled_fn(
+            *fn_args: object, _launcher: Callable[..., object]
+        ) -> None:
+            _launcher("fake_kernel", (1,), *fn_args)
+
+        with (
+            patch(
+                "helion.autotuner.precompile_future._prepare_precompiler_for_fork",
+                side_effect=RuntimeError("an illegal memory access was encountered"),
+            ),
+            pytest.raises(RuntimeError, match="illegal memory access"),
+        ):
+            search.benchmark_provider._create_precompile_future("cfg", fake_compiled_fn)
+
+    @pytest.mark.skipif(
+        "fork" not in mp.get_all_start_methods(),
+        reason="fork start method is unavailable on this platform",
+    )
+    def test_fork_precompile_unexpected_error_skipped_with_ignore_errors(self):
+        settings = Settings(
+            autotune_precompile="fork",
+            autotune_ignore_errors=True,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings, args=("arg0",))
+
+        def fake_compiled_fn(
+            *fn_args: object, _launcher: Callable[..., object]
+        ) -> None:
+            _launcher("fake_kernel", (1,), *fn_args)
+
+        with patch(
+            "helion.autotuner.precompile_future._prepare_precompiler_for_fork",
+            side_effect=RuntimeError("something unexpected"),
+        ):
+            future = search.benchmark_provider._create_precompile_future(
+                "cfg", fake_compiled_fn
+            )
+
+        self.assertFalse(future.ok)
+
     def _run_autotuner_and_check_logging(
         self, search_factory: Callable[[object, tuple[object, ...]], BaseSearch]
     ) -> None:
@@ -461,7 +803,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         csv_path = base_path.with_suffix(".csv")
         self.assertTrue(csv_path.exists())
         rows = list(csv.reader(csv_path.read_text().splitlines()))
-        statuses = [row[3] for row in rows[1:]]  # skip header
+        status_idx = rows[0].index("status")  # look up by name; column order may change
+        statuses = [row[status_idx] for row in rows[1:]]  # skip header
         started_count = sum(1 for s in statuses if s == "started")
         completed_count = sum(1 for s in statuses if s in ("ok", "error", "timeout"))
         self.assertGreater(started_count, 0, "Should log started entries")
@@ -500,6 +843,51 @@ class TestAutotuneIgnoreErrors(TestCase):
             with self.subTest(algorithm=name):
                 self._run_autotuner_and_check_logging(factory)
 
+    @skipIfRefEager("Autotuning not supported in ref eager mode")
+    @skipIfXPU("maxnreg parameter not supported on XPU backend")
+    def test_autotune_skips_restricted_search(self):
+        """A run restricted to user-pinned configs (``configs=[...]`` without
+        ``force_autotune``) is a biased slice excluded from the dataset: even
+        with the dataset flag on, no ``.meta.jsonl`` is written. The debug
+        ``.csv`` is still written, since it is gated only by the log path
+        (PRD FR8/FR9)."""
+        configs = [
+            helion.Config(block_sizes=[32], num_warps=4),
+            helion.Config(block_sizes=[64], num_warps=8),
+        ]
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base_path = Path(tmpdir.name) / "autotune_run"
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_LOG": str(base_path),
+                "HELION_AUTOTUNE_LOG_DETAILS": "1",
+                "HELION_AUTOTUNE_LOG_LEVEL": "0",
+            },
+        ):
+
+            @helion.kernel(configs=configs)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+            args = (
+                torch.randn([64], device=DEVICE),
+                torch.randn([64], device=DEVICE),
+            )
+            bound_kernel = add.bind(args)
+            random.seed(123)
+            search = FiniteSearch(bound_kernel, args, configs=configs)
+            search.autotune()
+
+        # Restricted search -> debug CSV written, but no dataset sidecar.
+        self.assertTrue(base_path.with_suffix(".csv").exists())
+        self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
+
 
 @onlyBackends(["triton"])
 class TestAutotuner(RefEagerTestDisabled, TestCase):
@@ -512,6 +900,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -530,8 +919,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
-    def test_config_fragment1(self):
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    def test_config_fragment1(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
@@ -549,9 +940,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
-    def test_config_warp_specialize_unroll(self):
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    def test_config_warp_specialize_unroll(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
@@ -560,6 +953,26 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         overrides = {"range_unroll_factors": [4], "range_warp_specializes": ([True])}
         # We expect all the unroll factors to be set to 0
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
+
+    @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
+    @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("maxnreg uses CUDA-specific register query")
+    @skipIfTileIR("block-size overshoot is gated to the triton backend")
+    def test_small_dim_block_size_overshoot(self):
+        # All dims are 16, smaller than SMALL_DIM_BLOCK_SIZE_OVERSHOOT, so the
+        # generated configs may use block sizes larger than the dimensions
+        # themselves (e.g. 32 or 64) -- the extra rows/cols are masked off.
+        self.assertEqual(SMALL_DIM_BLOCK_SIZE_OVERSHOOT, 64)
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        spec = _get_examples_matmul().bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
@@ -1075,6 +1488,45 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             # Check boolean
             self.assertIn(neighbor[4], [True, False])
 
+    def test_lfbo_tree_search_generate_neighbors_cap(self):
+        """LFBOTreeSearch applies num_neighbors_cap in the tree-guided path."""
+
+        class MockEstimator:
+            tree_ = SimpleNamespace(feature=np.array([0], dtype=int))
+
+            def decision_path(self, _x):
+                return SimpleNamespace(indices=np.array([0], dtype=int))
+
+            def predict_proba(self, x):
+                scores = np.asarray(x)[:, 0]
+                probas = scores / np.max(scores)
+                return np.column_stack((1.0 - probas, probas))
+
+        spec = PowerOfTwoFragment(16, 128, 32)
+        search = LFBOTreeSearch.__new__(LFBOTreeSearch)
+        search.num_neighbors = 10
+        search.num_neighbors_cap = 3
+        search.radius = 2
+        search.surrogate = SimpleNamespace(estimators_=[MockEstimator()])
+        search._autotune_metrics = SimpleNamespace(num_generations=2)
+        search._encoded_to_flat_mapping = None
+        search.config_gen = SimpleNamespace(
+            flat_spec=[spec],
+            block_size_indices=[0],
+            num_warps_index=-1,
+            overridden_flat_indices=set(),
+            encode_config=lambda flat: spec.encode(flat[0]),
+        )
+
+        capped_neighbors = search._generate_neighbors([32])
+
+        search.num_neighbors_cap = -1
+        uncapped_neighbors = search._generate_neighbors([32])
+
+        self.assertEqual(len(capped_neighbors), 3)
+        self.assertEqual(len(uncapped_neighbors), 10)
+        self.assertTrue(all(neighbor != [32] for neighbor in capped_neighbors))
+
     def test_lfbo_pattern_search_surrogate_select_matches_legacy_prefix(self):
         """Top-k LFBO selection should match the legacy full-ranking implementation."""
 
@@ -1301,6 +1753,77 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
         run_mode("fork", expect_error=False)
         run_mode("spawn", expect_error=True)
+
+    def test_autotune_noncontiguous_arg(self) -> None:
+        """Autotuning a kernel bound on a non-contiguous arg must succeed.
+
+        A kernel bound on a non-contiguous arg hardcodes that arg's load strides
+        into the compiled kernel as compile-time constants. The autotuner reruns
+        that compiled kernel on a clone of the args to compute its accuracy
+        baseline, so the clone must keep the same layout. If the clone is made
+        contiguous, those hardcoded strides address the wrong (or out-of-bounds)
+        memory and read garbage, so every config mismatches the baseline and
+        autotuning fails to select one.
+
+        The arg is a strided slice (``buf[::2]``): its contiguous clone compacts
+        the storage, so the hardcoded stride-2 loads read the wrong elements.
+        """
+        config_a = helion.Config(block_sizes=[32], num_warps=4)
+        config_b = helion.Config(block_sizes=[64], num_warps=4)
+
+        @helion.kernel(configs=[config_a, config_b], autotune_log_level=0)
+        def double(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+            return out
+
+        # Strided 1-D view: size 1024, stride 2 over a 2048-element buffer.
+        x = torch.arange(2048, device=DEVICE, dtype=torch.float32)[::2]
+        self.assertFalse(x.is_contiguous())
+        self.assertEqual(x.stride(), (2,))
+
+        bound_kernel = double.bind((x,))
+        search = FiniteSearch(bound_kernel, (x,), configs=[config_a, config_b])
+        best = search.autotune()
+        self.assertIn(best, (config_a, config_b))
+
+        torch.testing.assert_close(double(x), x * 2.0)
+
+    def test_autotune_broadcast_arg(self) -> None:
+        """Autotuning a kernel bound on a broadcast/expanded arg must succeed.
+
+        Same accuracy-baseline issue as the strided-slice case, but for a
+        ``stride-0`` view from ``expand``. Here ``b`` is ``[M, 1]`` expanded to
+        ``[M, N]`` (stride ``(1, 0)``); the kernel indexes ``b[ti, tj]`` so the
+        stride-0 column load is hardcoded into the compiled kernel. A clone that
+        materialized ``b`` to a contiguous ``[M, N]`` (stride ``(N, 1)``) would
+        make that hardcoded load read a different element per column, so the
+        baseline diverges and every config is rejected.
+        """
+        config_a = helion.Config(block_sizes=[32, 32], num_warps=4)
+        config_b = helion.Config(block_sizes=[64, 64], num_warps=4)
+
+        @helion.kernel(configs=[config_a, config_b], autotune_log_level=0)
+        def add_bias(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_i, tile_j in hl.tile(x.size()):
+                out[tile_i, tile_j] = x[tile_i, tile_j] + b[tile_i, tile_j]
+            return out
+
+        m, n = 128, 128
+        x = torch.randn(m, n, device=DEVICE)
+        # Broadcast/expanded view: [m, 1] -> [m, n], stride (1, 0).
+        b = torch.randn(m, 1, device=DEVICE).expand(m, n)
+        self.assertFalse(b.is_contiguous())
+        self.assertEqual(b.stride(), (1, 0))
+
+        bound_kernel = add_bias.bind((x, b))
+        search = FiniteSearch(bound_kernel, (x, b), configs=[config_a, config_b])
+        best = search.autotune()
+        self.assertIn(best, (config_a, config_b))
+
+        torch.testing.assert_close(add_bias(x, b), x + b)
 
     def test_accuracy_check_filters_bad_config_wrong_arg_mutation(self) -> None:
         bad_config = helion.Config(block_sizes=[1], num_warps=8)
@@ -1697,6 +2220,34 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         result = add(*args)
         torch.testing.assert_close(result, sum(args))
 
+    def test_env_autotune_effort_none_ignores_force_autotune(self):
+        autotuner_fn = Mock(
+            side_effect=AssertionError("autotuner should not run with effort=none")
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNE_EFFORT": "none",
+                "HELION_FORCE_AUTOTUNE": "1",
+            },
+        ):
+
+            @helion.kernel(autotuner_fn=autotuner_fn)
+            def add(a, b):
+                out = torch.empty_like(a)
+                for tile in hl.tile(out.size()):
+                    out[tile] = a[tile] + b[tile]
+                return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        result = add(*args)
+        torch.testing.assert_close(result, sum(args))
+        autotuner_fn.assert_not_called()
+
     def test_autotune_effort_quick(self):
         """Test that quick effort profile uses correct default values."""
         # Get the quick profile defaults
@@ -1837,7 +2388,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         bound = add.bind(args)
 
         # Default: -1 (no cap)
-        with patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}):
+        with (
+            without_env_var("HELION_CAP_AUTOTUNE_NUM_NEIGHBORS"),
+            patch.dict(os.environ, {"HELION_AUTOTUNER": "PatternSearch"}),
+        ):
             autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertEqual(autotuner.autotuner.num_neighbors_cap, -1)
 
@@ -1852,11 +2406,33 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             autotuner = bound.settings.autotuner_fn(bound, args)
             self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
 
+        # Env var also applies to LFBO-based pattern search.
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 50)
+
         # Explicit constructor arg wins over env var
         with patch.dict(
             os.environ,
             {
                 "HELION_AUTOTUNER": "PatternSearch",
+                "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
+            },
+        ):
+            autotuner = bound.settings.autotuner_fn(bound, args, num_neighbors_cap=10)
+            self.assertEqual(autotuner.autotuner.num_neighbors_cap, 10)
+
+        # Explicit constructor arg wins over env var for LFBO-based search too.
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_AUTOTUNER": "LFBOTreeSearch",
                 "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
             },
         ):
@@ -1903,6 +2479,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertEqual(pow2_frag.encode(8), [3.0])  # log2(8) = 3
         self.assertEqual(pow2_frag.encode(16), [4.0])  # log2(16) = 4
 
+        # Test NumThreadsFragment (0 is the CuTe auto-thread sentinel)
+        num_threads_frag = NumThreadsFragment(high=128)
+        self.assertEqual(num_threads_frag.dim(), 1)
+        self.assertEqual(num_threads_frag.encode(0), [0.0])
+        self.assertEqual(num_threads_frag.encode(8), [4.0])
+
         # Test EnumFragment (one-hot encoding)
         enum_frag = EnumFragment(choices=("a", "b", "c"))
         self.assertEqual(enum_frag.dim(), 3)
@@ -1925,11 +2507,27 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             (BooleanFragment(), True),
             (IntegerFragment(1, 10, 5), 5),
             (PowerOfTwoFragment(2, 128, 8), 16),
+            (NumThreadsFragment(128), 0),
             (EnumFragment(choices=("a", "b")), "b"),
         ]:
             dim = fragment.dim()
             encoded = fragment.encode(value)
             self.assertEqual(len(encoded), dim)
+
+    def test_block_size_fragment_autotuner_min_clamp(self):
+        """random_config() must not crash when autotuner_min > max_size."""
+        from examples.attention import attention
+
+        q, k, v = [
+            torch.randn(4, 48, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        ]
+        bound = attention.bind((q, k, v))
+        config_spec = bound.config_spec
+        config_spec.raise_grid_block_minimums()
+        gen = ConfigGeneration(config_spec)
+        config = gen.random_config()
+        self.assertEqual(config["block_sizes"][0], 1)
 
     def test_autotune_benchmark_fn(self) -> None:
         """Test that custom benchmark function is used during rebenchmarking."""
@@ -1984,6 +2582,615 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         # Should have been called with 2 functions
         self.assertEqual(benchmark_calls[0][0], 2)
+
+    def test_rebenchmark_clears_jit_fast_path_caches(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.config_spec = SimpleNamespace(backend=None)
+        events: list[str] = []
+
+        class FakeJITFunction:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def clear_fast_path_caches(self) -> None:
+                events.append(f"clear {self.name}")
+
+        def generated_kernel_a() -> None:
+            events.append("run a")
+
+        def generated_kernel_b() -> None:
+            events.append("run b")
+
+        globals_key_a = f"_helion_{generated_kernel_a.__name__}"
+        globals_key_b = f"_helion_{generated_kernel_b.__name__}"
+        generated_kernel_a.__globals__[globals_key_a] = FakeJITFunction("a")
+        generated_kernel_b.__globals__[globals_key_b] = FakeJITFunction("b")
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            for _ in range(2):
+                for fn in fns:
+                    fn()
+            return [100.0, 101.0]
+
+        search.settings.autotune_benchmark_fn = custom_benchmark_fn
+        member_a = PopulationMember(generated_kernel_a, [100.0], [], helion.Config())
+        member_b = PopulationMember(generated_kernel_b, [101.0], [], helion.Config())
+        try:
+            search.rebenchmark([member_a, member_b])
+        finally:
+            del generated_kernel_a.__globals__[globals_key_a]
+            del generated_kernel_b.__globals__[globals_key_b]
+
+        self.assertEqual(
+            events,
+            [
+                "run a",
+                "clear a",
+                "run b",
+                "clear b",
+                "run a",
+                "clear a",
+                "run b",
+                "clear b",
+                "clear a",
+                "clear b",
+            ],
+        )
+
+    def test_final_rebenchmark_can_restore_earlier_stable_best(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 9.0
+
+        stable_config = helion.Config(num_warps=4)
+        noisy_config = helion.Config(num_warps=8)
+        stable = PopulationMember(lambda: None, [10.0], (), stable_config, status="ok")
+        noisy = PopulationMember(lambda: None, [9.0], (), noisy_config, status="ok")
+        search._benchmarked_members = {
+            stable_config: stable,
+            noisy_config: noisy,
+        }
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search.population = [noisy]
+
+        def fake_rebenchmark(
+            members: list[PopulationMember],
+            *,
+            desc: str = "Rebenchmarking",
+            target_ms: float = 200.0,
+            use_isolated: bool = True,
+            confirm_suspicious: bool = True,
+            use_interleaved: bool = True,
+        ) -> None:
+            self.assertIn("Final verification", desc)
+            self.assertEqual(target_ms, 5000.0)
+            self.assertFalse(use_isolated)
+            self.assertFalse(confirm_suspicious)
+            self.assertFalse(use_interleaved)
+            for member in members:
+                member.perfs.append(10.0 if member is stable else 12.0)
+
+        with (
+            clean_final_rebenchmark_env(),
+            patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
+        ):
+            self.assertIs(search.final_rebenchmark_best(noisy), stable)
+
+    def test_final_rebenchmark_target_ms_env_is_bounded(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS="50"
+        ):
+            self.assertEqual(search._final_rebenchmark_target_ms(), 200.0)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS="1500"
+        ):
+            self.assertEqual(search._final_rebenchmark_target_ms(), 1500.0)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS="1e308"
+        ):
+            self.assertEqual(search._final_rebenchmark_target_ms(), 60000.0)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS="inf"
+        ):
+            self.assertEqual(search._final_rebenchmark_target_ms(), 5000.0)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS="nan"
+        ):
+            self.assertEqual(search._final_rebenchmark_target_ms(), 5000.0)
+
+    def test_final_rebenchmark_pinned_tolerance_env(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+
+        with clean_final_rebenchmark_env():
+            self.assertEqual(search._final_rebenchmark_pinned_tolerance(), 0.0)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE="0.02"
+        ):
+            self.assertEqual(search._final_rebenchmark_pinned_tolerance(), 0.02)
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE="-1"
+        ):
+            self.assertEqual(search._final_rebenchmark_pinned_tolerance(), 0.0)
+
+    def test_final_rebenchmark_top_k_default_scoped_to_cute(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+
+        with clean_final_rebenchmark_env():
+            # The larger finalist set is scoped to cute; other backends use the
+            # cheaper default so autotune wall-time is not inflated.
+            search.config_spec = SimpleNamespace(backend_name="cute")
+            self.assertEqual(search._final_rebenchmark_top_k(), 32)
+            search.config_spec = SimpleNamespace(backend_name="triton")
+            self.assertEqual(search._final_rebenchmark_top_k(), 8)
+            search.config_spec = SimpleNamespace(backend_name="pallas")
+            self.assertEqual(search._final_rebenchmark_top_k(), 8)
+
+        # An explicit env override wins regardless of backend.
+        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
+            search.config_spec = SimpleNamespace(backend_name="cute")
+            self.assertEqual(search._final_rebenchmark_top_k(), 2)
+
+    def test_final_rebenchmark_prefers_faster_generated_config_by_default(
+        self,
+    ) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 9.0
+
+        pinned_config = helion.Config(num_warps=4)
+        noisy_config = helion.Config(num_warps=8)
+        pinned = PopulationMember(lambda: None, [10.0], (), pinned_config, status="ok")
+        noisy = PopulationMember(lambda: None, [9.0], (), noisy_config, status="ok")
+        search._benchmarked_members = {
+            pinned_config: pinned,
+            noisy_config: noisy,
+        }
+        search._pinned_finalist_configs = {pinned_config}
+        search._pinned_finalist_members = {pinned_config: pinned}
+        search.population = [noisy]
+
+        def fake_rebenchmark(
+            members: list[PopulationMember],
+            *,
+            desc: str = "Rebenchmarking",
+            target_ms: float = 200.0,
+            use_isolated: bool = True,
+            confirm_suspicious: bool = True,
+            use_interleaved: bool = True,
+        ) -> None:
+            for member in members:
+                member.perfs.append(10.04 if member is pinned else 10.0)
+
+        with (
+            clean_final_rebenchmark_env(),
+            patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
+        ):
+            self.assertIs(search.final_rebenchmark_best(noisy), noisy)
+
+    def test_final_rebenchmark_can_prefer_near_tied_pinned_config(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 9.0
+
+        pinned_config = helion.Config(num_warps=4)
+        noisy_config = helion.Config(num_warps=8)
+        pinned = PopulationMember(lambda: None, [10.0], (), pinned_config, status="ok")
+        noisy = PopulationMember(lambda: None, [9.0], (), noisy_config, status="ok")
+        search._benchmarked_members = {
+            pinned_config: pinned,
+            noisy_config: noisy,
+        }
+        search._pinned_finalist_configs = {pinned_config}
+        search._pinned_finalist_members = {pinned_config: pinned}
+        search.population = [noisy]
+
+        def fake_rebenchmark(
+            members: list[PopulationMember],
+            *,
+            desc: str = "Rebenchmarking",
+            target_ms: float = 200.0,
+            use_isolated: bool = True,
+            confirm_suspicious: bool = True,
+            use_interleaved: bool = True,
+        ) -> None:
+            for member in members:
+                member.perfs.append(10.04 if member is pinned else 10.0)
+
+        with (
+            clean_final_rebenchmark_env(
+                HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE="0.005"
+            ),
+            patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
+        ):
+            self.assertIs(search.final_rebenchmark_best(noisy), pinned)
+
+    def test_final_rebenchmark_isolated_env(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+
+        with clean_final_rebenchmark_env():
+            self.assertFalse(search._final_rebenchmark_use_isolated())
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED="1"
+        ):
+            self.assertTrue(search._final_rebenchmark_use_isolated())
+        with clean_final_rebenchmark_env(
+            HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED="maybe"
+        ):
+            self.assertFalse(search._final_rebenchmark_use_isolated())
+
+    def test_final_rebenchmark_isolated_env_keeps_suspicious_confirmation(
+        self,
+    ) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 9.0
+
+        config_a = helion.Config(num_warps=4)
+        config_b = helion.Config(num_warps=8)
+        member_a = PopulationMember(lambda: None, [10.0], (), config_a, status="ok")
+        member_b = PopulationMember(lambda: None, [9.0], (), config_b, status="ok")
+        search._benchmarked_members = {
+            config_a: member_a,
+            config_b: member_b,
+        }
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search.population = [member_b]
+
+        def fake_rebenchmark(
+            members: list[PopulationMember],
+            *,
+            desc: str = "Rebenchmarking",
+            target_ms: float = 200.0,
+            use_isolated: bool = True,
+            confirm_suspicious: bool = True,
+            use_interleaved: bool = True,
+        ) -> None:
+            self.assertIn("Final verification", desc)
+            self.assertEqual(target_ms, 5000.0)
+            self.assertTrue(use_isolated)
+            self.assertTrue(confirm_suspicious)
+            self.assertFalse(use_interleaved)
+            for member in members:
+                member.perfs.append(9.5 if member is member_a else 10.0)
+
+        with (
+            clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED="1"),
+            patch.object(search, "rebenchmark", side_effect=fake_rebenchmark),
+        ):
+            self.assertIs(search.final_rebenchmark_best(member_b), member_a)
+
+    def test_rebenchmark_repeat_for_target_ms(self) -> None:
+        self.assertEqual(PopulationBasedSearch._repeat_for_target_ms(200.0, 100.0), 3)
+        self.assertEqual(
+            PopulationBasedSearch._repeat_for_target_ms(1000.0, 0.05), 20000
+        )
+        self.assertEqual(
+            PopulationBasedSearch._repeat_for_target_ms(1e308, 1e-308), 20_000
+        )
+
+    def test_isolated_rebenchmark_rep_ms_is_timeout_bounded(self) -> None:
+        self.assertEqual(PopulationBasedSearch._isolated_rep_ms(1000.0, 30), 1000)
+        self.assertEqual(PopulationBasedSearch._isolated_rep_ms(60000.0, 30), 15000)
+        with patch.dict(os.environ, {"HELION_CAP_REBENCHMARK_REPEAT": "50"}):
+            self.assertEqual(PopulationBasedSearch._isolated_rep_ms(1000.0, 30), 50)
+
+    def test_steady_rebenchmark_rep_ms_honors_cap(self) -> None:
+        self.assertEqual(PopulationBasedSearch._steady_rebenchmark_rep_ms(1000.0), 1000)
+        with patch.dict(os.environ, {"HELION_CAP_REBENCHMARK_REPEAT": "50"}):
+            self.assertEqual(
+                PopulationBasedSearch._steady_rebenchmark_rep_ms(1000.0), 50
+            )
+
+    def test_rebenchmark_repeat_ignores_global_optimistic_outlier(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        repeats: list[int] = []
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            repeats.append(repeat)
+            return [50.0 for _ in fns]
+
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.settings.autotune_benchmark_fn = custom_benchmark_fn
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 0.001
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.config_spec = SimpleNamespace(backend=None)
+        member_a = PopulationMember(lambda: None, [50.0], (), helion.Config())
+        member_b = PopulationMember(lambda: None, [51.0], (), helion.Config())
+
+        search.rebenchmark([member_a, member_b], target_ms=1000.0)
+
+        self.assertEqual(repeats, [19])
+
+    def test_final_rebenchmark_can_skip_suspicious_confirmation(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0.9,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(
+            mutated_arg_indices=[],
+            benchmark_isolated=Mock(side_effect=AssertionError("unexpected isolated")),
+        )
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.config_spec = SimpleNamespace(backend=None)
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            return [50.0 for _ in fns]
+
+        search.settings.autotune_benchmark_fn = custom_benchmark_fn
+        member_a = PopulationMember(lambda: None, [100.0], (), helion.Config())
+        member_b = PopulationMember(lambda: None, [101.0], (), helion.Config())
+
+        search.rebenchmark(
+            [member_a, member_b],
+            target_ms=1000.0,
+            use_isolated=False,
+            confirm_suspicious=False,
+        )
+
+        self.assertEqual(member_a.perfs, [100.0, 50.0])
+        self.assertEqual(member_b.perfs, [101.0, 50.0])
+
+    def test_rebenchmark_can_use_steady_backend_timer(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 100.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        calls: list[tuple[int, int, str]] = []
+
+        def steady_bench(
+            fn: Callable[[], object],
+            *,
+            warmup: int,
+            rep: int,
+            return_mode: str,
+            process_group_name: str | None = None,
+        ) -> float:
+            fn()
+            calls.append((warmup, rep, return_mode))
+            return 50.0 + len(calls)
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+        )
+        member_a = PopulationMember(lambda: None, [100.0], (), helion.Config())
+        member_b = PopulationMember(lambda: None, [101.0], (), helion.Config())
+
+        with patch("helion.autotuner.base_search.clear_jit_fast_path_caches") as clear:
+            search.rebenchmark(
+                [member_a, member_b],
+                target_ms=1500.0,
+                use_isolated=False,
+                confirm_suspicious=False,
+                use_interleaved=False,
+            )
+
+        self.assertEqual(calls, [(1000, 1500, "median"), (1000, 1500, "median")])
+        self.assertEqual(member_a.perfs, [100.0, 51.0])
+        self.assertEqual(member_b.perfs, [101.0, 52.0])
+        self.assertEqual(clear.call_count, 2)
+
+    def test_final_rebenchmark_respects_custom_benchmark_fn(
+        self,
+    ) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 9.0
+        search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        calls: list[str] = []
+
+        def fn_a() -> None:
+            calls.append("a")
+
+        def fn_b() -> None:
+            calls.append("b")
+
+        def steady_bench(
+            fn: Callable[[], object],
+            *,
+            warmup: int,
+            rep: int,
+            return_mode: str,
+            process_group_name: str | None = None,
+        ) -> float:
+            raise AssertionError("unexpected steady benchmark")
+
+        def custom_benchmark_fn(
+            fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None
+        ) -> list[float]:
+            self.assertIn("Final verification", desc or "")
+            self.assertEqual(repeat, 500)
+            timings = []
+            for fn in fns:
+                fn()
+                timings.append(9.5 if calls[-1] == "a" else 10.0)
+            return timings
+
+        settings.autotune_benchmark_fn = custom_benchmark_fn
+
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(get_do_bench=lambda: steady_bench)
+        )
+        config_a = helion.Config(num_warps=4)
+        config_b = helion.Config(num_warps=8)
+        member_a = PopulationMember(fn_a, [10.0], (), config_a, status="ok")
+        member_b = PopulationMember(fn_b, [9.0], (), config_b, status="ok")
+        search._benchmarked_members = {
+            config_a: member_a,
+            config_b: member_b,
+        }
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search.population = [member_b]
+
+        with (
+            clean_final_rebenchmark_env(),
+            without_env_var("HELION_CAP_REBENCHMARK_REPEAT"),
+        ):
+            self.assertIs(search.final_rebenchmark_best(member_b), member_a)
+
+    def test_rebenchmark_uses_target_ms_for_isolated_benchmark(self) -> None:
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 0.05
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        reps: list[int] = []
+
+        def benchmark_isolated(
+            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+        ) -> list[float]:
+            reps.append(rep)
+            return [0.05 for _ in fns]
+
+        search.benchmark_provider = SimpleNamespace(
+            benchmark_isolated=benchmark_isolated,
+            mutated_arg_indices=[],
+        )
+        member_a = PopulationMember(lambda: None, [0.05], (), helion.Config())
+        member_b = PopulationMember(lambda: None, [0.06], (), helion.Config())
+
+        search.rebenchmark([member_a, member_b], target_ms=1000.0)
+
+        self.assertEqual(reps, [1000])
+
+    def test_benchmarked_member_history_is_bounded_and_deduped(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search._benchmarked_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+
+        config_a = helion.Config(num_warps=4)
+        config_b = helion.Config(num_warps=8)
+        config_c = helion.Config(num_warps=16)
+        slow_a = PopulationMember(lambda: None, [10.0], (), config_a, status="ok")
+        fast_a = PopulationMember(lambda: None, [8.0], (), config_a, status="ok")
+        member_b = PopulationMember(lambda: None, [9.0], (), config_b, status="ok")
+        member_c = PopulationMember(lambda: None, [7.0], (), config_c, status="ok")
+
+        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
+            search._record_benchmarked_member(slow_a)
+            search._record_benchmarked_member(fast_a)
+            search._record_benchmarked_member(member_b)
+            search._record_benchmarked_member(member_c)
+
+        # A snapshot of the faster member for config_a is retained (deduped).
+        self.assertEqual(search._benchmarked_members[config_a].perfs, fast_a.perfs)
+        self.assertNotIn(config_b, search._benchmarked_members)
+        self.assertEqual(set(search._benchmarked_members), {config_a, config_c})
+
+    def test_pinned_finalist_survives_benchmarked_member_pruning(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search._benchmarked_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+
+        pinned_config = helion.Config(num_warps=4)
+        fast_config = helion.Config(num_warps=8)
+        faster_config = helion.Config(num_warps=16)
+        slow_config = helion.Config(num_warps=32)
+        pinned = PopulationMember(lambda: None, [10.0], (), pinned_config, status="ok")
+        fast = PopulationMember(lambda: None, [8.0], (), fast_config, status="ok")
+        faster = PopulationMember(lambda: None, [7.0], (), faster_config, status="ok")
+        slow = PopulationMember(lambda: None, [9.0], (), slow_config, status="ok")
+        search.pin_finalist_config(pinned_config)
+
+        with clean_final_rebenchmark_env(HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K="2"):
+            search._record_benchmarked_member(pinned)
+            search._record_benchmarked_member(fast)
+            search._record_benchmarked_member(faster)
+            search._record_benchmarked_member(slow)
+
+        # The pinned config survives pruning (kept as a snapshot in the map).
+        self.assertIn(pinned_config, search._pinned_finalist_members)
+        self.assertEqual(
+            search._pinned_finalist_members[pinned_config].perfs, pinned.perfs
+        )
+        self.assertEqual(set(search._benchmarked_members), {fast_config, faster_config})
 
     def test_autotune_configuration_cloning(self) -> None:
         """Tests base_search._clone_args function."""
@@ -2090,16 +3297,23 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
 
+    @skipIfXPU("CUDA specific API used to check memory usage")
     def test_chunked_allclose_memory(self):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
-        import helion.autotuner.benchmark_provider as _bs
+        import helion.autotuner.accuracy as _accuracy
 
         numel = 2**26  # 64M float32 elements (~256 MB each)
 
         config1 = helion.Config(block_sizes=[128], num_warps=4)
         config2 = helion.Config(block_sizes=[256], num_warps=4)
 
-        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        # Pin the accuracy check to the parent so the patched chunked helper
+        # below is observed; the default subprocess path runs it in the worker.
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
+        )
         def vec_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(a)
             for tile in hl.tile(a.size()):
@@ -2120,22 +3334,24 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         naive_peak = torch.cuda.max_memory_allocated() - base_mem
         del ref_a, ref_b
 
-        # Patch _assert_close to record peak memory delta during each call
-        real_assert_close = _bs._assert_close
+        # Patch the moved chunked helper to record peak memory delta per call.
+        real_chunked_assert_close = _accuracy._chunked_assert_close
         peaks: list[int] = []
 
-        def measuring_assert_close(*args, **kwargs):
+        def measuring_chunked_assert_close(*args, **kwargs):
             torch.cuda.reset_peak_memory_stats()
             before = torch.cuda.memory_allocated()
-            real_assert_close(*args, **kwargs)
+            real_chunked_assert_close(*args, **kwargs)
             peak = torch.cuda.max_memory_allocated() - before
             peaks.append(peak)
 
-        with patch.object(_bs, "_assert_close", measuring_assert_close):
+        with patch.object(
+            _accuracy, "_chunked_assert_close", measuring_chunked_assert_close
+        ):
             out = vec_add(a, b)
 
         # Accuracy check was called at least once
-        self.assertGreater(len(peaks), 0, "Expected _assert_close to be called")
+        self.assertGreater(len(peaks), 0, "Expected _chunked_assert_close to be called")
 
         # Every call's peak memory should be less than naive peak
         for i, p in enumerate(peaks):
@@ -2145,7 +3361,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 f"Call {i}: peak {p} should be < 50% of naive {naive_peak}",
             )
 
-        # Kernel result is correct
         torch.testing.assert_close(out, a + b)
 
     def test_autotune_baseline_accuracy_check_fn(self) -> None:
@@ -2283,6 +3498,1513 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
 
 
+@skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
+@skipUnlessCuteAvailable("CUTLASS CuTe Python DSL is not available")
+@onlyBackends(["cute"])
+class TestCuteAutotuner(TestCase):
+    def test_implicit_call_uses_autotuner_fn(self) -> None:
+        calls: list[bool] = []
+
+        def autotuner_fn(bound_kernel, args, **kwargs):
+            class RecordingAutotuner:
+                def autotune(self, *, skip_cache: bool = False):
+                    calls.append(skip_cache)
+                    return bound_kernel.config_spec.default_config()
+
+            return RecordingAutotuner()
+
+        @helion.kernel(
+            backend="cute",
+            autotuner_fn=autotuner_fn,
+            autotune_log_level=0,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8], device=DEVICE),
+            torch.randn([8], device=DEVICE),
+        )
+        torch.testing.assert_close(add(*args), sum(args))
+        self.assertEqual(calls, [False])
+
+    def test_cute_config_generation_repairs_num_threads(self) -> None:
+        @helion.kernel(backend="cute", autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([16, 64], device=DEVICE),
+            torch.randn([16, 64], device=DEVICE),
+        )
+        bound = add.bind(args)
+        gen = ConfigGeneration(bound.config_spec)
+        flat_keys = {
+            key for key, _count, _is_sequence in gen.config_spec.flat_key_layout()
+        }
+        # ``loop_orders`` is exposed for the cute non-tcgen05 search
+        # surface (audited fp32 1024^3 matmul finds ~3x bench-time wins
+        # from ``[[1, 0]]`` over the default ``[[0, 1]]`` — see
+        # ``cute_plan.md`` §7.0). ``cute_vector_widths`` is the per-axis
+        # vec width slot registered for non-reduction tile blocks. The
+        # set still excludes Triton-style knobs that the cute path does
+        # not consume.
+        self.assertEqual(
+            flat_keys,
+            {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+        )
+
+        repaired = gen.unflatten(
+            gen.flatten(helion.Config(block_sizes=[16, 64], num_threads=[128, 128]))
+        )
+        self.assertEqual(repaired.block_sizes, [16, 64])
+        self.assertEqual(repaired.num_threads, [16, 64])
+
+        configs = [gen.random_config() for _ in range(20)]
+        self.assertTrue(any(config.num_threads for config in configs))
+        for config in configs:
+            self.assertLessEqual(
+                set(config.config),
+                {"block_sizes", "num_threads", "loop_orders", "cute_vector_widths"},
+            )
+            self.assertNotIn("persistent", config.pid_type)
+            explicit_threads = [nt for nt in config.num_threads if nt > 0]
+            if explicit_threads:
+                self.assertLessEqual(math.prod(explicit_threads), 1024)
+            for block_size, num_threads in zip(
+                config.block_sizes,
+                config.num_threads,
+                strict=False,
+            ):
+                if num_threads > 0:
+                    self.assertLessEqual(num_threads, block_size)
+                    self.assertEqual(block_size % num_threads, 0)
+        # Deterministic round-trip pins the widened surface: a config
+        # explicitly built with ``loop_orders=[[1, 0]]`` must survive
+        # flatten/unflatten unchanged (otherwise the autotuner cannot
+        # actually explore the alternate order).
+        round_tripped = gen.unflatten(
+            gen.flatten(
+                helion.Config(
+                    block_sizes=[16, 64],
+                    num_threads=[16, 64],
+                    loop_orders=[[1, 0]],
+                )
+            )
+        )
+        self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+
+    def test_cute_tcgen05_search_surface_excludes_loop_orders(self) -> None:
+        """tcgen05 persistent scheduler relies on a fixed
+        ``pid_info[0]=M, pid_info[1]=N`` mapping (``cluster_m`` and
+        virtual-PID logic). Sampling ``loop_orders=[[1, 0]]`` for a
+        tcgen05 config would steer cluster logic onto the wrong axis.
+        The cute non-tcgen05 widening must not leak into the tcgen05
+        branch.
+        """
+        bound = _get_examples_matmul().bind(
+            (
+                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            )
+        )
+        # Confirm we are on the tcgen05 search branch.
+        self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+        flat_keys = {
+            key for key, _count, _is_sequence in bound.config_spec.flat_key_layout()
+        }
+        self.assertNotIn("loop_orders", flat_keys)
+
+    def test_cute_flash_search_surface(self) -> None:
+        """The flash-attention autotune surface (Tasks #25 + #28) appears only
+        when the dense flash dataflow is detected.
+
+        For an attention kernel bind ``cute_flash_search_enabled`` is True and
+        every active flash autotune knob is in ``flat_key_layout()`` -- including
+        the paired exp2 schedule and the fa4-win knobs (``topology``,
+        ``disc_pipe``, ``epi_tma``), with the ``topology`` fragment offering
+        ``fa4`` for the fa4-eligible (even-num_kv) shape; for a non-attention
+        cute kernel (a matmul) the flag is False and none of the flash knobs leak
+        into the search surface.
+        """
+        from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CGA2_LOCAL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_PDL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CLC_STAGES_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
+        from helion._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_CORR_TILE_SIZE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_DISC_PIPE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_FREQ_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET0_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_OFFSET_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_RES_KEY
+        from helion._compiler.cute.cute_flash import FLASH_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_GMEM_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_STG_STORE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EPI_TMA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_EXP2_IMPL_KEY
+        from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
+        from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
+        from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_OTHER_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_P_STORE_REP_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
+        from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
+        from helion._compiler.cute.cute_flash import FLASH_RESCALE_CHUNK_COLS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_RESCALE_THRESHOLD_KEY
+        from helion._compiler.cute.cute_flash import FLASH_ROLE_MAP_KEY
+        from helion._compiler.cute.cute_flash import FLASH_S_LOAD_REP_KEY
+        from helion._compiler.cute.cute_flash import FLASH_S_STAGE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SKIP_RESCALE_STATS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SMALL_BIASED_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_DISC_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
+        from helion._compiler.cute.cute_flash import FLASH_SPLIT_P_ARRIVE_KEY
+        from helion._compiler.cute.cute_flash import FLASH_TENSOR_4D_TMA_KEY
+        from helion._compiler.cute.cute_flash import FLASH_TOPOLOGY_KEY
+        from helion._compiler.cute.cute_flash import flash_autotune_fragments
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def flash_attention(q_in, k_in, v_in):
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                    qk = qk - m_ij[:, :, None]
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def flash_attention_with_aux(q_in, k_in, v_in):
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            aux = torch.empty(
+                [q_view.size(0), m_dim], device=q_in.device, dtype=torch.float32
+            )
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                    qk = qk - m_ij[:, :, None]
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                aux[tile_b, tile_m] = torch.zeros_like(l_i)
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size()), aux.view(q_in.size()[:-1])
+
+        @helion.kernel(backend="cute", static_shapes=True)
+        def sparse_flash_attention(q_in, k_in, v_in):
+            m_dim = q_in.size(-2)
+            n_dim = k_in.size(-2)
+            head_dim = hl.specialize(q_in.size(-1))
+            q_view = q_in.reshape([-1, m_dim, head_dim])
+            v_view = v_in.reshape([-1, n_dim, head_dim])
+            k_view = k_in.reshape([-1, n_dim, head_dim])
+            out = torch.empty_like(q_view)
+            qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+            for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+                m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+                l_i = torch.full_like(m_i, 1.0)
+                acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+                qt = q_view[tile_b, tile_m, :]
+                for tile_n in hl.tile(v_view.size(1)):
+                    kt = k_view[tile_b, tile_n, :]
+                    qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+                    delta = tile_m.index[None, :, None] - tile_n.index[None, None, :]
+                    qk = torch.where((delta >= 0) & (delta <= 64), qk, float("-inf"))
+                    m_ij_keepdim = torch.maximum(
+                        m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
+                    )
+                    qk = qk - m_ij_keepdim
+                    m_ij = m_ij_keepdim.squeeze(-1)
+                    p = torch.exp2(qk)
+                    l_ij = torch.sum(p, -1)
+                    alpha = torch.exp2(m_i - m_ij)
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, :, None]
+                    vt = v_view[tile_b, tile_n, :]
+                    acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+                    m_i = m_ij
+                acc = acc / l_i[:, :, None]
+                out[tile_b, tile_m, :] = acc.to(out.dtype)
+            return out.view(q_in.size())
+
+        q, k, v = (
+            torch.randn(2, 8, 256, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        attn_bound = flash_attention.bind((q, k, v))
+        self.assertTrue(attn_bound.config_spec.cute_flash_search_enabled)
+        attn_keys = {
+            key
+            for key, _count, _is_sequence in attn_bound.config_spec.flat_key_layout()
+        }
+        for key in FLASH_AUTOTUNE_CONFIG_KEYS:
+            self.assertIn(key, attn_keys)
+        for legacy_key in (
+            FLASH_EXP2_IMPL_KEY,
+            FLASH_E2E_FREQ_KEY,
+            FLASH_E2E_RES_KEY,
+        ):
+            self.assertNotIn(legacy_key, attn_keys)
+        for generic_key in ("num_threads", "loop_orders", "cute_vector_widths"):
+            self.assertNotIn(generic_key, attn_keys)
+        # The fa4-win knobs are explicitly part of the surface when enabled.
+        for fa4_key in (
+            FLASH_TOPOLOGY_KEY,
+            FLASH_SOFTMAX_DISC_KEY,
+            FLASH_DISC_PIPE_KEY,
+            FLASH_EPI_TMA_KEY,
+            FLASH_EPI_STG_KEY,
+            FLASH_EPI_STG_STORE_KEY,
+            FLASH_EPI_STG_GMEM_KEY,
+            FLASH_CORR_TILE_SIZE_KEY,
+            FLASH_OTHER_REGS_KEY,
+            FLASH_CLC_KEY,
+            FLASH_CLC_HEADS_PER_BATCH_KEY,
+            FLASH_CLC_PDL_KEY,
+            FLASH_CLC_STAGES_KEY,
+            FLASH_LOCAL_TMA_PARTITION_KEY,
+            FLASH_TENSOR_4D_TMA_KEY,
+        ):
+            self.assertIn(fa4_key, attn_keys)
+        # seq=256 -> num_kv=2 (even) is fa4-eligible (seq % 256 == 0), so the
+        # topology fragment must offer fa4 (alongside the ws_overlap default
+        # seed first) so the autotuner can pick the fa4 win for this shape.
+        flash_fragments = attn_bound.config_spec._flat_fields()
+        topology_choices = flash_fragments[FLASH_TOPOLOGY_KEY].choices
+        self.assertEqual(topology_choices[0], "fa4")
+        self.assertIn("fa4", topology_choices)
+        self.assertEqual(
+            flash_fragments[FLASH_SMALL_BIASED_KEY].search_choices, (True,)
+        )
+        small_biased_fragments = flash_autotune_fragments(
+            64,
+            1,
+            small_biased_candidate=True,
+        )
+        self.assertEqual(
+            small_biased_fragments[FLASH_SMALL_BIASED_KEY].search_choices,
+            (True, False),
+        )
+        sparse_bound = sparse_flash_attention.bind((q, k, v))
+        sparse_fragments_from_bound = sparse_bound.config_spec._flat_fields()
+        self.assertEqual(
+            sparse_fragments_from_bound[FLASH_TOPOLOGY_KEY].choices,
+            ("ws_overlap",),
+        )
+        sparse_default_config = sparse_bound.config_spec.default_config().config
+        self.assertEqual(sparse_default_config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertTrue(sparse_default_config[FLASH_PACKED_REDUCE_KEY])
+        sparse_fa4_config = dict(sparse_default_config)
+        sparse_fa4_config[FLASH_TOPOLOGY_KEY] = "fa4"
+        sparse_bound.config_spec.normalize(sparse_fa4_config)
+        self.assertEqual(sparse_fa4_config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        e2e_schedule_choices = flash_fragments[FLASH_E2E_SCHEDULE_KEY].choices
+        self.assertEqual(e2e_schedule_choices[0], "16/4")
+        self.assertEqual(set(e2e_schedule_choices), {"16/4", "8/2", "16/2", "xu"})
+        self.assertEqual(
+            flash_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices, ("inherit",)
+        )
+        e2e_offset_choices = flash_fragments[FLASH_E2E_OFFSET_KEY].choices
+        self.assertEqual(e2e_offset_choices[0], 2)
+        self.assertEqual(set(e2e_offset_choices), set(range(16)))
+        e2e_offset0_choices = flash_fragments[FLASH_E2E_OFFSET0_KEY].choices
+        self.assertEqual(e2e_offset0_choices[0], 0)
+        self.assertEqual(set(e2e_offset0_choices), set(range(16)))
+        # The fa4 levers offer narrow validated search sets.
+        self.assertEqual(flash_fragments[FLASH_DISC_PIPE_KEY].choices[0], 4)
+        self.assertEqual(
+            set(flash_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4}
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_SOFTMAX_DISC_KEY].choices), {False, True}
+        )
+        self.assertEqual(set(flash_fragments[FLASH_EPI_TMA_KEY].choices), {False, True})
+        self.assertEqual(set(flash_fragments[FLASH_EPI_STG_KEY].choices), {False, True})
+        self.assertEqual(
+            set(flash_fragments[FLASH_EPI_STG_STORE_KEY].choices), {"slice", "whole"}
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_EPI_STG_GMEM_KEY].choices), {"stage", "pair"}
+        )
+        self.assertEqual(
+            set(flash_fragments[FLASH_CORR_TILE_SIZE_KEY].choices), {8, 16, 32}
+        )
+        rescale_threshold_choices = flash_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices
+        self.assertEqual(rescale_threshold_choices[0], 8.0)
+        self.assertEqual(
+            set(rescale_threshold_choices), {0.0, 4.0, 8.0, 12.0, 16.0, 32.0}
+        )
+        rescale_chunk_cols_choices = flash_fragments[
+            FLASH_RESCALE_CHUNK_COLS_KEY
+        ].choices
+        self.assertEqual(rescale_chunk_cols_choices[0], 32)
+        self.assertEqual(set(rescale_chunk_cols_choices), {16, 32, 64})
+        self.assertEqual(
+            set(flash_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices),
+            {16, 32},
+        )
+        manual_config = dict(attn_bound.config_spec.default_config().config)
+        manual_config[FLASH_RESCALE_CHUNK_COLS_KEY] = 64
+        attn_bound.config_spec.normalize(manual_config)
+        self.assertEqual(manual_config[FLASH_RESCALE_CHUNK_COLS_KEY], 64)
+        manual_corr_config = dict(attn_bound.config_spec.default_config().config)
+        manual_corr_config[FLASH_CORR_REGS_KEY] = 72
+        attn_bound.config_spec.normalize(manual_corr_config)
+        self.assertEqual(manual_corr_config[FLASH_CORR_REGS_KEY], 72)
+        manual_bad_corr_config = dict(attn_bound.config_spec.default_config().config)
+        manual_bad_corr_config[FLASH_CORR_REGS_KEY] = 96
+        with self.assertRaises(exc.InvalidConfig):
+            attn_bound.config_spec.normalize(manual_bad_corr_config)
+        self.assertEqual(flash_fragments[FLASH_SOFTMAX_REGS_KEY].choices[0], 200)
+        self.assertEqual(
+            set(flash_fragments[FLASH_SOFTMAX_REGS_KEY].choices),
+            {176, 184, 192, 200},
+        )
+        self.assertEqual(flash_fragments[FLASH_CORR_REGS_KEY].choices[0], 64)
+        self.assertEqual(
+            set(flash_fragments[FLASH_CORR_REGS_KEY].choices), {64, 72, 80, 88}
+        )
+        self.assertEqual(set(flash_fragments[FLASH_CORR_REGS_KEY].search_choices), {64})
+        self.assertEqual(flash_fragments[FLASH_OTHER_REGS_KEY].choices[0], 48)
+        self.assertEqual(
+            set(flash_fragments[FLASH_OTHER_REGS_KEY].choices),
+            {32, 40, 48, 56, 64, 80},
+        )
+        self.assertEqual(
+            flash_fragments[FLASH_OTHER_REGS_KEY].search_choices,
+            (48, 32, 40, 56, 64, 80),
+        )
+        with unittest.mock.patch.dict(
+            os.environ, {"HELION_CUTE_FLASH_CORR_REGS": "88"}
+        ):
+            corr88_fragments = flash_autotune_fragments(64, 2)
+        self.assertEqual(corr88_fragments[FLASH_CORR_REGS_KEY].choices[0], 88)
+        self.assertEqual(
+            set(corr88_fragments[FLASH_CORR_REGS_KEY].choices),
+            {64, 72, 80, 88},
+        )
+        self.assertEqual(
+            set(corr88_fragments[FLASH_CORR_REGS_KEY].search_choices),
+            {64, 88},
+        )
+        with unittest.mock.patch.dict(
+            os.environ, {"HELION_CUTE_FLASH_RESCALE_THRESHOLD": "inf"}
+        ):
+            inf_threshold_fragments = flash_autotune_fragments(64, 64)
+        self.assertEqual(
+            inf_threshold_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (8.0,),
+        )
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_E2E_SCHEDULE": "xu",
+                "HELION_CUTE_FLASH_E2E_OFFSET": "5",
+                "HELION_CUTE_FLASH_E2E_OFFSET0": "7",
+                "HELION_CUTE_FLASH_RESCALE_THRESHOLD": "12",
+                "HELION_CUTE_FLASH_RESCALE_CHUNK_COLS": "16",
+                "HELION_CUTE_FLASH_S_STAGE": "1",
+                "HELION_CUTE_FLASH_SOFTMAX_REGS": "192",
+            },
+        ):
+            env_xu_long_fragments = flash_autotune_fragments(64, 64, is_causal=False)
+        self.assertEqual(
+            set(env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
+            {"16/4", "8/2", "16/2", "xu"},
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
+            ("xu", "16/4", "8/2"),
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_E2E_SCHEDULE_KEY].choices[0],
+            "xu",
+        )
+        self.assertEqual(
+            set(env_xu_long_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            tuple(range(16)),
+        )
+        self.assertEqual(
+            set(env_xu_long_fragments[FLASH_E2E_OFFSET0_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            tuple(range(16)),
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (12.0, 8.0),
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
+            (16, 32),
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_S_STAGE_KEY].search_choices,
+            (1, 2),
+        )
+        self.assertEqual(
+            env_xu_long_fragments[FLASH_SOFTMAX_REGS_KEY].choices,
+            (192, 176, 184, 200),
+        )
+        with unittest.mock.patch.dict(
+            os.environ, {"HELION_CUTE_FLASH_TOPOLOGY": "bad"}
+        ):
+            bad_topology_fragments = flash_autotune_fragments(64, 64, is_causal=False)
+        self.assertEqual(
+            bad_topology_fragments[FLASH_TOPOLOGY_KEY].choices,
+            ("ws_overlap", "fa4"),
+        )
+        self.assertIsNone(bad_topology_fragments[FLASH_TOPOLOGY_KEY].search_choices)
+        self.assertEqual(
+            set(bad_topology_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
+            {"16/4", "8/2", "16/2", "xu"},
+        )
+        self.assertIsNone(bad_topology_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices)
+        self.assertEqual(
+            set(bad_topology_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4}
+        )
+        self.assertIsNone(bad_topology_fragments[FLASH_DISC_PIPE_KEY].search_choices)
+        with unittest.mock.patch.dict(
+            os.environ, {"HELION_CUTE_FLASH_TOPOLOGY": "ws_overlap"}
+        ):
+            long_ws_fragments = flash_autotune_fragments(64, 64, is_causal=False)
+        self.assertEqual(
+            set(long_ws_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
+            {"16/4", "8/2", "16/2", "xu"},
+        )
+        self.assertEqual(
+            set(long_ws_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4}
+        )
+        self.assertEqual(
+            set(long_ws_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
+            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+        )
+        self.assertEqual(
+            set(long_ws_fragments[FLASH_PACKED_REDUCE_KEY].choices), {False, True}
+        )
+        self.assertEqual(flash_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].choices, (0,))
+        self.assertEqual(
+            flash_fragments[FLASH_CAUSAL_KV_ORDER_KEY].choices, ("ascending",)
+        )
+        self.assertEqual(flash_fragments[FLASH_ROLE_MAP_KEY].choices, ("helion", "fa4"))
+        self.assertEqual(
+            flash_fragments[FLASH_ROLE_MAP_KEY].search_choices, ("helion",)
+        )
+        causal_fragments = flash_autotune_fragments(64, 64, is_causal=True)
+        self.assertEqual(
+            causal_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].choices,
+            (8, 0, 1, 2, 4, 16, 32, 64),
+        )
+        self.assertEqual(
+            set(causal_fragments[FLASH_CAUSAL_KV_ORDER_KEY].choices),
+            {"ascending", "descending"},
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_TOPOLOGY_KEY].search_choices,
+            ("fa4", "ws_overlap"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_ROLE_MAP_KEY].choices,
+            ("helion", "fa4"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_ROLE_MAP_KEY].search_choices,
+            ("helion", "fa4"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
+            ("8/2", "xu", "16/4"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].choices,
+            ("inherit", "xu", "16/4", "8/2"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].search_choices,
+            ("inherit", "xu", "16/4", "8/2"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            tuple(range(16)),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (1, 0, *range(2, 16)),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 10, 8, 6, 4, 3),
+        )
+        self.assertEqual(
+            set(causal_fragments[FLASH_KV_STAGE_KEY].choices),
+            {2, 3, 4, 6, 8, 10},
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (8.0,),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
+            (16, 32),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_DISC_PIPE_KEY].search_choices,
+            (2, 3, 4),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_SOFTMAX_REGS_KEY].search_choices,
+            (200, 184, 192),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_PACKED_REDUCE_KEY].search_choices,
+            (True,),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].search_choices,
+            (8, 0, 1, 2, 4, 16),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_CAUSAL_KV_ORDER_KEY].search_choices,
+            ("descending", "ascending"),
+        )
+        self.assertEqual(
+            causal_fragments[FLASH_CAUSAL_LOOP_SPLIT_KEY].search_choices,
+            (True, False),
+        )
+        self.assertEqual(
+            set(causal_fragments[FLASH_EPI_TMA_KEY].search_choices), {False, True}
+        )
+        causal_long_fragments = flash_autotune_fragments(64, 512, is_causal=True)
+        self.assertEqual(
+            causal_long_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            (9, *range(9), *range(10, 16)),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (3, 0, 1, 2, *range(4, 16)),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 10, 8, 6, 4, 3),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_DISC_PIPE_KEY].search_choices,
+            (4, 2, 3),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_SOFTMAX_REGS_KEY].search_choices,
+            (184, 192, 200),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_CAUSAL_LPT_SWIZZLE_KEY].search_choices,
+            (1, 0, 2, 4, 8, 16),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_CAUSAL_KV_ORDER_KEY].search_choices,
+            ("descending", "ascending"),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_MASKED_E2E_SCHEDULE_KEY].search_choices,
+            ("16/4", "inherit", "xu", "8/2"),
+        )
+        self.assertEqual(
+            causal_long_fragments[FLASH_ROLE_MAP_KEY].search_choices,
+            ("helion", "fa4"),
+        )
+        causal_very_long_fragments = flash_autotune_fragments(64, 4096, is_causal=True)
+        causal_very_long_search_choices = {
+            FLASH_KV_STAGE_KEY: (2,),
+            FLASH_E2E_SCHEDULE_KEY: ("8/2",),
+            FLASH_MASKED_E2E_SCHEDULE_KEY: ("16/4",),
+            FLASH_TOPOLOGY_KEY: ("fa4",),
+            FLASH_DISC_PIPE_KEY: (4,),
+            FLASH_E2E_OFFSET_KEY: (9,),
+            FLASH_E2E_OFFSET0_KEY: (3,),
+            FLASH_RESCALE_CHUNK_COLS_KEY: (32,),
+            FLASH_SKIP_RESCALE_STATS_KEY: (False,),
+            FLASH_SOFTMAX_REGS_KEY: (184,),
+            FLASH_CAUSAL_LPT_SWIZZLE_KEY: (1,),
+            FLASH_CAUSAL_KV_ORDER_KEY: ("descending",),
+            FLASH_ROLE_MAP_KEY: ("helion",),
+            FLASH_CAUSAL_LOOP_SPLIT_KEY: (True,),
+            FLASH_EPI_TMA_KEY: (False,),
+            FLASH_EPI_STG_KEY: (False,),
+            FLASH_EPI_STG_STORE_KEY: ("slice",),
+            FLASH_EPI_STG_GMEM_KEY: ("stage",),
+        }
+        for key, search_choices in causal_very_long_search_choices.items():
+            self.assertEqual(
+                causal_very_long_fragments[key].search_choices, search_choices
+            )
+        long_dense_fragments = flash_autotune_fragments(64, 64, is_causal=False)
+        self.assertEqual(
+            long_dense_fragments[FLASH_TOPOLOGY_KEY].choices,
+            ("fa4", "ws_overlap"),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_TOPOLOGY_KEY].search_choices,
+            ("fa4", "ws_overlap"),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_ROLE_MAP_KEY].search_choices,
+            ("helion",),
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
+            {"16/4", "8/2", "16/2", "xu"},
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
+            ("8/2", "16/4"),
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            (2, 0, 1, *range(3, 16)),
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_E2E_OFFSET0_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (2, 0, 1, *range(3, 16)),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (8.0,),
+        )
+        very_long_dense_fragments = flash_autotune_fragments(64, 256, is_causal=False)
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_RESCALE_THRESHOLD_KEY].search_choices,
+            (8.0, 32.0, 16.0),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_PERSISTENT_CTAS_PER_SM_KEY].search_choices,
+            (1, 2, 3, 4),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_PERSISTENT_CTAS_PER_SM_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_KV_ORDER_KEY].search_choices,
+            ("ascending", "descending"),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_KV_ORDER_KEY].search_choices,
+            ("descending",),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CORR_TILE_SIZE_KEY].search_choices,
+            (16, 8, 32),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CORR_TILE_SIZE_KEY].search_choices,
+            (8, 16),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_OTHER_REGS_KEY].search_choices,
+            (48, 32, 40, 56, 64, 80),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_OTHER_REGS_KEY].search_choices,
+            (40,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_E2E_SCHEDULE_KEY].search_choices,
+            ("8/2", "16/4"),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SOFTMAX_DISC_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_DISC_PIPE_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SPLIT_P_ARRIVE_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_PRECOMPUTE_QK_DESC_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_P_STORE_REP_KEY].search_choices,
+            (16,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_S_LOAD_REP_KEY].search_choices,
+            (32,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_FIRST_LOAD_ORDER_KEY].search_choices,
+            (0,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
+            (0,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_PDL_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_E2E_OFFSET_KEY].search_choices,
+            (0,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_E2E_OFFSET0_KEY].search_choices,
+            (1,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
+            (8,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SKIP_RESCALE_STATS_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_SOFTMAX_REGS_KEY].search_choices,
+            (200, 192),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_CORR_REGS_KEY].search_choices,
+            (64,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices,
+            (True,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_STG_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_STG_STORE_KEY].search_choices,
+            ("slice",),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_EPI_STG_GMEM_KEY].search_choices,
+            ("stage",),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
+            (False,),
+        )
+        self.assertEqual(
+            very_long_dense_fragments[FLASH_TENSOR_4D_TMA_KEY].search_choices,
+            (False,),
+        )
+        common_very_long_dense_search_choices = {
+            FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
+            FLASH_CORR_TILE_SIZE_KEY: (8, 16),
+            FLASH_SOFTMAX_DISC_KEY: (False,),
+            FLASH_DISC_PIPE_KEY: (1,),
+            FLASH_P_STORE_REP_KEY: (16,),
+            FLASH_S_LOAD_REP_KEY: (32,),
+            FLASH_CLC_KEY: (False,),
+            FLASH_CLC_HEADS_PER_BATCH_KEY: (0,),
+            FLASH_CLC_PDL_KEY: (False,),
+            FLASH_CLC_STAGES_KEY: (1,),
+            FLASH_E2E_OFFSET_KEY: (0,),
+            FLASH_RESCALE_CHUNK_COLS_KEY: (8,),
+            FLASH_SKIP_RESCALE_STATS_KEY: (False,),
+            FLASH_SOFTMAX_REGS_KEY: (200, 192),
+            FLASH_EPI_STG_KEY: (False,),
+            FLASH_EPI_STG_STORE_KEY: ("slice",),
+            FLASH_EPI_STG_GMEM_KEY: ("stage",),
+        }
+        very_long_dense_search_choices_by_num_kv = {
+            256: {
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_OTHER_REGS_KEY: (40,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (1,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_CORR_REGS_KEY: (64,),
+                FLASH_EPI_TMA_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+            },
+            384: {
+                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_OTHER_REGS_KEY: (32,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (3,),
+                FLASH_KV_ORDER_KEY: ("ascending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_EPI_TMA_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+            },
+            512: {
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_OTHER_REGS_KEY: (32,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("8/2", "16/4"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (0,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_EPI_TMA_KEY: (False,),
+                FLASH_EPI_STG_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+            },
+            1024: {
+                FLASH_RESCALE_THRESHOLD_KEY: (8.0, 32.0, 16.0),
+                FLASH_OTHER_REGS_KEY: (40,),
+                FLASH_FIRST_LOAD_ORDER_KEY: (0,),
+                FLASH_E2E_SCHEDULE_KEY: ("16/4", "8/2"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False,),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (0,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+                FLASH_PERSISTENT_CTAS_PER_SM_KEY: (1,),
+                FLASH_CORR_REGS_KEY: (72,),
+                FLASH_EPI_TMA_KEY: (True,),
+                FLASH_EPI_STG_KEY: (False,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (2, 3),
+                FLASH_CLC_KEY: (True,),
+                FLASH_CLC_HEADS_PER_BATCH_KEY: (32,),
+            },
+            2048: {
+                FLASH_RESCALE_THRESHOLD_KEY: (32.0, 16.0, 8.0),
+                FLASH_CORR_TILE_SIZE_KEY: (8, 16),
+                FLASH_SOFTMAX_REGS_KEY: (192, 200),
+                FLASH_ROLE_MAP_KEY: ("helion", "fa4"),
+                FLASH_OTHER_REGS_KEY: (32,),
+                FLASH_KV_ORDER_KEY: ("descending",),
+                FLASH_FIRST_LOAD_ORDER_KEY: (4,),
+                FLASH_E2E_SCHEDULE_KEY: ("16/4", "8/2"),
+                FLASH_SPLIT_P_ARRIVE_KEY: (False, True),
+                FLASH_PRECOMPUTE_QK_DESC_KEY: (False,),
+                FLASH_E2E_OFFSET0_KEY: (0,),
+                FLASH_CORR_REGS_KEY: (80,),
+                FLASH_EPI_TMA_KEY: (False,),
+                FLASH_EPI_STG_KEY: (True,),
+                FLASH_LOCAL_TMA_PARTITION_KEY: (False,),
+                FLASH_TENSOR_4D_TMA_KEY: (False,),
+                FLASH_KV_STAGE_KEY: (3, 2),
+                FLASH_CGA2_LOCAL_KEY: (False,),
+            },
+        }
+        for num_kv, expected in very_long_dense_search_choices_by_num_kv.items():
+            with self.subTest(num_kv=num_kv):
+                fragments = flash_autotune_fragments(64, num_kv, is_causal=False)
+                for key, search_choices in {
+                    **common_very_long_dense_search_choices,
+                    **expected,
+                }.items():
+                    self.assertEqual(fragments[key].search_choices, search_choices)
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_CLC": "1",
+                "HELION_CUTE_FLASH_CLC_HEADS": "128",
+            },
+        ):
+            clc_override_fragments = flash_autotune_fragments(64, 256, is_causal=False)
+        self.assertEqual(
+            clc_override_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
+            (128,),
+        )
+        self.assertIn(
+            128,
+            clc_override_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].choices,
+        )
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_EPI_STG": "1",
+                "HELION_CUTE_FLASH_EPI_TMA": "0",
+            },
+        ):
+            epi_stg_override_fragments = flash_autotune_fragments(
+                64, 2048, is_causal=False
+            )
+        self.assertEqual(
+            epi_stg_override_fragments[FLASH_EPI_STG_KEY].search_choices,
+            (True,),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_RESCALE_CHUNK_COLS_KEY].search_choices,
+            (16, 32),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_DISC_PIPE_KEY].search_choices, (3, 2, 4)
+        )
+        self.assertEqual(long_dense_fragments[FLASH_S_STAGE_KEY].search_choices, (2,))
+        self.assertEqual(
+            long_dense_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 3, 4, 6, 8),
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_KV_STAGE_KEY].choices),
+            {2, 3, 4, 6, 8, 10},
+        )
+        self.assertLess(
+            len(long_dense_fragments[FLASH_KV_STAGE_KEY].search_choices),
+            len(long_dense_fragments[FLASH_KV_STAGE_KEY].choices),
+        )
+        with unittest.mock.patch.dict(os.environ, {"HELION_CUTE_FLASH_KV_STAGE": "6"}):
+            long_dense_kv6_fragments = flash_autotune_fragments(64, 64, is_causal=False)
+        self.assertEqual(long_dense_kv6_fragments[FLASH_KV_STAGE_KEY].choices[0], 6)
+        self.assertEqual(
+            long_dense_kv6_fragments[FLASH_KV_STAGE_KEY].search_choices,
+            (2, 3, 4, 6, 8),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_EPI_TMA_KEY].search_choices, (True, False)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_EPI_STG_KEY].search_choices, (False, True)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_SOFTMAX_DISC_KEY].search_choices, (True, False)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_PERSISTENT_KEY].search_choices, (True,)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_P_STORE_REP_KEY].search_choices, (16, 32)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_S_LOAD_REP_KEY].search_choices, (32, 16)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_PRECOMPUTE_QK_DESC_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_FIRST_LOAD_ORDER_KEY].search_choices,
+            (0, 1, 2, 3, 4),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_SKIP_RESCALE_STATS_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_KEY].search_choices, (False, True)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_HEADS_PER_BATCH_KEY].search_choices,
+            (0, 32, 16, 64),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_PDL_KEY].search_choices, (False, True)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CLC_STAGES_KEY].search_choices, (1, 2, 3)
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_LOCAL_TMA_PARTITION_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_TENSOR_4D_TMA_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_PACKED_REDUCE_KEY].search_choices, (True,)
+        )
+        sparse_fragments = flash_autotune_fragments(
+            64,
+            2,
+            has_kv_tile_pruning=True,
+            requires_ws_overlap=True,
+        )
+        self.assertEqual(sparse_fragments[FLASH_PACKED_REDUCE_KEY].choices[0], True)
+        self.assertEqual(sparse_fragments[FLASH_TOPOLOGY_KEY].choices, ("ws_overlap",))
+        with unittest.mock.patch.dict(
+            os.environ, {"HELION_CUTE_FLASH_PACKED_REDUCE": "0"}
+        ):
+            packed_reduce_off_fragments = flash_autotune_fragments(
+                64, 64, is_causal=False
+            )
+        self.assertEqual(
+            packed_reduce_off_fragments[FLASH_PACKED_REDUCE_KEY].search_choices,
+            (False, True),
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_CORR_REGS_KEY].choices),
+            {64, 72, 80, 88},
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_CORR_REGS_KEY].search_choices, (64,)
+        )
+        self.assertEqual(
+            set(long_dense_fragments[FLASH_OTHER_REGS_KEY].choices),
+            {32, 40, 48, 56, 64, 80},
+        )
+        self.assertEqual(
+            long_dense_fragments[FLASH_TOPOLOGY_KEY].differential_mutation(
+                "ws_overlap", "fa4", "fa4"
+            ),
+            "ws_overlap",
+        )
+        random_config = attn_bound.config_spec.flat_config(
+            lambda fragment: fragment.random()
+        )
+        self.assertEqual(random_config.config["block_sizes"], [1, 128, 128])
+
+        aux_bound = flash_attention_with_aux.bind((q, k, v))
+        self.assertFalse(aux_bound.config_spec.cute_flash_search_enabled)
+        aux_keys = {
+            key for key, _count, _is_sequence in aux_bound.config_spec.flat_key_layout()
+        }
+        self.assertIn("num_threads", aux_keys)
+        for key in FLASH_CONFIG_KEYS:
+            self.assertNotIn(key, aux_keys)
+
+        q_odd, k_odd, v_odd = (
+            torch.randn(2, 8, 384, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        odd_bound = flash_attention.bind((q_odd, k_odd, v_odd))
+        odd_fragments = odd_bound.config_spec._flat_fields()
+        # Odd-KV shapes keep stale fa4-only values in the enum surface for
+        # best-config cache transfer, but resolve_flash_config() clamps them back
+        # to ws_overlap/no-op values before codegen.
+        self.assertEqual(
+            odd_fragments[FLASH_TOPOLOGY_KEY].choices, ("ws_overlap", "fa4")
+        )
+        self.assertEqual(set(odd_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4})
+        self.assertEqual(
+            set(odd_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            set(odd_fragments[FLASH_E2E_OFFSET0_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            set(odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
+            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+        )
+        long_odd_fragments = flash_autotune_fragments(64, 65, is_causal=False)
+        self.assertEqual(
+            set(long_odd_fragments[FLASH_E2E_SCHEDULE_KEY].choices),
+            {"16/4", "8/2", "16/2", "xu"},
+        )
+        self.assertEqual(
+            set(long_odd_fragments[FLASH_E2E_OFFSET_KEY].choices), set(range(16))
+        )
+        self.assertEqual(
+            set(long_odd_fragments[FLASH_DISC_PIPE_KEY].choices), {1, 2, 3, 4}
+        )
+        self.assertEqual(
+            set(long_odd_fragments[FLASH_RESCALE_THRESHOLD_KEY].choices),
+            {0.0, 4.0, 8.0, 12.0, 16.0, 32.0},
+        )
+        valid_wide_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="16/4",
+            cute_flash_e2e_offset=13,
+        )
+        odd_bound.config_spec.normalize(valid_wide_offset)
+        long_q, long_k, long_v = (
+            torch.empty(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+            for _ in range(3)
+        )
+        long_bound = flash_attention.bind((long_q, long_k, long_v))
+        long_gen = ConfigGeneration(long_bound.config_spec)
+        long_manual_xu = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+        )
+        long_bound.config_spec.normalize(long_manual_xu)
+        self.assertEqual(long_manual_xu.config[FLASH_E2E_SCHEDULE_KEY], "xu")
+        self.assertEqual(long_manual_xu.config[FLASH_E2E_OFFSET_KEY], 0)
+        long_manual_ws = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="ws_overlap",
+        )
+        long_bound.config_spec.normalize(long_manual_ws)
+        self.assertEqual(long_manual_ws.config[FLASH_TOPOLOGY_KEY], "ws_overlap")
+        self.assertEqual(long_manual_ws.config[FLASH_E2E_SCHEDULE_KEY], "8/2")
+        self.assertEqual(long_manual_ws.config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(long_manual_ws.config[FLASH_DISC_PIPE_KEY], 1)
+        self.assertFalse(long_manual_ws.config[FLASH_PACKED_REDUCE_KEY])
+        long_manual_bad_topology = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="bad",
+        )
+        long_bound.config_spec.normalize(long_manual_bad_topology, _fix_invalid=True)
+        self.assertEqual(long_manual_bad_topology.config[FLASH_TOPOLOGY_KEY], "fa4")
+        self.assertEqual(
+            long_manual_bad_topology.config[FLASH_E2E_SCHEDULE_KEY],
+            "8/2",
+        )
+        self.assertEqual(long_manual_bad_topology.config[FLASH_DISC_PIPE_KEY], 3)
+        self.assertTrue(long_manual_bad_topology.config[FLASH_PACKED_REDUCE_KEY])
+        long_manual_threshold = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_rescale_threshold=12.0,
+        )
+        long_bound.config_spec.normalize(long_manual_threshold)
+        self.assertEqual(
+            long_manual_threshold.config[FLASH_RESCALE_THRESHOLD_KEY],
+            12.0,
+        )
+        long_manual_corr = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_corr_regs=72,
+        )
+        long_bound.config_spec.normalize(long_manual_corr)
+        self.assertEqual(long_manual_corr.config[FLASH_CORR_REGS_KEY], 72)
+        long_manual_inf_threshold = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_rescale_threshold=math.inf,
+        )
+        with self.assertRaises(exc.InvalidConfig):
+            long_bound.config_spec.normalize(long_manual_inf_threshold)
+        long_manual_structural = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_s_stage=1,
+            cute_flash_kv_stage=3,
+            cute_flash_disc_pipe=2,
+            cute_flash_epi_tma=True,
+            cute_flash_persistent=False,
+            cute_flash_packed_reduce=False,
+        )
+        long_bound.config_spec.normalize(long_manual_structural)
+        self.assertEqual(long_manual_structural.config[FLASH_S_STAGE_KEY], 1)
+        self.assertEqual(long_manual_structural.config[FLASH_KV_STAGE_KEY], 3)
+        self.assertEqual(long_manual_structural.config[FLASH_DISC_PIPE_KEY], 2)
+        self.assertTrue(long_manual_structural.config[FLASH_EPI_TMA_KEY])
+        self.assertFalse(long_manual_structural.config[FLASH_PERSISTENT_KEY])
+        self.assertFalse(long_manual_structural.config[FLASH_PACKED_REDUCE_KEY])
+        for config in (
+            long_manual_xu,
+            long_manual_ws,
+            long_manual_threshold,
+            long_manual_corr,
+            long_manual_structural,
+        ):
+            flat = long_gen.flatten(config)
+            long_gen.encode_config(flat)
+            expected_config = dict(config.config)
+            expected_config.pop("cute_vector_widths", None)
+            self.assertEqual(long_gen.unflatten(flat).config, expected_config)
+        for _ in range(20):
+            random_long = long_gen.random_config().config
+            self.assertIn(
+                random_long[FLASH_E2E_SCHEDULE_KEY],
+                {"16/4", "8/2"},
+            )
+            self.assertEqual(random_long[FLASH_MASKED_E2E_SCHEDULE_KEY], "inherit")
+            self.assertIn(random_long[FLASH_E2E_OFFSET_KEY], set(range(16)))
+            self.assertIn(random_long[FLASH_E2E_OFFSET0_KEY], set(range(16)))
+            self.assertIn(random_long[FLASH_TOPOLOGY_KEY], {"fa4", "ws_overlap"})
+            self.assertIn(random_long[FLASH_SOFTMAX_DISC_KEY], {False, True})
+            self.assertIn(random_long[FLASH_DISC_PIPE_KEY], {2, 3, 4})
+            self.assertIn(random_long[FLASH_EPI_TMA_KEY], {False, True})
+            self.assertIn(random_long[FLASH_EPI_STG_KEY], {False, True})
+            self.assertIn(random_long[FLASH_EPI_STG_STORE_KEY], {"slice", "whole"})
+            self.assertIn(random_long[FLASH_EPI_STG_GMEM_KEY], {"stage", "pair"})
+            self.assertEqual(random_long[FLASH_RESCALE_THRESHOLD_KEY], 8.0)
+            self.assertIn(random_long[FLASH_RESCALE_CHUNK_COLS_KEY], {16, 32})
+            self.assertEqual(random_long[FLASH_S_STAGE_KEY], 2)
+            self.assertIn(random_long[FLASH_KV_STAGE_KEY], {2, 3, 4, 6, 8})
+            self.assertTrue(random_long[FLASH_PERSISTENT_KEY])
+            self.assertIn(random_long[FLASH_PERSISTENT_CTAS_PER_SM_KEY], {1, 2, 3, 4})
+            self.assertIn(random_long[FLASH_P_STORE_REP_KEY], {16, 32})
+            self.assertIn(random_long[FLASH_S_LOAD_REP_KEY], {16, 32})
+            self.assertIn(random_long[FLASH_PRECOMPUTE_QK_DESC_KEY], {False, True})
+            self.assertIn(random_long[FLASH_FIRST_LOAD_ORDER_KEY], {0, 1, 2, 3, 4})
+            self.assertIn(random_long[FLASH_KV_ORDER_KEY], {"ascending", "descending"})
+            self.assertIn(random_long[FLASH_SKIP_RESCALE_STATS_KEY], {False, True})
+            self.assertIn(random_long[FLASH_OTHER_REGS_KEY], {32, 40, 48, 56, 64, 80})
+            self.assertIn(random_long[FLASH_CORR_TILE_SIZE_KEY], {8, 16, 32})
+            self.assertIn(random_long[FLASH_CLC_KEY], {False, True})
+            self.assertIn(random_long[FLASH_CLC_PDL_KEY], {False, True})
+            self.assertIn(random_long[FLASH_CLC_STAGES_KEY], {1, 2, 3})
+            self.assertIn(random_long[FLASH_LOCAL_TMA_PARTITION_KEY], {False, True})
+            self.assertIn(random_long[FLASH_TENSOR_4D_TMA_KEY], {False, True})
+            self.assertIn(
+                random_long[FLASH_CLC_HEADS_PER_BATCH_KEY],
+                {0, 1, 2, 4, 8, 16, 32, 64},
+            )
+            self.assertTrue(random_long[FLASH_PACKED_REDUCE_KEY])
+        odd_fa4_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_topology="fa4",
+            cute_flash_e2e_schedule="16/4",
+        )
+        odd_bound.config_spec.normalize(odd_fa4_without_offset)
+        self.assertEqual(odd_fa4_without_offset.config[FLASH_E2E_OFFSET_KEY], 0)
+        invalid_narrow_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_e2e_offset=13,
+        )
+        with self.assertRaises(exc.InvalidConfig):
+            odd_bound.config_spec.normalize(invalid_narrow_offset)
+        with patch.dict(os.environ, {"HELION_CUTE_FLASH_E2E_SCHEDULE": "xu"}):
+            xu_default_fragments = flash_autotune_fragments(64, 2, is_causal=False)
+        self.assertEqual(
+            set(xu_default_fragments[FLASH_E2E_OFFSET_KEY].choices),
+            set(range(16)),
+        )
+        xu_config_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+        )
+        attn_bound.config_spec.normalize(xu_config_without_offset)
+        self.assertEqual(xu_config_without_offset.config[FLASH_E2E_OFFSET_KEY], 0)
+        self.assertEqual(xu_config_without_offset.config[FLASH_E2E_OFFSET0_KEY], 0)
+        split_config_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="16/4",
+        )
+        attn_bound.config_spec.normalize(split_config_without_offset)
+        self.assertEqual(split_config_without_offset.config[FLASH_E2E_OFFSET_KEY], 2)
+        self.assertEqual(split_config_without_offset.config[FLASH_E2E_OFFSET0_KEY], 0)
+        env_offset_config_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="16/4",
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "HELION_CUTE_FLASH_E2E_OFFSET": "5",
+                "HELION_CUTE_FLASH_E2E_OFFSET0": "3",
+            },
+        ):
+            attn_bound.config_spec.normalize(env_offset_config_without_offset)
+        self.assertEqual(
+            env_offset_config_without_offset.config[FLASH_E2E_OFFSET_KEY], 5
+        )
+        self.assertEqual(
+            env_offset_config_without_offset.config[FLASH_E2E_OFFSET0_KEY], 3
+        )
+        split8_config_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+        )
+        attn_bound.config_spec.normalize(split8_config_without_offset)
+        self.assertEqual(split8_config_without_offset.config[FLASH_E2E_OFFSET_KEY], 1)
+        split8_config_bad_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_e2e_offset=99,
+            cute_flash_e2e_offset0=99,
+        )
+        attn_bound.config_spec.normalize(split8_config_bad_offset, _fix_invalid=True)
+        self.assertEqual(split8_config_bad_offset.config[FLASH_E2E_OFFSET_KEY], 3)
+        self.assertEqual(split8_config_bad_offset.config[FLASH_E2E_OFFSET0_KEY], 3)
+        legacy_split_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+            cute_flash_exp2_impl="split",
+            cute_flash_e2e_freq=16,
+            cute_flash_e2e_res=4,
+            cute_flash_e2e_offset=2,
+        )
+        attn_bound.config_spec.normalize(legacy_split_config)
+        self.assertEqual(legacy_split_config.config[FLASH_E2E_OFFSET_KEY], 2)
+        legacy_split_without_freq_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+            cute_flash_exp2_impl="split",
+        )
+        attn_bound.config_spec.normalize(legacy_split_without_freq_config)
+        self.assertEqual(
+            legacy_split_without_freq_config.config[FLASH_E2E_OFFSET_KEY], 2
+        )
+        legacy_split_without_freq_explicit_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+            cute_flash_exp2_impl="split",
+            cute_flash_e2e_offset=2,
+        )
+        attn_bound.config_spec.normalize(legacy_split_without_freq_explicit_offset)
+        self.assertEqual(
+            legacy_split_without_freq_explicit_offset.config[FLASH_E2E_OFFSET_KEY],
+            2,
+        )
+        legacy_wide_freq_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_e2e_freq=32,
+            cute_flash_e2e_res=4,
+            cute_flash_e2e_offset=31,
+            cute_flash_e2e_offset0=31,
+        )
+        attn_bound.config_spec.normalize(legacy_wide_freq_config)
+        self.assertEqual(legacy_wide_freq_config.config[FLASH_E2E_OFFSET_KEY], 31)
+        self.assertEqual(legacy_wide_freq_config.config[FLASH_E2E_OFFSET0_KEY], 31)
+        legacy_wide_freq_fix_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_e2e_freq=32,
+            cute_flash_e2e_res=4,
+            cute_flash_e2e_offset=31,
+        )
+        attn_bound.config_spec.normalize(legacy_wide_freq_fix_config, _fix_invalid=True)
+        self.assertEqual(legacy_wide_freq_fix_config.config[FLASH_E2E_OFFSET_KEY], 31)
+        negative_offset_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="16/4",
+            cute_flash_e2e_offset=-1,
+            cute_flash_e2e_offset0=-1,
+        )
+        with self.assertRaises(exc.InvalidConfig):
+            attn_bound.config_spec.normalize(negative_offset_config)
+        negative_offset_fix_config = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="16/4",
+            cute_flash_e2e_offset=-1,
+        )
+        attn_bound.config_spec.normalize(negative_offset_fix_config, _fix_invalid=True)
+        self.assertEqual(negative_offset_fix_config.config[FLASH_E2E_OFFSET_KEY], 2)
+        split16_2_config_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="16/2",
+        )
+        attn_bound.config_spec.normalize(split16_2_config_without_offset)
+        self.assertEqual(
+            split16_2_config_without_offset.config[FLASH_E2E_OFFSET_KEY], 2
+        )
+        causal_8192_bound = flash_attention.bind(
+            tuple(
+                torch.randn(1, 1, 8192, 64, dtype=torch.float16, device=DEVICE)
+                for _ in range(3)
+            )
+        )
+        causal_8192_bound.config_spec._cute_flash_is_causal = True
+        causal_8_2_without_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+        )
+        causal_8192_bound.config_spec.normalize(causal_8_2_without_offset)
+        self.assertEqual(causal_8_2_without_offset.config[FLASH_E2E_OFFSET_KEY], 0)
+        causal_masked_split_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="xu",
+            cute_flash_masked_e2e_schedule="16/4",
+            cute_flash_e2e_offset=15,
+            cute_flash_e2e_offset0=14,
+        )
+        causal_8192_bound.config_spec.normalize(causal_masked_split_offset)
+        self.assertEqual(causal_masked_split_offset.config[FLASH_E2E_OFFSET_KEY], 15)
+        self.assertEqual(causal_masked_split_offset.config[FLASH_E2E_OFFSET0_KEY], 14)
+        causal_main8_masked16_offset = helion.Config(
+            block_sizes=[1, 128, 128],
+            cute_flash_e2e_schedule="8/2",
+            cute_flash_masked_e2e_schedule="16/4",
+            cute_flash_e2e_offset=15,
+        )
+        causal_8192_bound.config_spec.normalize(causal_main8_masked16_offset)
+        self.assertEqual(causal_main8_masked16_offset.config[FLASH_E2E_OFFSET_KEY], 15)
+
+        # A plain matmul is not an attention kernel: the flash surface must
+        # stay off and none of its knobs may appear.
+        mm_bound = _get_examples_matmul().bind(
+            (
+                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+                torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
+            )
+        )
+        self.assertFalse(mm_bound.config_spec.cute_flash_search_enabled)
+        mm_keys = {
+            key for key, _count, _is_sequence in mm_bound.config_spec.flat_key_layout()
+        }
+        for key in FLASH_CONFIG_KEYS:
+            self.assertNotIn(key, mm_keys)
+
+
 @onlyBackends(["triton"])
 class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
     def _autotune_and_record(self, **settings: object) -> float:
@@ -2356,7 +5078,400 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(first, second)
 
 
+class TestAutotuneBestOfKSettings(TestCase):
+    """Settings-only coverage for ``autotune_best_of_k`` (no GPU/backend
+    dependency)."""
+
+    def test_default_is_one(self) -> None:
+        with without_env_var("HELION_AUTOTUNE_BEST_OF_K"):
+            self.assertEqual(helion.Settings().autotune_best_of_k, 1)
+
+    def test_env_var_override(self) -> None:
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_BEST_OF_K": "5"}, clear=False):
+            self.assertEqual(helion.Settings().autotune_best_of_k, 5)
+
+    def test_setting_override(self) -> None:
+        self.assertEqual(helion.Settings(autotune_best_of_k=3).autotune_best_of_k, 3)
+
+    def test_k_zero_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"autotune_best_of_k must be >= 1"):
+            helion.Settings(autotune_best_of_k=0)
+
+    def test_k_negative_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"autotune_best_of_k must be >= 1"):
+            helion.Settings(autotune_best_of_k=-3)
+
+
 @onlyBackends(["triton"])
+class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
+    """Best-of-K multi-seed autotune selection — cache key + K-loop coverage.
+
+    Covers:
+      - K = 1 leaves the cache hash byte-identical with the pre-feature
+        repr (no field appended to the dataclass repr).
+      - K > 1 differentiates the cache hash structurally; the K value
+        appears as a field on the key dataclass, not concatenated into
+        ``extra_cache_key``.
+      - K > 1 with no ``_autotuner_factory`` wired raises a clear error.
+      - The K-loop runs K trials with deterministic per-trial seeds,
+        and the winner is picked by the **final rebench** (not the
+        per-trial ``best_perf_so_far`` low-water mark).
+      - The autotuner reference on the cache is restored to the
+        original after the loop.
+    """
+
+    def test_cache_key_byte_identical_when_k_is_one(self) -> None:
+        """K=1 cache hash must match the bytes produced by the original
+        ``LooseAutotuneCacheKey`` repr (before ``best_of_k`` was added)."""
+        from helion.autotuner.base_cache import LooseAutotuneCacheKey
+
+        # Build a key with K=1 and one with K=5; the K=1 repr must equal
+        # the repr that omits ``best_of_k`` entirely.
+        common_kwargs = {
+            "specialization_key": (),
+            "extra_results": (),
+            "kernel_source_hash": "abc",
+            "hardware": "B200",
+            "runtime_name": "12.6",
+            "backend": "triton",
+            "config_spec_hash": "h1",
+            "extra_cache_key": "",
+        }
+        k1 = LooseAutotuneCacheKey(**common_kwargs, best_of_k=1)
+        k5 = LooseAutotuneCacheKey(**common_kwargs, best_of_k=5)
+        # K=1 repr matches a manually-constructed repr without best_of_k.
+        expected_k1_repr = (
+            "LooseAutotuneCacheKey("
+            "specialization_key=(), extra_results=(), "
+            "kernel_source_hash='abc', hardware='B200', "
+            "runtime_name='12.6', backend='triton', "
+            "config_spec_hash='h1', extra_cache_key='')"
+        )
+        self.assertEqual(repr(k1), expected_k1_repr)
+        # K=5 includes the field in the repr.
+        self.assertIn("best_of_k=5", repr(k5))
+        # Hashes differ structurally.
+        self.assertNotEqual(k1.stable_hash(), k5.stable_hash())
+
+    def test_cache_key_does_not_alias_extra_cache_key(self) -> None:
+        """A K=1 key with ``extra_cache_key`` carrying a literal
+        ``;best_of_k=5`` suffix must NOT collide with a K=5 key whose
+        ``extra_cache_key`` is empty — i.e. the K must be a structural
+        field, not folded into the string."""
+        from helion.autotuner.base_cache import LooseAutotuneCacheKey
+
+        k1_aliased = LooseAutotuneCacheKey(
+            specialization_key=(),
+            extra_results=(),
+            kernel_source_hash="abc",
+            hardware="B200",
+            runtime_name="12.6",
+            backend="triton",
+            config_spec_hash="h1",
+            extra_cache_key="foo;best_of_k=5",
+            best_of_k=1,
+        )
+        k5 = LooseAutotuneCacheKey(
+            specialization_key=(),
+            extra_results=(),
+            kernel_source_hash="abc",
+            hardware="B200",
+            runtime_name="12.6",
+            backend="triton",
+            config_spec_hash="h1",
+            extra_cache_key="foo",
+            best_of_k=5,
+        )
+        self.assertNotEqual(k1_aliased.stable_hash(), k5.stable_hash())
+
+    def test_best_of_k_gt_1_without_factory_raises(self) -> None:
+        """The bare ``Cache(autotuner)`` constructor must reject K>1 at
+        run time rather than silently fall back to single-trial."""
+        from helion.autotuner.local_cache import LocalAutotuneCache
+
+        @helion.kernel(autotune_best_of_k=3, autotune_log_level=0)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+
+        # Build a cache with NO autotuner_factory wired; this models the
+        # external ``Cache(autotuner)`` constructor path.
+        class _MinimalSearch:
+            def __init__(self):
+                self.kernel = bound
+                self.settings = bound.settings
+                self.args = args
+                self.best_perf_so_far = math.inf
+                self._skip_cache = False
+
+                class _Log:
+                    def __call__(self, *a, **kw):
+                        pass
+
+                    def reset(self):
+                        pass
+
+                    def warning(self, *a, **kw):
+                        pass
+
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                return None  # never reached: K>1 must raise before this
+
+        cache = LocalAutotuneCache(_MinimalSearch())  # no autotuner_factory
+        with (
+            patch("helion.autotuner.base_cache.should_skip_cache", return_value=True),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"autotune_best_of_k > 1 requires a registered _autotuner_factory",
+            ),
+        ):
+            cache.autotune()
+
+    def test_k_loop_runs_k_trials_with_deterministic_seeds(self) -> None:
+        """The K-loop runs K trials with seeds ``base + i``."""
+        from helion.autotuner.local_cache import LocalAutotuneCache
+        from helion.runtime.config import Config
+
+        seeds_seen: list[int] = []
+        # ``block_sizes`` must be powers of two; pick four distinct values.
+        trial_configs = [Config(block_sizes=[16, 1 << (3 + i)]) for i in range(4)]
+        # Low-water perfs (per-trial best_perf_so_far) and rebench perfs
+        # disagree on the winner: low-water best is index 2, rebench
+        # best is index 3.
+        low_water_perfs = [3.0, 5.0, 1.0, 2.0]
+        rebench_perfs = [3.0, 5.0, 8.0, 2.0]
+        trial_idx = {"n": 0}
+
+        class MockTrialSearch:
+            def __init__(self, bound_kernel, args, **kwargs):
+                self.kernel = bound_kernel
+                self.settings = bound_kernel.settings
+                self.args = args
+                self.best_perf_so_far = math.inf
+                self._skip_cache = False
+
+                class _Log:
+                    def __call__(self, *a, **kw):
+                        pass
+
+                    def reset(self):
+                        pass
+
+                    def warning(self, *a, **kw):
+                        pass
+
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                i = trial_idx["n"]
+                seeds_seen.append(self.settings.autotune_random_seed)
+                self.best_perf_so_far = low_water_perfs[i]
+                cfg = trial_configs[i]
+                trial_idx["n"] += 1
+                return cfg
+
+        def mock_autotuner_fn(bound_kernel, args, **kwargs):
+            def factory():
+                return MockTrialSearch(bound_kernel, args, **kwargs)
+
+            return LocalAutotuneCache(factory(), autotuner_factory=factory)
+
+        @helion.kernel(
+            autotuner_fn=mock_autotuner_fn,
+            autotune_best_of_k=4,
+            autotune_random_seed=100,
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+
+        # Patch the final-rebench step so we can return the desired perfs
+        # without needing a real benchmark_provider.
+        with (
+            patch("helion.autotuner.base_cache.should_skip_cache", return_value=True),
+            patch.object(
+                LocalAutotuneCache,
+                "_rebench_trial_configs",
+                lambda self, configs: rebench_perfs,
+            ),
+        ):
+            picked = bound.autotune(args)
+
+        # K trials ran.
+        self.assertEqual(trial_idx["n"], 4)
+        # Deterministic seeds: base + i.
+        self.assertEqual(seeds_seen, [100, 101, 102, 103])
+        # Winner is picked by REBENCH (index 3), not by low-water (index 2).
+        rebench_winner = rebench_perfs.index(min(rebench_perfs))
+        low_water_winner = low_water_perfs.index(min(low_water_perfs))
+        self.assertNotEqual(rebench_winner, low_water_winner)
+        self.assertEqual(picked, trial_configs[rebench_winner])
+
+    def test_k_loop_restores_autotuner_and_settings(self) -> None:
+        """After the K-loop, ``cache.autotuner`` must equal the original
+        instance, and the mutated settings must be restored to base."""
+        from helion.autotuner.local_cache import LocalAutotuneCache
+        from helion.runtime.config import Config
+
+        cfg = Config(block_sizes=[16, 32])
+
+        class MockSearch:
+            def __init__(self, bound_kernel, args, **kwargs):
+                self.kernel = bound_kernel
+                self.settings = bound_kernel.settings
+                self.args = args
+                self.best_perf_so_far = math.inf
+                self._skip_cache = False
+
+                class _Log:
+                    def __call__(self, *a, **kw):
+                        pass
+
+                    def reset(self):
+                        pass
+
+                    def warning(self, *a, **kw):
+                        pass
+
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                # Simulate the adaptive-timeout mutation that the real
+                # BaseSearch does inside _prepare()/set_adaptive_compile_timeout.
+                self.settings.autotune_compile_timeout = 5
+                self.best_perf_so_far = 1.0
+                return cfg
+
+        original_autotuner_ref = {"r": None}
+
+        def mock_autotuner_fn(bound_kernel, args, **kwargs):
+            def factory():
+                return MockSearch(bound_kernel, args, **kwargs)
+
+            inner = factory()
+            original_autotuner_ref["r"] = inner
+            return LocalAutotuneCache(inner, autotuner_factory=factory)
+
+        @helion.kernel(
+            autotuner_fn=mock_autotuner_fn,
+            autotune_best_of_k=3,
+            autotune_random_seed=100,
+            autotune_compile_timeout=60,
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+
+        with (
+            patch("helion.autotuner.base_cache.should_skip_cache", return_value=True),
+            patch.object(
+                LocalAutotuneCache,
+                "_rebench_trial_configs",
+                lambda self, configs: [1.0] * len(configs),
+            ),
+        ):
+            captured_cache = bound.settings.autotuner_fn(bound, args)
+            self.assertIsNotNone(original_autotuner_ref["r"])
+            self.assertIs(captured_cache.autotuner, original_autotuner_ref["r"])
+            captured_cache.autotune()
+
+        # After the K-loop, the cache's ``autotuner`` reference must be
+        # restored to the original instance (no leaked trial swap).
+        self.assertIs(captured_cache.autotuner, original_autotuner_ref["r"])
+        # And the settings the autotuner mutated must be restored to base.
+        self.assertEqual(bound.settings.autotune_compile_timeout, 60)
+        self.assertEqual(bound.settings.autotune_random_seed, 100)
+
+    def test_k_one_falls_through_to_single_trial(self) -> None:
+        """With ``autotune_best_of_k=1`` the K-loop must not run; the
+        cache calls the autotuner exactly once and returns its config.
+        """
+        from helion.autotuner.local_cache import LocalAutotuneCache
+        from helion.runtime.config import Config
+
+        call_count = {"n": 0}
+        only_config = Config(block_sizes=[16, 32])
+
+        class _Log:
+            def __call__(self, *a, **kw):
+                pass
+
+            def reset(self):
+                pass
+
+            def warning(self, *a, **kw):
+                pass
+
+        class SingleTrialSearch:
+            def __init__(self, bound_kernel, args, **kwargs):
+                self.kernel = bound_kernel
+                self.settings = bound_kernel.settings
+                self.args = args
+                self.best_perf_so_far = 1.0
+                self._skip_cache = False
+                self.log = _Log()
+
+            def autotune(self, *, skip_cache: bool = False):
+                call_count["n"] += 1
+                return only_config
+
+        def mock_autotuner_fn(bound_kernel, args, **kwargs):
+            def factory():
+                return SingleTrialSearch(bound_kernel, args, **kwargs)
+
+            return LocalAutotuneCache(factory(), autotuner_factory=factory)
+
+        @helion.kernel(
+            autotuner_fn=mock_autotuner_fn,
+            autotune_best_of_k=1,
+            autotune_log_level=0,
+        )
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([8, 32], device=DEVICE),
+            torch.randn([8, 32], device=DEVICE),
+        )
+        bound = add.bind(args)
+        with patch("helion.autotuner.base_cache.should_skip_cache", return_value=True):
+            picked = bound.autotune(args)
+        self.assertEqual(call_count["n"], 1)
+        self.assertEqual(picked, only_config)
+
+
+@onlyBackends(["triton", "cute"])
 class TestAutotuneCacheSelection(TestCase):
     """Selection of the autotune cache via HELION_AUTOTUNE_CACHE."""
 
@@ -2409,6 +5524,90 @@ class TestAutotuneCacheSelection(TestCase):
                     ValueError, "Unknown HELION_AUTOTUNE_CACHE"
                 ):
                     bound.settings.autotuner_fn(bound, args)
+
+
+@onlyBackends(["triton", "cute"])
+class TestAutotuneSeedConfigs(TestCase):
+    """Tests for seeding initial autotune populations with user configs."""
+
+    def _seed_config(self) -> helion.Config:
+        if _get_backend() == "cute":
+            return helion.Config(num_threads=[32])
+        return helion.Config(num_warps=8)
+
+    def _has_seed_config(self, configs: list[helion.Config]) -> bool:
+        if _get_backend() == "cute":
+            return any(config.num_threads == [32] for config in configs)
+        return any(config.num_warps == 8 for config in configs)
+
+    def _make_kernel_and_args(self, **kernel_kwargs):
+        @helion.kernel(autotune_log_level=0, **kernel_kwargs)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        return add, args
+
+    def _population_configs(self, search: PatternSearch) -> list[helion.Config]:
+        return [
+            search.config_gen.unflatten(flat)
+            for flat in search._generate_initial_population_flat()
+        ]
+
+    def test_decorator_accepts_single_seed_config(self) -> None:
+        seed_config = self._seed_config()
+        add, _args = self._make_kernel_and_args(autotune_seed_configs=seed_config)
+
+        self.assertEqual(add.settings.autotune_seed_configs, seed_config)
+        self.assertEqual(add.configs, [])
+
+    def test_random_initial_population_includes_seed_configs(self) -> None:
+        seed_config = self._seed_config()
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+
+        configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 3)
+        self.assertTrue(self._has_seed_config(configs))
+
+    def test_best_available_initial_population_includes_seed_configs(self) -> None:
+        seed_config = self._seed_config()
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(
+            bound,
+            args,
+            initial_population_strategy=InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+        )
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]):
+            configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 2)
+        self.assertTrue(self._has_seed_config(configs))
+
+    def test_random_initial_population_logs_invalid_seed_configs(self) -> None:
+        seed_config = helion.Config.from_dict({"block_sizes": ["bad"]})
+        add, args = self._make_kernel_and_args(autotune_seed_configs=[seed_config])
+        bound = add.bind(args)
+        search = PatternSearch(bound, args, initial_population=3)
+        search.log = Mock()
+
+        configs = self._population_configs(search)
+
+        self.assertGreaterEqual(len(configs), 3)
+        search.log.assert_called_once()
+        self.assertIn(
+            "Failed to transfer autotune seed config 1", search.log.call_args[0][0]
+        )
 
 
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
@@ -2526,602 +5725,714 @@ class TestConfigFilter(TestCase):
         self.assertEqual(results[1].config.get("num_warps"), 2)
 
 
-class TestLLMGuidedSearch(TestCase):
-    """Tests for LLMGuidedSearch config parsing and utility methods."""
+class TestFiniteSearchWarmStart(TestCase):
+    """Tests for helion.from_cache() — a CachedFiniteSearch autotuner_fn."""
 
-    @classmethod
-    def _make_mock_search(cls, **overrides):
-        """Create a minimal LLMGuidedSearch-like object for testing internal methods."""
-        from helion.autotuner.llm_search import LLMGuidedSearch
-
-        search = LLMGuidedSearch.__new__(LLMGuidedSearch)
-        search.settings = Settings()
-        search.log = AutotuningLogger(search.settings)
-        search._messages = []
-        search._all_benchmark_results = []
-        search._latest_results_by_config_key = {}
-        search.configs_per_round = 15
-        search._llm_call_times = []
-        search._benchmark_times = []
-        search.model = "gpt-5-2"
-        search.api_base = None
-        search.api_key = None
-        search.request_timeout_s = 120.0
-
-        # Mock config_spec with a normalize that accepts anything
-        search.config_spec = SimpleNamespace(
-            normalize=lambda raw, _fix_invalid=False: None,
-            default_config=lambda: helion.Config(block_sizes=[64]),
-            _flat_fields=dict,
-        )
-        search._default_config_dict = dict(search.config_spec.default_config())
-        for name, value in overrides.items():
-            setattr(search, name, value)
-        return search
-
-    def test_parse_configs_accepts_common_llm_outputs(self):
-        """LLM config parsing accepts the response shapes we expect to see in practice."""
-        import json
-
-        from helion.autotuner.llm_search import LLMGuidedSearch
-
-        # Critical subflow: accept the response wrappers and cleanup patterns
-        # we expect from real LLM/provider output while deduplicating configs.
-        cases = [
-            (
-                "structured",
-                json.dumps(
-                    {"configs": [{"block_sizes": [64]}, {"block_sizes": [128]}]}
-                ),
-                2,
-            ),
-            (
-                "python-literals",
-                '{"configs": [{"block_sizes": [64], "maxnreg": None, "flag": True}]}',
-                1,
-            ),
-            (
-                "deduplicates",
-                json.dumps({"configs": [{"block_sizes": [64]}, {"block_sizes": [64]}]}),
-                1,
-            ),
-            ("malformed", "not json at all", 0),
-        ]
-
-        for name, response, expected in cases:
-            with self.subTest(name=name):
-                search = self._make_mock_search()
-                configs = LLMGuidedSearch._parse_configs(search, response)
-                self.assertEqual(len(configs), expected)
-
-    def test_parse_configs_rejects_shape_guesses(self):
-        """LLM config parsing rejects guessed scalar/list shapes instead of repairing them."""
-        from helion.autotuner.llm_search import LLMGuidedSearch
-
-        # Critical subflow: reject scalar-vs-list shape guesses so invalid
-        # LLM output cannot silently morph into a different config.
-        search = self._make_mock_search(
-            config_spec=SimpleNamespace(
-                normalize=lambda raw, _fix_invalid=False: None,
-                default_config=lambda: helion.Config(block_sizes=[64, 64], num_warps=4),
-                _flat_fields=lambda: {
-                    "block_sizes": ListOf(IntegerFragment(1, 256, 64), length=2),
-                    "num_stages": IntegerFragment(1, 8, 2),
-                    "num_warps": PowerOfTwoFragment(1, 32, 4),
-                },
-            ),
-        )
-        search._default_config_dict = dict(search.config_spec.default_config())
-
-        cases = [
-            ("non-power-of-two num_warps", '{"configs": [{"num_warps": 6}]}', 0),
-            ("scalar block_sizes", '{"configs": [{"block_sizes": 64}]}', 0),
-            ("list scalar field", '{"configs": [{"num_stages": [2]}]}', 0),
-            (
-                "well-shaped config",
-                '{"configs": [{"block_sizes": [64, 128], "num_warps": 8, "num_stages": 2}]}',
-                1,
-            ),
-        ]
-
-        for name, response, expected in cases:
-            with self.subTest(name=name):
-                configs = LLMGuidedSearch._parse_configs(search, response)
-                self.assertEqual(len(configs), expected)
-
-    def test_context_window_keeps_prefix_and_recent_history(self):
-        """Prompt context always keeps the fixed prefix and trims only old round history."""
-        from helion.autotuner.llm_search import _MAX_CONTEXT_ROUNDS
-        from helion.autotuner.llm_search import LLMGuidedSearch
-
-        # Critical subflow: keep the fixed prompt prefix intact while trimming
-        # only stale round history from the rolling conversation window.
-        for short_history in (False, True):
-            with self.subTest(short_history=short_history):
-                search = self._make_mock_search()
-                search._messages = [
-                    {"role": "system", "content": "system"},
-                    {"role": "user", "content": "initial"},
-                ]
-                if short_history:
-                    search._messages.append(
-                        {"role": "assistant", "content": "response"}
-                    )
-                    expected_len = 3
-                else:
-                    for i in range(10):
-                        search._messages.append(
-                            {"role": "user", "content": f"round {i}"}
-                        )
-                        search._messages.append(
-                            {"role": "assistant", "content": f"resp {i}"}
-                        )
-                    expected_len = 2 + _MAX_CONTEXT_ROUNDS * 2
-
-                context = LLMGuidedSearch._get_context_messages(search)
-                self.assertEqual(context[0]["content"], "system")
-                self.assertEqual(context[1]["content"], "initial")
-                self.assertEqual(len(context), expected_len)
-
-    def test_profile_kwargs_defaults_and_supported_env_overrides(self):
-        """Profile kwargs use the supported env overrides and ignore unsupported ones."""
-        from helion.autotuner.llm_search import LLMGuidedSearch
-
-        # Critical subflow: profile resolution should honor supported env
-        # overrides without letting deprecated knobs leak into runtime kwargs.
-        kwargs = LLMGuidedSearch.get_kwargs_from_profile(
-            get_effort_profile("full"), Settings()
-        )
-        self.assertEqual(kwargs["model"], "gpt-5-2")
-        self.assertEqual(kwargs["configs_per_round"], 15)
-        self.assertEqual(kwargs["max_rounds"], 4)
-        self.assertEqual(kwargs["initial_random_configs"], 10)
-        self.assertEqual(kwargs["compile_timeout_s"], 15)
-
-        quick_kwargs = LLMGuidedSearch.get_kwargs_from_profile(
-            get_effort_profile("quick"), Settings()
-        )
-        self.assertEqual(quick_kwargs["max_rounds"], 1)
-        self.assertEqual(quick_kwargs["initial_random_configs"], 10)
-
-        with patch.dict(
-            os.environ,
-            {
-                "HELION_LLM_PROVIDER": "openai",
-                "HELION_LLM_MODEL": "gpt-4.1-mini",
-                "HELION_LLM_COMPILE_TIMEOUT_S": "21",
-                "HELION_LLM_INITIAL_RANDOM_CONFIGS": "99",
-                "HELION_LLM_TEMPERATURE": "0.9",
-                "HELION_LLM_MAX_OUTPUT_TOKENS": "9999",
-            },
-            clear=False,
-        ):
-            kwargs = LLMGuidedSearch.get_kwargs_from_profile(
-                get_effort_profile("full"), Settings()
-            )
-        self.assertEqual(kwargs["provider"], "openai")
-        self.assertEqual(kwargs["model"], "gpt-4.1-mini")
-        self.assertEqual(kwargs["initial_random_configs"], 10)
-        self.assertEqual(kwargs["compile_timeout_s"], 21)
-        self.assertNotIn("temperature", kwargs)
-        self.assertNotIn("max_output_tokens", kwargs)
-
-    @onlyBackends(["triton"])
-    def test_autotune_runs_full_llm_guided_loop_with_mocked_provider(self):
-        """LLM-guided search runs the public round loop with mocked LLM and benchmark backends."""
-        import concurrent.futures
-        import json
-
-        from helion.autotuner.base_search import BenchmarkResult
-        from helion.autotuner.llm_search import LLMGuidedSearch
-
-        # End-to-end LLM flow: run the public autotune entrypoint with the
-        # real round orchestration, while mocking only provider I/O and timing.
-        class FakeBenchmarkProvider:
-            def __init__(
-                self,
-                *,
-                kernel,
-                settings,
-                config_spec,
-                args,
-                log,
-                autotune_metrics,
-            ) -> None:
-                del kernel, settings, config_spec, args, log, autotune_metrics
-                self.mutated_arg_indices: list[int] = []
-                self.setup_called = False
-                self.cleanup_called = False
-
-            def setup(self) -> None:
-                self.setup_called = True
-
-            def cleanup(self) -> None:
-                self.cleanup_called = True
+    def _make_kernel_and_args(self):
+        @helion.kernel(autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
 
         args = (
-            torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
-            torch.randn([128, 128], device=DEVICE, dtype=torch.float16),
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
         )
-        bound = _get_examples_matmul().bind(args)
-        default_config = bound.config_spec.default_config()
-        search = LLMGuidedSearch(
-            bound,
-            args,
-            configs_per_round=2,
-            max_rounds=3,
-            initial_random_configs=0,
-        )
-        search._benchmark_provider_cls = FakeBenchmarkProvider
-        search._default_config_dict = dict(default_config)
+        return add, args
 
-        def sparse_config(cfg: helion.Config) -> dict[str, object]:
-            return {
-                key: value
-                for key, value in dict(cfg).items()
-                if key not in default_config or value != default_config[key]
-            }
+    @staticmethod
+    def _fake_cache_random(count):
+        """Patch _find_similar_cached_configs to return `count` distinct backend-agnostic flats."""
+        from helion.autotuner.local_cache import SavedBestConfig
 
-        def collect_candidate_configs(count: int) -> list[helion.Config]:
-            candidates: list[helion.Config] = []
-            seen = {repr(default_config)}
-            raw_candidates = [
-                {"num_warps": 8},
-                {"num_stages": 2},
-                {"pid_type": "xyz"},
-                {"num_warps": 8, "num_stages": 2},
-                {"num_warps": 8, "pid_type": "xyz"},
-            ]
-            for raw in raw_candidates:
-                parsed = search._parse_configs(json.dumps({"configs": [raw]}))
-                if not parsed:
-                    continue
-                candidate = parsed[0]
-                key = repr(candidate)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(candidate)
-                if len(candidates) == count:
-                    return candidates
-            raise AssertionError(
-                f"Could not find {count} valid non-default configs for matmul"
-            )
-
-        round0_cfg, round1_cfg = collect_candidate_configs(2)
-        default_key = repr(default_config)
-        round0_key = repr(round0_cfg)
-        round1_key = repr(round1_cfg)
-        round0_sparse = sparse_config(round0_cfg)
-        round1_sparse = sparse_config(round1_cfg)
-
-        llm_requests: list[list[dict[str, str]]] = []
-        benchmark_batches: list[tuple[str, list[dict[str, object]]]] = []
-        rebenchmark_descs: list[str] = []
-        async_request_count = 0
-        sync_request_count = 0
-        llm_responses = iter(
-            [
-                json.dumps({"configs": [{}, round0_sparse]}),
-                json.dumps({"configs": [round0_sparse, round1_sparse]}),
-                json.dumps({"configs": [round1_sparse]}),
-            ]
-        )
-        perf_by_key = {
-            default_key: 10.0,
-            round0_key: 5.0,
-            round1_key: 3.0,
-        }
-        rebench_perf_by_key = {
-            default_key: 9.5,
-            round0_key: 4.5,
-            round1_key: 2.5,
-        }
-
-        def fake_call_llm_async(
-            self, messages: list[dict[str, str]]
-        ) -> concurrent.futures.Future[str]:
-            del self
-            nonlocal async_request_count
-            async_request_count += 1
-            llm_requests.append([dict(message) for message in messages])
-            future: concurrent.futures.Future[str] = concurrent.futures.Future()
-            future.set_result(next(llm_responses))
-            return future
-
-        def fake_call_llm(self, messages: list[dict[str, str]]) -> str:
-            del self
-            nonlocal sync_request_count
-            sync_request_count += 1
-            llm_requests.append([dict(message) for message in messages])
-            return next(llm_responses)
-
-        def fake_benchmark_batch(
-            self, configs: list[helion.Config], *, desc: str = "Benchmarking"
-        ) -> list[BenchmarkResult]:
-            batch_keys = [repr(config) for config in configs]
-            benchmark_batches.append(
-                (desc, [sparse_config(config) for config in configs])
-            )
-
-            results: list[BenchmarkResult] = []
-            for config, key in zip(configs, batch_keys, strict=True):
-                perf = perf_by_key[key]
-                self.best_perf_so_far = min(self.best_perf_so_far, perf)
-                self._autotune_metrics.num_configs_tested += 1
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=lambda: None,
-                        perf=perf,
-                        status="ok",
-                        compile_time=0.01,
+        def fake_find(search_self, max_configs):
+            distinct: list[tuple] = []
+            for _ in range(20):
+                if len(distinct) >= count:
+                    break
+                batch = search_self.config_gen.random_population_flat(
+                    max(count * 3, 10)
+                )
+                for flat in batch:
+                    t = tuple(flat)
+                    if t not in distinct:
+                        distinct.append(t)
+                        if len(distinct) >= count:
+                            break
+            out = []
+            for flat in distinct[:max_configs]:
+                out.append(
+                    SavedBestConfig(
+                        hardware="x",
+                        specialization_key="x",
+                        config=search_self.config_gen.unflatten(list(flat)),
+                        config_spec_hash="x",
+                        flat_config=flat,
                     )
                 )
-            return results
+            return out
 
-        def fake_rebenchmark_population(self, members=None, *, desc="Rebenchmarking"):
-            del members
-            rebenchmark_descs.append(desc)
-            for member in self.population:
-                member.perfs.append(rebench_perf_by_key[repr(member.config)])
+        return fake_find
+
+    def test_from_cache_factory(self):
+        """helion.from_cache() returns a callable that creates a CachedFiniteSearch."""
+
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fn = helion.from_cache()
+        self.assertTrue(callable(fn))
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            fn(bound, args)
+
+    def test_from_cache_empty_cache_raises(self):
+        """CachedFiniteSearch with empty cache and no explicit configs raises NotEnoughConfigs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        with (
+            patch.object(BaseSearch, "_find_similar_cached_configs", return_value=[]),
+            self.assertRaises(exc.NotEnoughConfigs),
+        ):
+            CachedFiniteSearch(bound, args)
+
+    def test_from_cache_prepends_cached(self):
+        """Cached configs appear before explicit configs in CachedFiniteSearch.configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        fake_fn = self._fake_cache_random(2)
+        fake_sizes: list[int] = []
+
+        def spy(search_self, max_configs):
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+        self.assertEqual(search.configs[-1], cfg1)
+
+    def test_from_cache_respects_max_parameter(self):
+        """from_cache(max_configs=N) caps the number of cached configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        observed_caps: list[int] = []
+        fake_sizes: list[int] = []
+        fake_fn = self._fake_cache_random(5)
+
+        def spy(search_self, max_configs):
+            observed_caps.append(max_configs)
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1], max_configs=2)
+        self.assertEqual(observed_caps, [2])
+        self.assertLessEqual(fake_sizes[0], 2)
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+
+    def test_from_cache_uses_default_cap_from_settings(self):
+        """Without max_configs, the cap falls back to autotune_best_available_max_configs."""
+        from helion.autotuner.finite_search import CachedFiniteSearch
+
+        cfg1 = helion.Config(block_sizes=[16])
+        add, args = self._make_kernel_and_args()
+        bound = add.bind(args)
+        observed_caps: list[int] = []
+        fake_sizes: list[int] = []
+        fake_fn = self._fake_cache_random(5)
+
+        def spy(search_self, max_configs):
+            observed_caps.append(max_configs)
+            result = fake_fn(search_self, max_configs)
+            fake_sizes.append(len(result))
+            return result
+
+        with patch.object(BaseSearch, "_find_similar_cached_configs", spy):
+            search = CachedFiniteSearch(bound, args, configs=[cfg1])
+        cap_in_effect = search.settings.autotune_best_available_max_configs
+        self.assertEqual(observed_caps, [cap_in_effect])
+        self.assertLessEqual(fake_sizes[0], cap_in_effect)
+        self.assertEqual(len(search.configs), fake_sizes[0] + 1)
+
+    def test_kernel_autotuner_fn_accepts_from_cache(self):
+        """@helion.kernel(autotuner_fn=helion.from_cache()) stores the callable in settings."""
+        fn = helion.from_cache()
+
+        @helion.kernel(autotuner_fn=fn, autotune_log_level=0)
+        def add(a, b):
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([128], device=DEVICE),
+            torch.randn([128], device=DEVICE),
+        )
+        bound = add.bind(args)
+        self.assertIs(bound.settings.autotuner_fn, fn)
+
+
+@onlyBackends(["triton", "cute"])
+class TestAutotuneBudget(TestCase):
+    def _make_search(self, settings: Settings) -> BaseSearch:
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search.kernel = SimpleNamespace(
+            format_kernel_decorator=lambda config, s: "decorator",
+            to_triton_code=lambda config: "code",
+            maybe_log_repro=lambda log_func, args, config=None: None,
+            supports_subprocess_benchmark=lambda: False,
+        )
+        search.args = ()
+        search.log = AutotuningLogger(settings)
+        search.config_spec = SimpleNamespace(
+            default_config=lambda: helion.Config(block_sizes=[1])
+        )
+        search._benchmark_provider_cls = LocalBenchmarkProvider
+        search.best_perf_so_far = float("inf")
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        return search
+
+    def test_setting_default_is_none(self) -> None:
+        with without_env_var("HELION_AUTOTUNE_BUDGET_SECONDS"):
+            settings = Settings()
+        self.assertIsNone(settings.autotune_budget_seconds)
+
+    def test_cute_backend_uses_default_autotune_budget_without_mutating(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_effort="quick",
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
+        observed_budgets: list[int | None] = []
+
+        def fake_autotune(self_, bound_kernel_, args, **kwargs):
+            observed_budgets.append(bound_kernel_.settings.autotune_budget_seconds)
+            return helion.Config()
+
+        with patch.object(
+            Backend, "autotune", autospec=True, side_effect=fake_autotune
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertEqual(observed_budgets, [_CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS])
+        self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
+
+    def test_cute_backend_leaves_full_autotune_unbudgeted_by_default(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_effort="full",
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
+        observed_budgets: list[int | None] = []
+
+        def fake_autotune(self_, bound_kernel_, args, **kwargs):
+            observed_budgets.append(bound_kernel_.settings.autotune_budget_seconds)
+            return helion.Config()
+
+        with patch.object(
+            Backend, "autotune", autospec=True, side_effect=fake_autotune
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertEqual(observed_budgets, [None])
+        self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
+
+    def test_cute_backend_restores_default_autotune_budget_on_error(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_effort="quick",
+            autotune_log_level=logging.CRITICAL,
+        )
+        bound_kernel = SimpleNamespace(settings=settings)
 
         with (
             patch.object(
-                LLMGuidedSearch,
-                "_call_llm_async",
+                Backend,
+                "autotune",
                 autospec=True,
-                side_effect=fake_call_llm_async,
+                side_effect=RuntimeError("boom"),
             ),
-            patch.object(
-                LLMGuidedSearch,
-                "_call_llm",
-                autospec=True,
-                side_effect=fake_call_llm,
-            ),
-            patch.object(
-                LLMGuidedSearch,
-                "benchmark_batch",
-                autospec=True,
-                side_effect=fake_benchmark_batch,
-            ),
-            patch.object(
-                LLMGuidedSearch,
-                "rebenchmark_population",
-                autospec=True,
-                side_effect=fake_rebenchmark_population,
-            ),
+            self.assertRaisesRegex(RuntimeError, "boom"),
         ):
-            best = search.autotune(skip_cache=True)
+            CuteBackend().autotune(bound_kernel, ())
 
-        self.assertEqual(dict(best), dict(round1_cfg))
-        self.assertTrue(search.benchmark_provider.setup_called)
-        self.assertTrue(search.benchmark_provider.cleanup_called)
-        self.assertEqual(len(llm_requests), 3)
-        self.assertEqual(async_request_count, 1)
-        self.assertEqual(sync_request_count, 2)
-        self.assertEqual([len(messages) for messages in llm_requests], [2, 4, 6])
-        self.assertIn("4.5000 ms", llm_requests[1][-1]["content"])
-        self.assertIn("2.5000 ms", llm_requests[2][-1]["content"])
-        self.assertEqual(
-            [desc for desc, _ in benchmark_batches],
-            ["Round 0 seed", "Round 0 LLM", "Round 1"],
+        self.assertIsNone(bound_kernel.settings.autotune_budget_seconds)
+
+    def test_cute_backend_preserves_explicit_autotune_budget(self) -> None:
+        from helion._compiler.backend import Backend
+        from helion._compiler.backend import CuteBackend
+
+        settings = Settings(
+            autotune_budget_seconds=42,
+            autotune_log_level=logging.CRITICAL,
         )
-        self.assertEqual(benchmark_batches[0][1], [sparse_config(default_config)])
-        self.assertEqual(benchmark_batches[1][1], [round0_sparse])
-        self.assertEqual(benchmark_batches[2][1], [round1_sparse])
-        self.assertEqual(
-            rebenchmark_descs,
-            ["Round 0: verifying top configs", "Round 1: verifying top configs"],
+        bound_kernel = SimpleNamespace(settings=settings)
+        observed_budgets: list[int | None] = []
+
+        def fake_autotune(self_, bound_kernel_, args, **kwargs):
+            observed_budgets.append(bound_kernel_.settings.autotune_budget_seconds)
+            return helion.Config()
+
+        with patch.object(
+            Backend, "autotune", autospec=True, side_effect=fake_autotune
+        ):
+            CuteBackend().autotune(bound_kernel, ())
+
+        self.assertEqual(observed_budgets, [42])
+        self.assertEqual(bound_kernel.settings.autotune_budget_seconds, 42)
+
+    def test_setting_from_env_var(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_BUDGET_SECONDS": "300"},
+            clear=False,
+        ):
+            settings = Settings()
+        self.assertEqual(settings.autotune_budget_seconds, 300)
+
+    def test_setting_from_kwarg(self) -> None:
+        settings = Settings(autotune_budget_seconds=42)
+        self.assertEqual(settings.autotune_budget_seconds, 42)
+
+    def test_no_budget_yields_full_range(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=None,
+            autotune_log_level=logging.CRITICAL,
         )
-        self.assertEqual(search._autotune_metrics.num_configs_tested, 3)
-        self.assertEqual(len(search._all_benchmark_results), 3)
-        self.assertEqual(len(search.population), 3)
-        self.assertEqual(search.best.perf, 2.5)
-        self.assertEqual(dict(best), dict(round1_cfg))
-        self.assertEqual(dict(search.best.config), dict(round1_cfg))
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 1e9
+        self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
+
+    def test_budget_yields_while_time_remains(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=600,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
+
+    def test_budget_stops_range_when_elapsed_exceeds(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 2.0
+        search.log = Mock()
+        self.assertEqual(list(search._budgeted_range(10)), [])
+        search.log.assert_called_once()
+
+    def test_budget_unset_when_prepare_not_called(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = BaseSearch.__new__(BaseSearch)
+        search.settings = settings
+        search._autotune_budget_start = None
+        self.assertEqual(list(search._budgeted_range(3)), [0, 1, 2])
+
+    def test_budget_resets_when_prepare_called_again(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=60,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        search._autotune_budget_start = time.perf_counter() - 100.0
+        self.assertEqual(list(search._budgeted_range(1)), [])
+
+        search._prepared = False
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_compute_baseline",
+            return_value=(None, [], None),
+        ):
+            search._prepare()
+        self.assertEqual(list(search._budgeted_range(1)), [0])
+
+    def test_budget_zero_immediately_exhausts(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=0,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        time.sleep(0.001)
+        self.assertEqual(list(search._budgeted_range(10)), [])
+
+    def test_setting_has_user_facing_description(self) -> None:
+        self.assertIn("autotune_budget_seconds", Settings.__slots__)
+        description = Settings.__slots__["autotune_budget_seconds"]
+        self.assertIn("HELION_AUTOTUNE_BUDGET_SECONDS", description)
+        self.assertIn("best", description.lower())
+
+    def test_generation_loops_use_budgeted_range(self) -> None:
+        import inspect
+
+        from helion.autotuner.de_surrogate_hybrid import DESurrogateHybrid
+        from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
+        from helion.autotuner.llm_search import LLMGuidedSearch
+        from helion.autotuner.pattern_search import PatternSearch
+        from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
+
+        for cls in (
+            DESurrogateHybrid,
+            DifferentialEvolutionSearch,
+            LLMGuidedSearch,
+            PatternSearch,
+            LFBOPatternSearch,
+        ):
+            source = inspect.getsource(cls)
+            self.assertIn(
+                "_budgeted_range",
+                source,
+                f"{cls.__name__} should use _budgeted_range for generation loops",
+            )
+
+    def test_finishing_phase_respects_budget(self) -> None:
+        import inspect
+
+        from helion.autotuner.base_search import PopulationBasedSearch
+
+        source = inspect.getsource(PopulationBasedSearch.run_finishing_phase)
+        self.assertIn(
+            "_budgeted_range",
+            source,
+            "run_finishing_phase should stop when the autotune budget is exhausted",
+        )
+
+    def test_final_rebenchmark_respects_budget(self) -> None:
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search._autotune_budget_start = time.perf_counter() - 2.0
+        search._benchmarked_members = {}
+        search._pinned_finalist_configs = set()
+        search._pinned_finalist_members = {}
+        search.population = []
+        member = PopulationMember(lambda: None, [1.0], (), helion.Config())
+
+        with patch.object(search, "rebenchmark") as rebenchmark:
+            self.assertIs(search.final_rebenchmark_best(member), member)
+
+        rebenchmark.assert_not_called()
+
+    def test_prepare_wires_budget_hook_into_provider(self) -> None:
+        """``BaseSearch._prepare`` should install the budget-check hook on
+        the benchmark provider so the initial-population
+        compile/benchmark phase can short-circuit once the wall-clock
+        budget is exhausted.
+        """
+        settings = Settings(
+            autotune_budget_seconds=1,
+            autotune_log_level=logging.CRITICAL,
+        )
+        search = self._make_search(settings)
+        self.assertEqual(
+            search.benchmark_provider.budget_exceeded_fn,
+            search._autotune_budget_exceeded,
+        )
+
+    def _make_stub_provider(self):
+        """Construct a minimal ``LocalBenchmarkProvider`` for budget-loop
+        tests without standing up a real kernel/config_spec.
+        """
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.kernel = SimpleNamespace(
+            compile_config=lambda config, allow_print: lambda *a, **kw: None,
+            format_kernel_decorator=lambda config, s: "decorator",
+            env=SimpleNamespace(process_group_name=None),
+        )
+        provider.settings = Settings(autotune_log_level=logging.CRITICAL)
+        # Match the cute backend's path: CuteBackend.supports_precompile()
+        # is False, which clears autotune_precompile in autotune setup.
+        provider.settings.autotune_precompile = None
+        provider.config_spec = SimpleNamespace()
+        provider.args = ()
+        provider.log = AutotuningLogger(provider.settings)
+        provider._autotune_metrics = SimpleNamespace(
+            num_configs_tested=0,
+            num_compile_failures=0,
+            num_accuracy_failures=0,
+            num_generations=0,
+            kernel_source="",
+        )
+        provider.mutated_arg_indices = ()
+        provider._benchmark_worker = None
+        provider._precompile_args_path = None
+        provider._precompile_tmpdir = None
+        return provider
+
+    def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
+        """``LocalBenchmarkProvider.benchmark`` must stop compiling
+        configs once ``budget_exceeded_fn`` returns ``True`` from inside
+        the compile loop, and still return one ``BenchmarkResult`` per
+        input config so callers receive a positionally-aligned list.
+        """
+        from helion.autotuner.benchmark_provider import BenchmarkResult
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+        provider = self._make_stub_provider()
+
+        compiled_count = [0]
+        budget_calls = [0]
+
+        original_compile = provider.kernel.compile_config
+
+        def counting_compile(config, allow_print):
+            compiled_count[0] += 1
+            return original_compile(config, allow_print)
+
+        provider.kernel.compile_config = counting_compile
+
+        def budget_check():
+            budget_calls[0] += 1
+            return compiled_count[0] >= 2
+
+        provider.set_budget_exceeded_fn(budget_check)
+
+        from helion.runtime.config import Config
+
+        configs = [Config() for _ in range(5)]
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            return_value=0.001,
+        ):
+            results = provider.benchmark(configs)
+
+        self.assertEqual(len(results), len(configs))
+        compiled_finite = sum(1 for r in results if math.isfinite(r.perf))
+        self.assertLessEqual(compiled_count[0], 2)
+        self.assertLessEqual(compiled_finite, compiled_count[0])
+        for r in results[compiled_count[0] :]:
+            self.assertEqual(r.status, "error")
+            self.assertEqual(r.perf, float("inf"))
+        for r in results:
+            self.assertIsInstance(r, BenchmarkResult)
+        # The hook must actually fire; without it the loop wouldn't break.
+        self.assertGreater(budget_calls[0], 0)
+
+    def test_benchmark_provider_short_circuits_benchmark_loop(self) -> None:
+        """If compilation finishes cleanly and the budget only fires
+        partway through the benchmark loop, remaining configs must be
+        left at the default ``perf=inf, status="error"`` slots while the
+        earlier benchmarked configs keep their measured perf.
+        """
+        from helion.autotuner.benchmark_provider import BenchmarkResult
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+
+        provider = self._make_stub_provider()
+
+        # All compiles succeed; budget stays clear during compilation.
+        benchmark_count = [0]
+
+        def budget_check():
+            # Trip the budget after 2 benchmark calls.
+            return benchmark_count[0] >= 2
+
+        provider.set_budget_exceeded_fn(budget_check)
+
+        def counting_benchmark(self_, config, fn):
+            benchmark_count[0] += 1
+            return 0.001
+
+        from helion.runtime.config import Config
+
+        configs = [Config() for _ in range(5)]
+
+        with patch.object(
+            LocalBenchmarkProvider,
+            "_benchmark_function",
+            new=counting_benchmark,
+        ):
+            results = provider.benchmark(configs)
+
+        self.assertEqual(len(results), len(configs))
+        # At most 2 benchmarks ran (the loop checks before each call).
+        self.assertLessEqual(benchmark_count[0], 2)
+        # First few entries have finite measured perf.
+        finite_count = sum(1 for r in results if math.isfinite(r.perf))
+        self.assertEqual(finite_count, benchmark_count[0])
+        # The tail entries must be the inf/error defaults.
+        for r in results[benchmark_count[0] :]:
+            self.assertEqual(r.status, "error")
+            self.assertEqual(r.perf, float("inf"))
+        for r in results:
+            self.assertIsInstance(r, BenchmarkResult)
+
+    def test_benchmark_provider_default_hook_is_no_op(self) -> None:
+        """A provider that never had its hook installed must read the
+        class-level no-op default rather than raising ``AttributeError``
+        on the first ``budget_exceeded_fn()`` call.
+        """
+        from helion.autotuner.benchmark_provider import BenchmarkProvider
+        from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+        from helion.autotuner.benchmark_provider import _never_exceeded
+
+        # Class-level default lives on the abstract base so any subclass
+        # picks it up even if it forgets to call super().__init__.
+        self.assertIs(BenchmarkProvider.budget_exceeded_fn, _never_exceeded)
+        # Subclass instance with no __init__ work still resolves the
+        # default via class-level descriptor.
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        self.assertFalse(provider.budget_exceeded_fn())
+
+    def test_cute_wall_clock_benchmark_uses_subprocess_worker(self) -> None:
+        from helion._compiler.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._subprocess_benchmark_uses_wall_clock())
+
+    def test_non_cute_custom_benchmark_stays_in_process(self) -> None:
+        from helion.autotuner.benchmarking import do_bench_generic
+
+        class OtherBackend:
+            @property
+            def name(self) -> str:
+                return "other"
+
+            def get_do_bench(self):
+                return do_bench_generic
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=OtherBackend())
+
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+        self.assertFalse(provider._subprocess_benchmark_uses_wall_clock())
 
 
-class TestLLMTransport(TestCase):
-    """Tests for provider selection and HTTP payload translation."""
+class TestConfigValuePriors(TestCase):
+    """Backend-supplied per-key priors bias the random half of the initial
+    population (config_generation), while the other half stays uniform."""
+
+    def _add_config_gen(self) -> tuple[ConfigGeneration, object]:
+        @helion.kernel(autotune_log_level=0)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        a = torch.randn(256, 256, device=DEVICE)
+        bound = add.bind((a, a))
+        return ConfigGeneration(bound.config_spec), bound
 
     @staticmethod
-    def _response_payload(
-        provider: str, text: str = '{"configs": []}'
-    ) -> dict[str, object]:
-        if provider == "openai_responses":
-            return {"output": [{"content": [{"type": "text", "text": text}]}]}
-        return {"content": [{"type": "text", "text": text}]}
+    def _forceable_slot(gen: ConfigGeneration) -> tuple[str, int, object]:
+        """Pick a config key the live kernel exposes and a value to force it to.
 
-    def test_transport_helpers_and_http_request_shapes(self):
-        """Provider helpers build the expected request/response shapes for each backend."""
-        from helion.autotuner.llm.transport import _resolve_api_base
-        from helion.autotuner.llm.transport import _resolve_api_key
-        from helion.autotuner.llm.transport import _resolve_v1_endpoint
-        from helion.autotuner.llm.transport import call_provider
-        from helion.autotuner.llm.transport import extract_anthropic_text
-        from helion.autotuner.llm.transport import extract_openai_response_text
-        from helion.autotuner.llm.transport import infer_provider
-        from helion.autotuner.llm.transport import responses_input_from_messages
-        from helion.autotuner.llm.transport import split_system_messages
+        Backends expose different keys (e.g. the default backend has a scalar
+        ``num_warps`` slot; the cute backend exposes only sequence keys such as
+        ``block_sizes``), so the priors tests select a target dynamically rather
+        than hard-coding ``num_warps``. Returns ``(key, flat_index, value)``
+        where ``value`` is representable by the slot's fragment.
+        """
+        # Prefer a scalar ``num_warps`` slot when present: a power-of-two value
+        # in its range that won't be altered by repair logic.
+        for key, (indices, is_sequence) in gen._key_to_flat_indices.items():
+            if key == "num_warps" and not is_sequence and indices:
+                return key, indices[0], 4
+        # Otherwise use the first block-size slot, which every backend exposes.
+        block_key, (block_indices, _is_seq) = next(
+            (k, v) for k, v in gen._key_to_flat_indices.items() if k == "block_sizes"
+        )
+        flat_idx = block_indices[0]
+        fragment = gen.flat_spec[flat_idx]
+        # Use the fragment's own default: guaranteed representable and stable.
+        return block_key, flat_idx, fragment.default()
 
-        # Critical subflow: transport must normalize provider selection,
-        # request payloads, and response parsing across supported backends.
-        self.assertEqual(infer_provider("claude-haiku-4.5"), "anthropic")
-        self.assertEqual(infer_provider("gpt-5-2"), "openai_responses")
-        self.assertEqual(infer_provider("custom/model"), "unsupported")
-        self.assertEqual(infer_provider("custom/model", "anthropic"), "anthropic")
-        self.assertEqual(infer_provider("custom/model", "openai"), "openai_responses")
-        with self.assertRaisesRegex(ValueError, "Unsupported LLM provider"):
-            infer_provider("gpt-5-2", "bogus")
+    def test_no_priors_falls_through_to_uniform(self) -> None:
+        gen, _ = self._add_config_gen()
+        # With no priors, biased sampling is exactly uniform sampling and the
+        # population fill is unchanged. Control the priors explicitly rather than
+        # relying on the ambient backend default (the cute backend, for example,
+        # supplies non-empty priors).
+        gen._config_value_priors = {}
+        self.assertEqual(gen._config_value_priors, {})
+        flat = gen.biased_random_flat()
+        self.assertEqual(len(flat), len(gen.flat_spec))
 
-        self.assertEqual(
-            _resolve_v1_endpoint("https://api.openai.com", "responses"),
-            "https://api.openai.com/v1/responses",
-        )
-        self.assertEqual(
-            _resolve_v1_endpoint("https://api.openai.com/v1", "responses"),
-            "https://api.openai.com/v1/responses",
-        )
-        self.assertEqual(
-            _resolve_v1_endpoint("https://proxy.example/v1/messages", "messages"),
-            "https://proxy.example/v1/messages",
-        )
-        self.assertEqual(
-            _resolve_api_base("openai_responses", "https://explicit.example/v1"),
-            "https://explicit.example/v1",
-        )
-        self.assertEqual(
-            _resolve_api_key("openai_responses", "explicit-key"), "explicit-key"
-        )
+    def test_prior_forces_value(self) -> None:
+        from helion.autotuner.config_priors import weighted_choice
 
-        system, history = split_system_messages(
-            [
-                {"role": "system", "content": "tune kernels"},
-                {"role": "user", "content": "suggest configs"},
-                {"role": "assistant", "content": '{"configs": []}'},
-            ]
-        )
-        self.assertEqual(system, "tune kernels")
-        self.assertEqual(
-            [message["role"] for message in history], ["user", "assistant"]
-        )
+        gen, _ = self._add_config_gen()
+        key, flat_idx, value = self._forceable_slot(gen)
+        # Control the priors directly on the instance so the test is independent
+        # of whatever priors the active backend supplies.
+        gen._config_value_priors = {key: weighted_choice({value: 1.0})}
+        # Disable size repair/shrink so the forced value is observed verbatim.
+        with (
+            patch.object(gen, "shrink_config", lambda *a, **k: None),
+            patch.object(gen, "_repair_cute_num_threads", lambda *a, **k: None),
+        ):
+            for _ in range(25):
+                self.assertEqual(gen.biased_random_flat()[flat_idx], value)
 
-        payload = responses_input_from_messages(
-            [
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "world"},
-            ]
-        )
-        self.assertEqual(
-            payload[0]["content"], [{"type": "input_text", "text": "hello"}]
-        )
-        self.assertEqual(
-            payload[1]["content"], [{"type": "output_text", "text": "world"}]
-        )
-        self.assertEqual(
-            extract_openai_response_text(
-                {
-                    "output": [
-                        {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": '{"configs": []}'}],
-                        }
-                    ]
-                }
-            ),
-            '{"configs": []}',
-        )
-        self.assertEqual(
-            extract_anthropic_text(
-                {
-                    "content": [
-                        {"type": "text", "text": '{"configs": [{"num_warps": 4}]}'}
-                    ]
-                }
-            ),
-            '{"configs": [{"num_warps": 4}]}',
-        )
+    def test_population_fill_is_half_biased(self) -> None:
+        from helion.autotuner.config_priors import weighted_choice
 
-        captured = {}
-        messages = [
-            {"role": "system", "content": "tune kernels"},
-            {"role": "user", "content": "suggest configs"},
-            {"role": "assistant", "content": '{"configs": []}'},
-        ]
-
-        def fake_post_json(url, payload, headers, *, request_timeout_s):
-            captured["url"] = url
-            captured["payload"] = payload
-            captured["headers"] = headers
-            captured["request_timeout_s"] = request_timeout_s
-
-        cases = [
-            {
-                "name": "openai",
-                "provider": "openai_responses",
-                "response_payload": self._response_payload("openai_responses"),
-                "expected_text": '{"configs": []}',
-                "model": "gpt-5-2",
-                "api_base": "https://api.openai.com",
-                "expected_url": "https://api.openai.com/v1/responses",
-                "api_key": "openai-test-key",
-                "request_assertions": lambda captured: (
-                    self.assertEqual(
-                        captured["headers"]["Authorization"],
-                        "Bearer openai-test-key",
-                    ),
-                    self.assertEqual(
-                        captured["payload"]["instructions"], "tune kernels"
-                    ),
-                    self.assertEqual(captured["payload"]["input"][0]["role"], "user"),
-                ),
-            },
-            {
-                "name": "anthropic",
-                "provider": "anthropic",
-                "response_payload": self._response_payload(
-                    "anthropic", '{"configs": [{"num_warps": 4}]}'
-                ),
-                "expected_text": '{"configs": [{"num_warps": 4}]}',
-                "model": "claude-3-5-haiku-latest",
-                "api_base": "https://api.anthropic.com",
-                "expected_url": "https://api.anthropic.com/v1/messages",
-                "api_key": "anthropic-test-key",
-                "request_assertions": lambda captured: (
-                    self.assertEqual(
-                        captured["headers"]["x-api-key"],
-                        "anthropic-test-key",
-                    ),
-                    self.assertEqual(captured["payload"]["system"], "tune kernels"),
-                    self.assertEqual(
-                        captured["payload"]["messages"][0]["role"], "user"
-                    ),
-                ),
-            },
-        ]
-
-        for case in cases:
-            with self.subTest(name=case["name"]):
-                captured.clear()
-
-                def fake_post_json_with_response(
-                    url,
-                    payload,
-                    headers,
-                    *,
-                    request_timeout_s,
-                    response_payload=case["response_payload"],
-                ):
-                    fake_post_json(
-                        url,
-                        payload,
-                        headers,
-                        request_timeout_s=request_timeout_s,
-                    )
-                    return response_payload
-
-                with (
-                    patch.dict(os.environ, {}, clear=True),
-                    patch(
-                        "helion.autotuner.llm.transport._post_json",
-                        side_effect=fake_post_json_with_response,
-                    ),
-                ):
-                    response = call_provider(
-                        case["provider"],
-                        model=case["model"],
-                        api_base=case["api_base"],
-                        api_key=case["api_key"],
-                        messages=messages,
-                        max_output_tokens=512,
-                        request_timeout_s=120.0,
-                    )
-                self.assertEqual(response, case["expected_text"])
-                self.assertEqual(captured["url"], case["expected_url"])
-                self.assertEqual(captured["request_timeout_s"], 120.0)
-                case["request_assertions"](captured)
+        gen, _ = self._add_config_gen()
+        key, _flat_idx, value = self._forceable_slot(gen)
+        gen._config_value_priors = {key: weighted_choice({value: 1.0})}
+        with (
+            # Suppress backend-supplied compiler seeds so the random-fill count
+            # is deterministic across backends (cute seeds a few configs).
+            patch.object(gen, "seed_flat_config_pairs", return_value=[]),
+            patch.object(
+                gen, "biased_random_flat", wraps=gen.biased_random_flat
+            ) as biased,
+            patch.object(gen, "random_flat", wraps=gen.random_flat) as uniform,
+        ):
+            # 1 default + 10 random fill slots (seeds suppressed above).
+            gen.random_population_flat(11)
+        self.assertEqual(biased.call_count, 5)
+        self.assertEqual(uniform.call_count, 5)
 
 
 if __name__ == "__main__":

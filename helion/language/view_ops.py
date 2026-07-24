@@ -106,13 +106,6 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
-@_decorators.codegen(subscript, "cute")
-def _(state: CodegenState) -> ast.AST:
-    # CuTe kernels currently execute scalarized pointwise code, so shape-only
-    # indexing used for broadcast setup is a no-op.
-    return state.ast_arg(0)
-
-
 @_decorators.ref(subscript)
 def _(tensor: torch.Tensor, indices: list[object]) -> torch.Tensor:
     # pyrefly: ignore [bad-index]
@@ -155,15 +148,6 @@ def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     )
 
 
-@_decorators.codegen(split, "triton")
-def _(state: CodegenState) -> list[ast.AST]:
-    split_call = expr_from_string("tl.split({tensor})", tensor=state.ast_arg(0))
-    return [
-        expr_from_string("{value}[0]", value=split_call),
-        expr_from_string("{value}[1]", value=split_call),
-    ]
-
-
 @_decorators.ref(split)
 def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return cast("tuple[torch.Tensor, torch.Tensor]", torch.unbind(tensor, dim=-1))
@@ -201,15 +185,6 @@ def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
 
     broadcast_shape = torch.broadcast_shapes(tensor0.shape, tensor1.shape)
     return tensor0.new_empty([*broadcast_shape, 2])
-
-
-@_decorators.codegen(join, "triton")
-def _(state: CodegenState) -> ast.AST:
-    return expr_from_string(
-        "tl.join({tensor0}, {tensor1})",
-        tensor0=state.ast_arg(0),
-        tensor1=state.ast_arg(1),
-    )
 
 
 @_decorators.ref(join)

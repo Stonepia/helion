@@ -12,16 +12,22 @@ import os
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Generator
+from typing import NamedTuple
+from typing import ParamSpec
 from typing import Sequence
+from typing import TypeVar
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional
 from torch.utils._pytree import tree_map
 
 from ._compat import get_mtia_tunable_fragments
@@ -58,6 +64,14 @@ if TYPE_CHECKING:
     from .runtime.kernel import BoundKernel
     from .runtime.kernel import Kernel
 
+_R = TypeVar("_R")
+_P = ParamSpec("_P")
+
+
+class CosSimilarity(NamedTuple):
+    dim: int
+    min_similarity: float
+
 
 def _strip_launcher_args(value: str) -> str:
     strip_pairs = []
@@ -65,6 +79,7 @@ def _strip_launcher_args(value: str) -> str:
         strip_pairs += [
             (r", waves_per_eu=\d+", ""),
             (r", matrix_instr_nonkdim=\d+", ""),
+            (r", xcd_remap=(?:True|False)", ""),
         ]
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
@@ -99,6 +114,12 @@ def skipIfFn(
     Works on both test methods and test classes. When applied to a class,
     wraps setUp to check the skip condition before each test runs.
     """
+
+    if not isinstance(reason, str):
+        raise TypeError(
+            f"Decorator using skipIfFn requires a reason string argument, got {type(reason).__name__}. "
+            "Make sure to call the decorator with parentheses, e.g. @decorator('reason') or @decorator()"
+        )
 
     def decorator(test_item: Callable) -> Callable:
         if isinstance(test_item, type):
@@ -201,11 +222,14 @@ class _OutputCapture:
 
 def is_cuda() -> bool:
     """Return True if running on CUDA (NVIDIA GPU)."""
+    if _get_backend() == "pallas":
+        return False
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
 DEVICE = None
 
 
@@ -220,22 +244,10 @@ def _has_mtia_runtime() -> bool:
         return False
 
 
-def _init_tpu_device() -> bool:
-    """Try to initialize the TPU device. Returns True if successful."""
-    try:
-        import torch_tpu.api  # type: ignore[import-not-found]
-
-        torch_tpu.api.tpu_device()
-        return True
-    except (ImportError, RuntimeError):
-        return False
-
-
 # Determine DEVICE without calling functions that initialize CUDA.
 if _get_backend() == "pallas" and is_pallas_interpret():
     DEVICE = torch.device("cpu")
 elif _get_backend() == "pallas":
-    _init_tpu_device()
     DEVICE = torch.device("tpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
@@ -305,8 +317,29 @@ def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
 
 
 def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
-    """Mark test as expected failure if running with pallas"""
+    """Mark test as expected failure if running with pallas (TPU or interpret mode)"""
     return xfailIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure only on real Pallas TPU (passes in interpret mode)."""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
+def xfailIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure only in Pallas interpret mode (passes on real TPU)."""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
+
+
+def skipIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test in Pallas interpret mode (e.g. tests of TPU-only behavior)."""
+    return skipIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
 
 
 def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
@@ -315,6 +348,21 @@ def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on a multi-XCD AMD CDNA GPU.
+
+    Single-XCD parts and CPX-partitioned devices (which expose one XCD) are
+    skipped, since xcd_remap is a no-op there.
+    """
+    from helion._compat import get_num_xcd
+    from helion._compat import supports_amd_cdna_tunables
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not (supports_amd_cdna_tunables() and get_num_xcd() > 1), reason
+    )
 
 
 def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:
@@ -331,23 +379,89 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() != "tileir", reason)
 
 
+CUTE_MIN_CUDA_VERSION = "13"
+
+
 @functools.cache
 def _has_cute_dsl() -> bool:
     try:
         import cutlass.cute as _cute  # noqa: F401
-    except ModuleNotFoundError:
+    except ImportError:
         return False
-    return True
+    from ._compat import requires_cuda_version
+
+    return requires_cuda_version(CUTE_MIN_CUDA_VERSION)
 
 
 def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test unless CUTLASS CuTe Python DSL is importable."""
+    """Skip test unless CUTLASS CuTe Python DSL is importable and CUDA >= 13."""
     return skipIfFn(lambda: not _has_cute_dsl(), reason)
 
 
 def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
     """Mark test xfail when CUTLASS CuTe backend is selected."""
     return xfailIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when CUTLASS CuTe backend is selected."""
+    return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def default_cute_mma_support(
+    *,
+    supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
+    warp_f16bf16: bool = True,
+    tcgen05_f16bf16: bool = True,
+    tcgen05_f8: bool = True,
+) -> SimpleNamespace:
+    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
+    return SimpleNamespace(
+        supported_impls=supported_impls,
+        warp_f16bf16=warp_f16bf16,
+        tcgen05_f16bf16=tcgen05_f16bf16,
+        tcgen05_f8=tcgen05_f8,
+    )
+
+
+@contextlib.contextmanager
+def patch_cute_mma_support(
+    support: SimpleNamespace | None = None,
+) -> Generator[SimpleNamespace, None, None]:
+    """Patch both ``get_cute_mma_support`` bindings.
+
+    ``cute_mma`` re-binds the symbol from ``mma_support`` at import time.
+    """
+    if support is None:
+        support = default_cute_mma_support()
+    with (
+        patch(
+            "helion._compiler.cute.cute_mma.get_cute_mma_support",
+            return_value=support,
+        ),
+        patch(
+            "helion._compiler.cute.mma_support.get_cute_mma_support",
+            return_value=support,
+        ),
+    ):
+        yield support
+
+
+@contextlib.contextmanager
+def float32_matmul_precision(precision: str) -> Generator[None, None, None]:
+    """Context manager to temporarily set the float32 matrix multiplication precision.
+
+    The original `torch.float32_matmul_precision` setting is restored upon exiting the context.
+
+    Args:
+        precision: The precision level to set ("highest", "high", or "medium").
+    """
+    original_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(original_precision)
 
 
 def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
@@ -372,7 +486,7 @@ def onlyBackends(
 def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
-    return skipIfFn(lambda: not supports_tensor_descriptor(), reason)
+    return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
 
 
 def skipUnlessTf32Supported(
@@ -423,10 +537,8 @@ def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
                 return False
         try:
             from jax.experimental import pallas  # noqa: F401
-            import torch_tpu.api  # type: ignore[import-not-found]
 
-            torch_tpu.api.tpu_device()
-            return True
+            return hasattr(torch, "tpu") and torch.tpu.is_available()
         except Exception:
             return False
 
@@ -451,11 +563,16 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
 def skipIfCudaCapabilityLessThan(
     min_capability: tuple[int, int], *, reason: str | None = None
 ) -> Callable[[Callable], Callable]:
-    """Skip test if not running on CUDA or capability is less than min_capability."""
+    """Skip test if running on CUDA with capability less than min_capability.
+
+    Pass-through on non-CUDA backends. Combine with `skipIfNotCUDA()` (or
+    `skipIfPallas`/`skipIfXPU`/etc.) at the call site if the test also
+    requires a specific platform.
+    """
 
     def cond() -> bool:
         if not is_cuda():
-            return True
+            return False
         return torch.cuda.get_device_capability() < min_capability
 
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
@@ -917,8 +1034,8 @@ def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
             # pyrefly: ignore [bad-argument-type]
             **kwargs
         )
-    elif bound.kernel.configs:
-        (config,) = bound.kernel.configs
+    elif len(bound.kernel.configs) == 1:
+        config = bound.kernel.configs[0]
     else:
         config = bound.config_spec.default_config()
     # Strip config keys not supported by the current backend so that
@@ -947,7 +1064,7 @@ def _run_bound_kernel(
         if has_device_tensor or (
             isinstance(result, torch.Tensor) and result.device.type != "cpu"
         ):
-            synchronize_device(result)
+            synchronize_device()
     except Exception as exc:
         if code is None:
             try:
@@ -960,7 +1077,7 @@ def _run_bound_kernel(
             sys.stderr.write("Failed to run kernel.\n")
         if has_device_tensor:
             try:
-                synchronize_device(None)
+                synchronize_device()
             except Exception as sync_error:
                 raise exc from sync_error
         raise
@@ -968,10 +1085,10 @@ def _run_bound_kernel(
 
 
 def code_and_output(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> tuple[str, object]:
+) -> tuple[str, _R]:
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
         if kwargs:
@@ -986,14 +1103,14 @@ def code_and_output(
     config = _bound_test_config(bound, **kwargs)
     code, result = _run_bound_kernel(bound, args, config, emit_code=True)
     assert code is not None
-    return code, result
+    return code, cast("_R", result)
 
 
 def output_only(
-    fn: Kernel,
+    fn: Kernel[_R],
     args: tuple[object, ...],
     **kwargs: object,
-) -> object:
+) -> _R:
     """Run a kernel for correctness checks without eagerly materializing code text."""
     bound = fn.bind(args)
     if is_ref_mode_enabled(bound.kernel.settings):
@@ -1005,7 +1122,7 @@ def output_only(
 
     config = _bound_test_config(bound, **kwargs)
     _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
-    return result
+    return cast("_R", result)
 
 
 def _as_tensors(result: object) -> list[torch.Tensor]:
@@ -1016,6 +1133,43 @@ def _as_tensors(result: object) -> list[torch.Tensor]:
     return [result.clone()]
 
 
+def _with_tf32_precision(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Run a test helper with TF32 enabled, restoring prior precision settings."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        orig_matmul_fp32_precision: str | None = None
+        orig_cudnn_fp32_precision: str | None = None
+        orig_float32_matmul_precision: str | None = None
+        try:
+            cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+            orig_matmul_fp32_precision = cast(
+                "str", torch.backends.cuda.matmul.fp32_precision
+            )
+            orig_cudnn_fp32_precision = cast("str", cudnn_conv.fp32_precision)
+            torch.backends.cuda.matmul.fp32_precision = "tf32"
+            cudnn_conv.fp32_precision = "tf32"
+        except AttributeError:  # No cudnn available
+            orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+            torch.set_float32_matmul_precision("high")  # older deprecated API
+
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if (
+                orig_matmul_fp32_precision is not None
+                and orig_cudnn_fp32_precision is not None
+            ):
+                cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+                torch.backends.cuda.matmul.fp32_precision = orig_matmul_fp32_precision
+                cudnn_conv.fp32_precision = orig_cudnn_fp32_precision
+            elif orig_float32_matmul_precision is not None:
+                torch.set_float32_matmul_precision(orig_float32_matmul_precision)
+
+    return wrapper
+
+
+@_with_tf32_precision
 def run_example(
     kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
     baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
@@ -1029,8 +1183,11 @@ def run_example(
     trace_path: str | None = None,
     process_group_name: str | None = None,
     interleaved: bool = True,
-) -> None:
+) -> dict[str, float]:
     """Run complete example: correctness check + benchmark.
+
+    Returns:
+        Dictionary mapping implementation names to their benchmark times in ms.
 
     Args:
         kernel_fn: Single kernel function, or dict of {name: function} for multiple kernel variants
@@ -1049,11 +1206,6 @@ def run_example(
     if dist.is_initialized() and process_group_name is None:
         assert dist.group.WORLD is not None
         process_group_name = dist.group.WORLD.group_name
-    try:
-        torch.backends.cuda.matmul.fp32_precision = "tf32"
-        torch.backends.cudnn.conv.fp32_precision = "tf32"  # type: ignore[reportAttributeAccessIssue]
-    except AttributeError:  # No cudnn available
-        torch.set_float32_matmul_precision("high")  # older deprecated API
 
     # Normalize to dict format
     kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
@@ -1152,6 +1304,7 @@ def run_example(
                     )
 
                     if baseline_grad is not None:
+                        assert tensor.grad is not None
                         torch.testing.assert_close(
                             tensor.grad.to(torch.float32),
                             baseline_grad.to(torch.float32),
@@ -1167,8 +1320,10 @@ def run_example(
     # Benchmark all functions — clone args to avoid buffer donation issues
     cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
-    bench_fns = [functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()]
-    repeat = compute_repeat(bench_fns[0])
+    benchmark_functions = [
+        functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()
+    ]
+    repeat = compute_repeat(benchmark_functions[0], default_cudagraph=True)
 
     # For distributed workload, different rank may have slightly different
     # benchmarking result causing diverging `repeat` value.
@@ -1184,14 +1339,23 @@ def run_example(
 
     with profile_context:
         if interleaved:
-            # pyrefly: ignore[bad-argument-type]
-            timings = interleaved_bench(bench_fns, repeat=repeat, desc="Benchmarking")
+            timings = interleaved_bench(
+                # pyrefly: ignore[bad-argument-type]
+                benchmark_functions,
+                repeat=repeat,
+                desc="Benchmarking",
+                default_cudagraph=True,
+            )
         else:
             timings = typing.cast(
                 "list[float]",
                 [
-                    do_bench(bench_fn, process_group_name=process_group_name)
-                    for bench_fn in bench_fns
+                    do_bench(
+                        benchmark_function,
+                        process_group_name=process_group_name,
+                        default_cudagraph=True,
+                    )
+                    for benchmark_function in benchmark_functions
                 ],
             )
 
@@ -1222,6 +1386,8 @@ def run_example(
 
         print(f"{'=' * 65}\n", file=sys.stderr)
 
+    return all_times
+
 
 def _assert_example_result_close(
     result: object,
@@ -1230,6 +1396,7 @@ def _assert_example_result_close(
     skip_accuracy: bool,
     atol: float,
     rtol: float,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
 ) -> None:
     if skip_accuracy:
         return
@@ -1245,9 +1412,19 @@ def _assert_example_result_close(
         assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
             f"Type mismatch: got {type(got)}, expected {type(exp)}"
         )
+        got_f32 = got.to(torch.float32)
+        exp_f32 = exp.to(torch.float32)
+
+        if cos_sim is not None:
+            dim, min_sim = cos_sim
+            sim = torch.nn.functional.cosine_similarity(got_f32, exp_f32, dim=dim)
+            assert sim.mean().item() >= min_sim, (
+                f"Cosine similarity {sim.mean().item()} is less than {min_sim}"
+            )
+
         torch.testing.assert_close(
-            got.to(torch.float32),
-            exp.to(torch.float32),
+            got_f32,
+            exp_f32,
             atol=atol,
             rtol=rtol,
         )
@@ -1277,6 +1454,7 @@ def check_example(
     atol: float = 1e-1,
     rtol: float = 1e-2,
     emit_code: bool = True,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
     **kwargs: object,
 ) -> str:
     """Helper used in unit tests to run a single example kernel and check its output."""
@@ -1296,7 +1474,12 @@ def check_example(
             **kwargs,
         )
     _assert_example_result_close(
-        result, expected, skip_accuracy=skip_accuracy, atol=atol, rtol=rtol
+        result,
+        expected,
+        skip_accuracy=skip_accuracy,
+        atol=atol,
+        rtol=rtol,
+        cos_sim=cos_sim,
     )
     return code
 
