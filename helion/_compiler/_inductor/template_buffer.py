@@ -522,6 +522,11 @@ class HelionTemplateBuffer(TemplateBuffer):
             if inputs
             else cast("BoundKernel", buffer_kwargs["bound_kernel"]).env.device
         )
+        if (
+            dev.index is None
+            and dev.type == torch.accelerator.current_accelerator().type
+        ):
+            dev = torch.device(dev.type, torch.accelerator.current_device_index())
 
         mutated_nodes = [
             realized_inputs[n] for n in mutated_input_names if n in realized_inputs
