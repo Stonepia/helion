@@ -14,7 +14,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
-from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -123,7 +122,6 @@ class TestBroadcasting(RefEagerTestBase, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @skipIfXPU("Type promotion issue on XPU backend")
     def test_python_float_promotion(self):
         # Repro for https://github.com/pytorch/helion/issues/493
         # Python floats should follow PyTorch type promotion (no unintended fp64 upcast)

@@ -1018,7 +1018,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
     )
-    @skipIfXPU("Timeout on XPU")
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
