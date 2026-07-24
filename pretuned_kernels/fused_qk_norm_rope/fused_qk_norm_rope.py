@@ -278,6 +278,7 @@ def _make_inputs(
     num_tokens: int,
     num_q_heads: int,
     num_kv_heads: int,
+    device: torch.device | str = "cuda",
 ) -> tuple[torch.Tensor, ...]:
     head_dim = 128
     in_dtype = torch.bfloat16
@@ -285,13 +286,15 @@ def _make_inputs(
     is_neox = True
     rotary_dim = head_dim
     total_dim = (num_q_heads + 2 * num_kv_heads) * head_dim
-    qkv = torch.empty(num_tokens, total_dim, dtype=in_dtype, device="cuda").uniform_(
+    qkv = torch.empty(num_tokens, total_dim, dtype=in_dtype, device=device).uniform_(
         -0.1, 0.1
     )
-    positions = torch.arange(num_tokens, dtype=torch.long, device="cuda")
-    q_weight = torch.empty(head_dim, dtype=in_dtype, device="cuda").uniform_(0.8, 1.2)
-    k_weight = torch.empty(head_dim, dtype=in_dtype, device="cuda").uniform_(0.8, 1.2)
-    cos_sin_cache = _compute_cos_sin_cache(40960, rotary_dim).to(in_dtype)
+    positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+    q_weight = torch.empty(head_dim, dtype=in_dtype, device=device).uniform_(0.8, 1.2)
+    k_weight = torch.empty(head_dim, dtype=in_dtype, device=device).uniform_(0.8, 1.2)
+    cos_sin_cache = _compute_cos_sin_cache(40960, rotary_dim, device=device).to(
+        in_dtype
+    )
     return (
         qkv,
         num_q_heads,
@@ -314,11 +317,11 @@ def _bench_shapes() -> list[tuple[int, int, int]]:
     return [(t, qh, kvh) for (qh, kvh) in num_heads_pair for t in num_tokens_list]
 
 
-def correctness_check() -> None:
+def correctness_check(device: torch.device | str = "cuda") -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
     for num_tokens, q_heads, kv_heads in _bench_shapes():
-        args = _make_inputs(num_tokens, q_heads, kv_heads)
+        args = _make_inputs(num_tokens, q_heads, kv_heads, device=device)
         qkv = args[0]
         qkv_helion = qkv.clone()
         qkv_torch = qkv.clone()

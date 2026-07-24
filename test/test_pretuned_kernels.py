@@ -1,6 +1,6 @@
 """Correctness and perf tests for kernels under ``pretuned_kernels/``.
 
-Correctness runs on every CUDA / ROCm runner; perf gating runs only on
+Correctness runs on every supported CUDA / ROCm / XPU runner; perf gating runs only on
 the hardware where each kernel's checked-in heuristics apply.
 """
 
@@ -356,8 +356,8 @@ class TestPretunedKernelsCorrectness(TestCase):
     """Numerical correctness vs. PyTorch eager."""
 
     def _run_correctness(self, name: str) -> None:
-        if not is_cuda():
-            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if not is_cuda() and DEVICE.type != "xpu":
+            self.skipTest("Pretuned kernels require CUDA / ROCm / XPU.")
         module = _import_pretuned_kernel_module(_KERNEL_MODULE_NAMES.get(name, name))
         kernel = getattr(module, name)
         builder = _INPUT_BUILDERS[name]
@@ -391,9 +391,9 @@ class TestPretunedKernelsCorrectness(TestCase):
         self._run_correctness("rope_bwd")
 
     def test_scaled_mm(self):
-        if not is_cuda():
-            self.skipTest("Pretuned kernels require CUDA / ROCm.")
-        if torch.cuda.get_device_capability() < (8, 9):
+        if not is_cuda() and DEVICE.type != "xpu":
+            self.skipTest("Pretuned kernels require CUDA / ROCm / XPU.")
+        if is_cuda() and torch.cuda.get_device_capability() < (8, 9):
             self.skipTest("scaled_mm requires FP8 support (SM89+).")
         module = _import_pretuned_kernel_module("scaled_mm")
         kernel = module.scaled_mm
@@ -417,12 +417,12 @@ class TestPretunedKernelsCorrectness(TestCase):
     def _run_vllm_ported_correctness(self, name: str, needs_fp8: bool = True) -> None:
         # vLLM-ported kernels self-verify via the module's correctness_check(),
         # which runs the kernel and its torch-native reference on one shape.
-        if not is_cuda():
-            self.skipTest("Pretuned kernels require CUDA / ROCm.")
-        if needs_fp8 and torch.cuda.get_device_capability() < (8, 9):
+        if not is_cuda() and DEVICE.type != "xpu":
+            self.skipTest("Pretuned kernels require CUDA / ROCm / XPU.")
+        if needs_fp8 and is_cuda() and torch.cuda.get_device_capability() < (8, 9):
             self.skipTest(f"{name} requires FP8 support (SM89+).")
         module = _import_pretuned_kernel_module(name)
-        module.correctness_check()
+        module.correctness_check(device=DEVICE)
 
     def test_silu_mul_fp8(self):
         self._run_vllm_ported_correctness("silu_mul_fp8")
