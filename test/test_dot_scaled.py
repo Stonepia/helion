@@ -91,7 +91,6 @@ class TestDotScaled(TestCase):
                 "fp16 tl.dot_scaled is unsupported on this Triton/CUDA target"
             )
 
-    @requires_sm100
     def test_invalid_format_string(self):
         """Verify that an invalid format string raises ValueError."""
         with self.assertRaises((ValueError, helion.exc.InternalError)):
@@ -127,7 +126,6 @@ class TestDotScaled(TestCase):
             y_scale = torch.ones(4, 64, device=DEVICE, dtype=torch.float32)
             bad_format_kernel(x, x_scale, y, y_scale)
 
-    @requires_sm100
     def test_3d_tensor_rejected(self):
         """Verify that 3D tensors are rejected."""
         with self.assertRaises((ValueError, helion.exc.ControlFlowTensorMismatch)):

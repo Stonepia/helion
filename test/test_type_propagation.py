@@ -185,7 +185,6 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         output = type_propagation_report(kernel, x)
         self.assertExpectedJournal(output)
 
-    @skipIfXPU("CUDA-only")
     def test_list_iteration(self):
         @helion.kernel()
         def kernel_list_iteration(

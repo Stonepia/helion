@@ -440,7 +440,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 128, 128, 256],
         )
 
-    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -2851,56 +2850,48 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
-    @skipIfNotCUDA()
     @skipIfCute("linear-attention examples not supported on cute backend")
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
