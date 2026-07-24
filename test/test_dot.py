@@ -239,19 +239,17 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertIn("out_dtype=tl.float32", code)
 
         # Test case 2: separate addition (acc_dtype = float16, common dtype = float32)
-        # TODO(Eikan): Support this case on XPU
-        if not torch.xpu.is_available():
-            input_dtype_2 = torch.float32
-            acc_dtype_2 = torch.float16
-            x2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
-            y2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
-            code2, out2 = code_and_output(dot_kernel_acc_arg, (x2, y2, acc_dtype_2))
-            # Validate we use separate addition pattern with cast
-            self.assertIn("tl.dot(", code2)
-            # Check for the addition pattern: acc + result
-            self.assertIn(" + ", code2)
-            # Check that we cast the result to acc_dtype
-            self.assertIn("tl.cast", code2)
+        input_dtype_2 = torch.float32
+        acc_dtype_2 = torch.float16
+        x2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
+        y2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
+        code2, out2 = code_and_output(dot_kernel_acc_arg, (x2, y2, acc_dtype_2))
+        # Validate we use separate addition pattern with cast
+        self.assertIn("tl.dot(", code2)
+        # Check for the addition pattern: acc + result
+        self.assertIn(" + ", code2)
+        # Check that we cast the result to acc_dtype
+        self.assertIn("tl.cast", code2)
 
         # Test case 3: separate addition (acc_dtype = int32, common dtype = int8)
         input_dtype_3 = torch.int8
