@@ -2929,6 +2929,36 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
+    @requires_fusion_support
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_scalar_sized_output_without_tensor_inputs(self):
+        """A scalar-sized output must not leak Helion's internal SymInt."""
+
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            torch_compile_fusion=True,
+        )
+        def scalar_device_kernel(n: int, device: torch.device) -> torch.Tensor:
+            out = torch.empty([n], dtype=torch.float32, device=device)
+            for tile in hl.tile(out.size()):
+                out[tile] = 3.0
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            # Keep the outer graph on the accelerator without giving the
+            # Helion kernel a tensor input from which to derive its output.
+            return scalar_device_kernel(16, DEVICE)
+
+        scalar_device_kernel.reset()
+        torch._dynamo.reset()
+        x = torch.ones(1, dtype=torch.float32, device=DEVICE)
+        with fresh_cache():
+            actual = torch.compile(f, fullgraph=True, backend="inductor")(x)
+
+        expected = torch.full((16,), 3.0, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(actual, expected)
+
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_no_return(self, allow_torch_compile_fusion):
