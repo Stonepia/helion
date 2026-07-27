@@ -103,6 +103,17 @@ def unswizzle_fp8_scales(scales: Tensor, rows: int, cols: int) -> Tensor:
     return scales.reshape(-1)[swizzled_scale_offsets(row, col, cols)]
 
 
+def _reference_unswizzle_fp8_scales(scales: Tensor, rows: int, cols: int) -> Tensor:
+    """Recover logical scales without the production offset/indexing helpers."""
+    row_tiles = _ceil_div(rows, 128)
+    col_tiles = _ceil_div(cols, 4)
+    physical = scales.reshape(row_tiles, col_tiles, 32, 4, 4)
+    logical_padded = physical.permute(0, 3, 2, 1, 4).reshape(
+        row_tiles * 128, col_tiles * 4
+    )
+    return logical_padded[:rows, :cols]
+
+
 def _check_swizzled_scales(
     name: str,
     scales: Tensor,
@@ -165,6 +176,87 @@ def _nvfp4_matmul_single_pass_kernel(
     return out
 
 
+def _portable_e2m1(packed: Tensor) -> tuple[Tensor, Tensor]:
+    value = packed.to(torch.int32)
+
+    def decode(nibble: Tensor) -> Tensor:
+        sign = ((nibble >> 3) & 1).to(torch.float32)
+        magnitude = (nibble & 7).to(torch.float32)
+        absolute = torch.where(
+            magnitude < 4.0,
+            magnitude * 0.5,
+            torch.where(magnitude < 6.0, magnitude - 2.0, magnitude * 2.0 - 8.0),
+        )
+        return absolute * (1.0 - 2.0 * sign)
+
+    return decode(value & 0xF), decode((value >> 4) & 0xF)
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none", backend="triton")
+def _nvfp4_matmul_portable_xpu_kernel(
+    a_groups: Tensor,
+    b_bytes: Tensor,
+    weight_scale: Tensor,
+    out: Tensor,
+    alpha: float = 1.0,
+) -> Tensor:
+    M, K_groups, _ = a_groups.shape
+    _, _, N = b_bytes.shape
+    for tile_m, tile_n in hl.tile([M, N], block_size=[16, 16]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K_groups, block_size=8):
+            offsets = swizzled_scale_offsets(
+                tile_n.index[None, :], tile_k.index[:, None], K_groups
+            )
+            scale = weight_scale[offsets].to(torch.float32)
+            for byte in hl.static_range(8):
+                weight_lo, weight_hi = _portable_e2m1(
+                    b_bytes[tile_k, byte, tile_n]
+                )
+                a_lo = a_groups[tile_m, tile_k, byte * 2].to(torch.float32)
+                a_hi = a_groups[tile_m, tile_k, byte * 2 + 1].to(torch.float32)
+                contrib_lo = a_lo.unsqueeze(2) * weight_lo.unsqueeze(0)
+                contrib_hi = a_hi.unsqueeze(2) * weight_hi.unsqueeze(0)
+                acc = acc + ((contrib_lo + contrib_hi) * scale.unsqueeze(0)).sum(
+                    dim=1
+                )
+        out[tile_m, tile_n] = (acc * alpha).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none", backend="triton")
+def _nvfp4_scaled_matmul_portable_xpu_kernel(
+    a_groups: Tensor,
+    b_groups: Tensor,
+    scale_a: Tensor,
+    scale_b: Tensor,
+    out: Tensor,
+) -> Tensor:
+    M, K_groups, _ = a_groups.shape
+    _, _, N = b_groups.shape
+    for tile_m, tile_n in hl.tile([M, N], block_size=[16, 16]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K_groups, block_size=8):
+            a_offsets = swizzled_scale_offsets(
+                tile_m.index[:, None], tile_k.index[None, :], K_groups
+            )
+            b_offsets = swizzled_scale_offsets(
+                tile_n.index[None, :], tile_k.index[:, None], K_groups
+            )
+            scale = (
+                scale_a[a_offsets].to(torch.float32).unsqueeze(2)
+                * scale_b[b_offsets].to(torch.float32).unsqueeze(0)
+            )
+            for byte in hl.static_range(8):
+                a_lo, a_hi = _portable_e2m1(a_groups[tile_m, tile_k, byte])
+                b_lo, b_hi = _portable_e2m1(b_groups[tile_k, byte, tile_n])
+                contrib_lo = a_lo.unsqueeze(2) * b_lo.unsqueeze(0)
+                contrib_hi = a_hi.unsqueeze(2) * b_hi.unsqueeze(0)
+                acc = acc + ((contrib_lo + contrib_hi) * scale).sum(dim=1)
+        out[tile_m, tile_n] = acc
+    return out
+
+
 def nvfp4_matmul(
     A: Tensor,
     B_packed: Tensor,
@@ -198,6 +290,14 @@ def nvfp4_matmul(
     _check_swizzled_scales("weight_scale", weight_scale, N, K_groups)
     b_fp4x2 = _as_fp4x2(B_packed)
     out = torch.empty(M, N, dtype=torch.bfloat16, device=A.device)
+    if A.device.type == "xpu":
+        return _nvfp4_matmul_portable_xpu_kernel(
+            A.view(M, K_groups, 16),
+            _fp4_storage(b_fp4x2).view(K_groups, 8, N),
+            weight_scale.reshape(-1),
+            out,
+            alpha,
+        )
     return _nvfp4_matmul_single_pass_kernel(
         A.view(M, K_groups, 16),
         b_fp4x2.view(K_groups, 8, N),
@@ -239,7 +339,9 @@ def nvfp4_scaled_matmul(
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
     """
-    Native Blackwell FP4 x FP4 block-scaled GEMM using ``torch._scaled_mm``.
+    CUDA uses native Blackwell FP4 x FP4 block-scaled GEMM. XPU uses the
+    portable Triton correctness fallback because the native PVC primitive is
+    experimental and not a correctness oracle.
 
     ``A_packed`` has shape ``[M, K // 2]``. ``B_packed_t`` is the transposed
     packed RHS with shape ``[K // 2, N]``, matching ``torch._scaled_mm``.
@@ -258,12 +360,53 @@ def nvfp4_scaled_matmul(
         raise TypeError(f"scale_a must be torch.float8_e4m3fn, got {scale_a.dtype}")
     if scale_b.dtype is not torch.float8_e4m3fn:
         raise TypeError(f"scale_b must be torch.float8_e4m3fn, got {scale_b.dtype}")
+    if A.device.type == "xpu":
+        out = torch.empty(M, N, dtype=out_dtype, device=A.device)
+        return _nvfp4_scaled_matmul_portable_xpu_kernel(
+            _fp4_storage(A).view(M, K_groups, 8),
+            _fp4_storage(B_t).view(K_groups, 8, N),
+            scale_a.reshape(-1),
+            scale_b.reshape(-1),
+            out,
+        )
     return torch._scaled_mm(
         A,
         B_t,
         scale_a.reshape(-1),
         scale_b.reshape(-1),
         out_dtype=out_dtype,
+    )
+
+
+def nvfp4_scaled_matmul_native_xpu_experimental(
+    A_packed: Tensor,
+    B_packed_t: Tensor,
+    scale_a: Tensor,
+    scale_b: Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Use the XPU native primitive only for explicit upstream validation."""
+    A, B_t, M, K, N = _prepare_scaled_mm_inputs(A_packed, B_packed_t)
+    K_groups = K // 16
+    _check_swizzled_scales("scale_a", scale_a, M, K_groups)
+    _check_swizzled_scales("scale_b", scale_b, N, K_groups)
+    if A.device.type != "xpu":
+        raise ValueError("native XPU NVFP4 adapter requires XPU tensors")
+    scale_a_logical = unswizzle_fp8_scales(scale_a, M, K_groups).contiguous()
+    scale_b_logical = unswizzle_fp8_scales(scale_b, N, K_groups).contiguous()
+    return torch.ops.aten._scaled_mm_v2.default(
+        A,
+        B_t,
+        [scale_a_logical],
+        [2],  # ScalingType.BlockWise1x16
+        [0],  # SwizzleType.NO_SWIZZLE
+        [scale_b_logical],
+        [2],
+        [0],
+        None,
+        out_dtype,
+        [],
+        False,
     )
 
 
@@ -348,13 +491,21 @@ def reference_nvfp4_scaled_matmul(
     K_groups = K // 16
     _check_swizzled_scales("scale_a", scale_a, M, K_groups)
     _check_swizzled_scales("scale_b", scale_b, N, K_groups)
-    return torch._scaled_mm(
-        A,
-        B_t,
-        scale_a.reshape(-1),
-        scale_b.reshape(-1),
-        out_dtype=out_dtype,
-    )
+    a_storage = _fp4_storage(A)
+    lut = FP4_E2M1_LUT.to(A.device)
+    a_lo = lut[(a_storage & 0xF).to(torch.long)]
+    a_hi = lut[((a_storage >> 4) & 0xF).to(torch.long)]
+    a_dequant = torch.stack([a_lo, a_hi], dim=-1).reshape(M, K)
+    b_dequant = unpack_and_dequantize_fp4(B_t)
+    scale_a_logical = _reference_unswizzle_fp8_scales(
+        scale_a, M, K_groups
+    ).to(torch.float32)
+    scale_b_logical = _reference_unswizzle_fp8_scales(
+        scale_b, N, K_groups
+    ).to(torch.float32)
+    a_dequant = a_dequant * scale_a_logical.repeat_interleave(16, dim=1)
+    b_dequant = b_dequant * scale_b_logical.T.repeat_interleave(16, dim=0)
+    return (a_dequant @ b_dequant).to(out_dtype)
 
 
 def make_fp8_scales(shape: tuple[int, ...], device: torch.device) -> Tensor:
@@ -369,7 +520,7 @@ def make_random_fp4(shape: tuple[int, int], device: torch.device) -> Tensor:
     rows, cols = shape
     if cols % 2 != 0:
         raise ValueError(f"FP4 logical trailing dimension must be even, got {cols}")
-    storage = torch.randint(0, 2, (rows, cols // 2), device=device, dtype=torch.uint8)
+    storage = torch.randint(0, 256, (rows, cols // 2), device=device, dtype=torch.uint8)
     return storage.view(torch.float4_e2m1fn_x2)
 
 
@@ -413,7 +564,7 @@ def check(m: int, k: int, n: int) -> None:
 
 
 def check_scaled(m: int, k: int, n: int) -> None:
-    """Test and benchmark the native FP4 x FP4 block-scaled CuTe path."""
+    """Test and benchmark the selected FP4 x FP4 block-scaled path."""
     A = make_random_fp4((m, k), DEVICE)
     B = make_random_fp4((n, k), DEVICE)
     B_t = B.T
@@ -431,12 +582,16 @@ def check_scaled(m: int, k: int, n: int) -> None:
 
     from triton.testing import do_bench
 
-    torch.cuda.synchronize()
+    if A.device.type == "cuda":
+        torch.cuda.synchronize()
+    else:
+        torch.xpu.synchronize()
     fast_ms = do_bench(lambda: nvfp4_scaled_matmul(A, B_t, scale_a, scale_b))
     torch_ms = do_bench(lambda: reference_nvfp4_scaled_matmul(A, B_t, scale_a, scale_b))
-    print(f"Native FP4xFP4 passed for shapes: M={m}, K={k}, N={n}")
-    print(f"  fast path:   {fast_ms:.4f} ms")
-    print(f"  torch ref:   {torch_ms:.4f} ms")
+    path = "XPU portable fallback" if A.device.type == "xpu" else "CUDA native CuTe path"
+    print(f"{path} passed for shapes: M={m}, K={k}, N={n}")
+    print(f"  selected path: {fast_ms:.4f} ms")
+    print(f"  independent reference: {torch_ms:.4f} ms")
 
 
 # %%
