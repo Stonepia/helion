@@ -15,11 +15,23 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfNotCUDA
+from helion._testing import is_cuda
+from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.exc as exc
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonStandardReductionHeuristicXPU,
+)
 import helion.language as hl
+
+
+def skipUnlessCUDAOrXPU():
+    """Run promoted reduction regressions only on CUDA or Intel XPU."""
+    return skipIfFn(
+        lambda: not (is_cuda() or torch.xpu.is_available()),
+        reason="Test skipped: CUDA (NVIDIA GPU) or Intel XPU is not available.",
+    )
 
 
 @helion.kernel()
@@ -292,7 +304,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
         self.assertEqual(len(device_ir.rolled_reductions), 1)
         self.assertEqual(len(fake_env.config_spec.reduction_loops), 1)
 
-    @skipIfNotCUDA()
+    @skipUnlessCUDAOrXPU()
     @skipIfRefEager("promoted-seed pid_type is only materialized in compiled mode")
     @skipIfTileIR("TileIR does not support barrier operations")
     def test_reduction_seed_default_config_is_persistent(self) -> None:
@@ -317,6 +329,18 @@ class TestBarrier(RefEagerTestBase, TestCase):
 
         x = torch.randn([256, 8192], device=DEVICE, dtype=torch.float32)
         expected = (x.double().sum(-1) * 2.0).float()
+        bound = barrier_reduction.bind((x,))
+        if DEVICE.type == "xpu":
+            promoted_default = bound.config_spec.compiler_default_config
+            self.assertIsNotNone(promoted_default)
+            self.assertEqual(
+                bound.config_spec.autotuner_heuristics,
+                [TritonStandardReductionHeuristicXPU.name],
+            )
+            default = bound.config_spec.default_config()
+            for key, value in promoted_default.config.items():
+                self.assertEqual(default.config[key], value)
+            self.assertTrue(default.config["pid_type"].startswith("persistent"))
         _code, out = code_and_output(barrier_reduction, (x,))
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-2)
 

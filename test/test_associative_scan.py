@@ -11,11 +11,23 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
-from helion._testing import skipIfNotCUDA
+from helion._testing import is_cuda
+from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonStandardReductionHeuristicXPU,
+)
 from helion.runtime.settings import _get_backend
+
+
+def skipUnlessCUDAOrXPU():
+    """Run promoted reduction regressions only on CUDA or Intel XPU."""
+    return skipIfFn(
+        lambda: not (is_cuda() or torch.xpu.is_available()),
+        reason="Test skipped: CUDA (NVIDIA GPU) or Intel XPU is not available.",
+    )
 
 
 def add_combine_fn(x, y):
@@ -1061,7 +1073,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             self.assertIn("def argmax_combine_tuple_fn_", code)
             self.assertIn("tl.associative_scan", code)
 
-    @skipIfNotCUDA()
+    @skipUnlessCUDAOrXPU()
     @skipIfRefEager(
         "promoted-seed reduction_loops is only materialized in compiled mode"
     )
@@ -1087,6 +1099,18 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         x = torch.randn([8, 4, 2048], device=DEVICE, dtype=torch.float32)
         expected = torch.cumsum(x.double(), dim=1).amax(1).float()
+        bound = cumsum_mid_reduce.bind((x,))
+        if DEVICE.type == "xpu":
+            promoted_default = bound.config_spec.compiler_default_config
+            self.assertIsNotNone(promoted_default)
+            self.assertEqual(
+                bound.config_spec.autotuner_heuristics,
+                [TritonStandardReductionHeuristicXPU.name],
+            )
+            default = bound.config_spec.default_config()
+            for key, value in promoted_default.config.items():
+                self.assertEqual(default.config[key], value)
+            self.assertNotIn("reduction_loops", default.config)
         _code, out = code_and_output(cumsum_mid_reduce, (x,))
         torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 

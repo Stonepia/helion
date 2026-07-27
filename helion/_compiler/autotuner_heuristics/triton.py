@@ -593,6 +593,17 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
     # NOT bound the grad-param COLLAPSE branch (which intentionally batches rows to cut the
     # cross-grid finalize) nor a raised autotuner_min floor (max(floor, ...) still wins).
     WIDEN_MAX_ROWS = 8
+    # Target SM waves after collapsing a cross-grid finalize.
+    COLLAPSE_TARGET_WAVES = 1
+    # The reduction-extent warp ramp and L2 policies are hardware tuning values.
+    WARP_RAMP: ClassVar[tuple[tuple[int | None, int], ...]] = (
+        (1024, 4),
+        (4096, 8),
+        (16384, 16),
+        (None, 32),
+    )
+    STREAM_EVICTION_POLICY = "first"
+    REREAD_EVICTION_POLICY = "last"
 
     # num_warps ramp: keyed on the primary reduction extent (see ``_num_warps``).
 
@@ -712,14 +723,10 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         """Scale num_warps with the reduction extent (pow2): rnumel <= 1024 -> 4, <= 4096 -> 8,
         <= 16384 -> 16, > 16384 -> 32."""
         rnumel = pd.size_hint
-        warps32_min_elems = 16384
-        if rnumel > warps32_min_elems:
-            return 32
-        if rnumel <= 1024:
-            return 4
-        if rnumel <= 4096:
-            return 8
-        return 16
+        for max_elems, num_warps in cls.WARP_RAMP:
+            if max_elems is None or rnumel <= max_elems:
+                return num_warps
+        raise AssertionError("reduction seed warp ramp has no terminal entry")
 
     @classmethod
     def _block_floor(cls, bs_spec: BlockSizeSpec) -> int:
@@ -766,12 +773,12 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         if n <= 0:
             return None
         if kind == "stream":
-            return ["first"] * n
+            return [cls.STREAM_EVICTION_POLICY] * n
         if kind == "reread":
             if reread_slot is None or not 0 <= reread_slot < n:
                 return None
-            policy = ["first"] * n
-            policy[reread_slot] = "last"
+            policy = [cls.STREAM_EVICTION_POLICY] * n
+            policy[reread_slot] = cls.REREAD_EVICTION_POLICY
             return policy
         return None
 
@@ -807,7 +814,7 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
             live tile -> its row co-occupies the working set) WIDENS into the byte remainder (capped
             by occupancy + WIDEN_MAX_ROWS + extent) and FLOORS when the budget is spent. A grid axis
             in NO live tile is REDUCED AWAY (a sequential cross-grid ``.sum(0)`` finalize, holds no
-            bytes) -> its floor raises to ``grid_rows / num_sm`` (collapse the finalize to ~1 SM
+            bytes) -> its floor raises to ``grid_rows / (num_sm * COLLAPSE_TARGET_WAVES)`` (collapse the finalize to ~1 SM
             wave). Both are pure per-axis MEMBERSHIP outcomes — no ``cdiv`` branch, no recognizer.
 
         Then the non-reduction loops LAST (welford's normalize, rms_norm_per_block's groups_per_row)
@@ -1086,7 +1093,17 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
                     # a sequential cross-grid reduction loop (grad-param .sum(0)): in NO live tile ->
                     # NOT resident, holds no bytes. The byte budget cannot size it; raise the floor
                     # to ~1 SM wave to collapse the cross-grid finalize.
-                    collapse = _np2(max(1, grid_rows // num_sm)) if grid_rows > 0 else 1
+                    collapse = (
+                        _np2(
+                            max(
+                                1,
+                                grid_rows
+                                // (num_sm * cls.COLLAPSE_TARGET_WAVES),
+                            )
+                        )
+                        if grid_rows > 0
+                        else 1
+                    )
                     blk = max(floor, min(collapse, ext))
                 elif carried_kernel:
                     # Register-occupancy guard (see ``carried_kernel`` above): the pinned
@@ -1164,8 +1181,8 @@ class _TritonReductionSeedBase(AutotunerHeuristic):
         )
 
 
-class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
-    """standard (Helion-rolled rdim) inner-reduction seed for sm90/H100: Helion rolls the
+class _TritonStandardReductionSeed(_TritonReductionSeedBase):
+    """Device-agnostic standard (Helion-rolled rdim) reduction seed emitter: Helion rolls the
     reduction axis into a ``reduction_loops`` loop from a single ``.sum(-1)``-style op — sum,
     long_sum, rms_norm, layer_norm, softmax-row, cross_entropy. Triton analog of
     ``CuteReductionTileHeuristic`` (keeps its registry name), deepening the original
@@ -1174,9 +1191,8 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
 
     Gated by ``_triton_reduction_eligible`` (standard track) — broader than upstream
     ``is_canonical_row_reduction`` (also multi-axis rollable rows and raised-``autotuner_min``
-    large-M shapes) — AND the sm90 hardware target. sm100 routes to
-    :class:`TritonStandardReductionHeuristicSM100`; unclaimed hardware routes to
-    :class:`TritonNarrowReductionHeuristic`.
+    large-M shapes) — and the concrete track's hardware target. Unclaimed hardware
+    routes to :class:`TritonNarrowReductionHeuristic`.
     """
 
     name = "triton_reduction_tile"
@@ -1271,8 +1287,14 @@ class TritonStandardReductionHeuristicSM90(_TritonReductionSeedBase):
         return _materialize_config(seed, config_spec=spec)
 
 
-class TritonUserTiledReductionHeuristicSM90(_TritonReductionSeedBase):
-    """user-tiled inner-reduction seed for sm90/H100: fires when the user hand-writes the
+class TritonStandardReductionHeuristicSM90(_TritonStandardReductionSeed):
+    """Promoted standard reduction seed for sm90/H100."""
+
+    name = "triton_reduction_tile"
+
+
+class _TritonUserTiledReductionSeed(_TritonReductionSeedBase):
+    """Device-agnostic user-tiled inner-reduction seed emitter: fires when the user hand-writes the
     ``hl.tile`` loop over the reduction axis (so the rdim is an ordinary ``block_sizes`` entry,
     e.g. ``hl.tile(n, block_size=R_BLOCK)``), which the upstream gate rejects entirely.
 
@@ -1334,6 +1356,62 @@ class TritonUserTiledReductionHeuristicSM90(_TritonReductionSeedBase):
         # ``pid_type='flat'`` (disallowed under a barrier / data-dependent bound) is
         # repaired to a legal persistent type instead of shipping the raw seed.
         return _materialize_config(seed, config_spec=spec)
+
+
+class TritonUserTiledReductionHeuristicSM90(_TritonUserTiledReductionSeed):
+    """Promoted user-tiled reduction seed for sm90/H100."""
+
+    name = "triton_reduction_user_tile"
+
+
+# ============================ XPU dedicated carrier/classes ============================ #
+class _TritonReductionSeedXPU(_TritonReductionSeedBase):
+    """XPU constant/gate carrier for promoted reduction seeds.
+
+    The structural reduction-fact allocator and config materialization are shared with
+    other Triton tracks. These initial values are correctness-cleared on PVC but are
+    deliberately owned by XPU and are not a performance calibration for Intel GPUs.
+    """
+
+    HARDWARE_TARGETS = (("xpu", None),)
+    ROW_PERSIST_MAX_BYTES = 245760
+    CARRIED_PERSIST_MAX_BYTES = 122880
+    PERSIST_HOLD_MAX_BYTES = 737280
+    USER_TILE_PERSIST_HOLD_MAX_BYTES = 294912
+    LOOPED_CHUNK = 16384
+    MIN_WAVES = 8
+    WIDEN_MAX_ROWS = 8
+    COLLAPSE_TARGET_WAVES = 1
+    WARP_RAMP = ((1024, 4), (4096, 8), (16384, 16), (None, 32))
+    STREAM_EVICTION_POLICY = "first"
+    REREAD_EVICTION_POLICY = "last"
+    NON_REDUCTION_LOOP_MAX_ELEMS: int | None = None
+
+    @classmethod
+    def non_reduction_loop_block_cap(
+        cls, spec: ConfigSpec, pd: ReductionDescriptor
+    ) -> int | None:
+        return cls.NON_REDUCTION_LOOP_MAX_ELEMS
+
+
+class TritonStandardReductionHeuristicXPU(
+    _TritonReductionSeedXPU, _TritonStandardReductionSeed
+):
+    """Promoted standard reduction seed for XPU.
+
+    This reuses only the device-agnostic standard emission and shared allocator; the
+    XPU carrier owns its hardware target and all currently selected tuning values.
+    """
+
+    name = "triton_reduction_tile_xpu"
+
+
+class TritonUserTiledReductionHeuristicXPU(
+    _TritonReductionSeedXPU, _TritonUserTiledReductionSeed
+):
+    """Promoted user-tiled reduction seed for XPU with XPU-owned constants."""
+
+    name = "triton_reduction_user_tile_xpu"
 
 
 def _config_with_num_warps(cfg: Config, num_warps: int) -> Config:
@@ -1421,7 +1499,7 @@ class _TritonReductionSeedSM100(_TritonReductionSeedBase):
 
 
 class TritonStandardReductionHeuristicSM100(
-    _TritonReductionSeedSM100, TritonStandardReductionHeuristicSM90
+    _TritonReductionSeedSM100, _TritonStandardReductionSeed
 ):
     """standard (Helion-rolled rdim) inner-reduction seed for sm100/B200: the rich
     :class:`TritonStandardReductionHeuristicSM90` allocator with B200 constants from
@@ -1431,7 +1509,7 @@ class TritonStandardReductionHeuristicSM100(
 
 
 class TritonUserTiledReductionHeuristicSM100(
-    _TritonReductionSeedSM100, TritonUserTiledReductionHeuristicSM90
+    _TritonReductionSeedSM100, _TritonUserTiledReductionSeed
 ):
     """user-tiled inner-reduction seed for sm100/B200: the rich
     :class:`TritonUserTiledReductionHeuristicSM90` allocator with B200 constants from
@@ -1444,6 +1522,7 @@ class TritonUserTiledReductionHeuristicSM100(
 _TUNED_REDUCTION_TARGETS: tuple[HardwareTarget, ...] = (
     ("cuda", "sm90"),
     ("cuda", "sm100"),
+    ("xpu", None),
 )
 
 

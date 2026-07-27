@@ -20,6 +20,9 @@ from helion._compiler.autotuner_heuristics.triton import TritonNarrowReductionHe
 from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.autotuner_heuristics.triton import (
+    TritonStandardReductionHeuristicXPU,
+)
+from helion._compiler.autotuner_heuristics.triton import (
     TritonStandardReductionHeuristicSM90,
 )
 from helion._compiler.autotuner_heuristics.triton import (
@@ -27,6 +30,9 @@ from helion._compiler.autotuner_heuristics.triton import (
 )
 from helion._compiler.autotuner_heuristics.triton import (
     TritonUserTiledReductionHeuristicSM90,
+)
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonUserTiledReductionHeuristicXPU,
 )
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
@@ -202,6 +208,12 @@ A100_HARDWARE = HardwareInfo(
     hardware_name="NVIDIA A100",
     runtime_version="12.8",
     compute_capability="sm80",
+)
+XPU_HARDWARE = HardwareInfo(
+    device_kind="xpu",
+    hardware_name="Intel Data Center GPU Max 1550",
+    runtime_version="1.14",
+    compute_capability=None,
 )
 
 
@@ -1099,9 +1111,10 @@ class TestTritonStandardReductionHeuristic(TestCase):
     @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
     def test_exactly_one_reduction_track_eligible_per_hardware(self) -> None:
         # The hardware gate lives in ``is_eligible``: for a standard reduction, EXACTLY one of
-        # the three standard-track classes fires per GPU — sm90 -> SM90, sm100 -> SM100, anything
-        # else -> the narrow fallback — and none of them return None-for-deferral from
-        # ``get_seed_config``. This is the invariant the class split exists to guarantee.
+        # the four standard-track classes fires per GPU — sm90 -> SM90, sm100 -> SM100,
+        # xpu -> XPU, and anything else -> the narrow fallback. None return
+        # ``None`` for deferral from ``get_seed_config``. This is the invariant the class
+        # split exists to guarantee.
         @helion.kernel(backend="triton")
         def row_reduction(x: torch.Tensor) -> torch.Tensor:
             m, _ = x.size()
@@ -1120,6 +1133,7 @@ class TestTritonStandardReductionHeuristic(TestCase):
         cases = [
             (HOPPER_HARDWARE, TritonStandardReductionHeuristicSM90),
             (BLACKWELL_HARDWARE, TritonStandardReductionHeuristicSM100),
+            (XPU_HARDWARE, TritonStandardReductionHeuristicXPU),
             (
                 HardwareInfo(
                     device_kind="cuda",
@@ -1133,6 +1147,7 @@ class TestTritonStandardReductionHeuristic(TestCase):
         tracks = [
             TritonStandardReductionHeuristicSM90,
             TritonStandardReductionHeuristicSM100,
+            TritonStandardReductionHeuristicXPU,
             TritonNarrowReductionHeuristic,
         ]
         for hardware, expected in cases:
@@ -1150,6 +1165,46 @@ class TestTritonStandardReductionHeuristic(TestCase):
                 seed = expected.get_seed_config(env, device_ir)
                 self.assertIsNotNone(seed)
                 self.assertEqual(seed.config["block_sizes"], [1])
+                if hardware.device_kind == "xpu":
+                    self.assertIn(
+                        TritonStandardReductionHeuristicXPU.name,
+                        env.config_spec.autotuner_heuristics,
+                    )
+                    self.assertNotIn(
+                        TritonNarrowReductionHeuristic.name,
+                        env.config_spec.autotuner_heuristics,
+                    )
+                    configs = compiler_seed_configs(env, device_ir)
+                    self.assertEqual(len(configs), 1)
+                    compiler_default = env.config_spec.compiler_default_config
+                    self.assertIsNotNone(compiler_default)
+                    default = env.config_spec.default_config()
+                    for key, value in compiler_default.config.items():
+                        self.assertEqual(default.config[key], value)
+
+    def test_xpu_user_tiled_reduction_track_is_independent(self) -> None:
+        """XPU owns a separately named promoted user-tiled reduction track."""
+
+        @helion.kernel(backend="triton")
+        def user_tiled_reduction(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m], dtype=x.dtype)
+                for tile_n in hl.tile(n):
+                    acc += x[tile_m, tile_n].sum(-1)
+                out[tile_m] = acc
+            return out
+
+        with patch("helion._hardware.get_hardware_info", return_value=XPU_HARDWARE):
+            bound = user_tiled_reduction.bind(
+                (torch.randn([128, 1024], device=DEVICE),)
+            )
+        self.assertIn(
+            TritonUserTiledReductionHeuristicXPU.name,
+            bound.config_spec.autotuner_heuristics,
+        )
+        self.assertIsNotNone(bound.config_spec.compiler_default_config)
 
 
 _FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]

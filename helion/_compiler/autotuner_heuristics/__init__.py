@@ -23,8 +23,10 @@ from .triton import TritonPointwiseSeedHeuristic
 from .triton import TritonSkinnyGemmHeuristic
 from .triton import TritonStandardReductionHeuristicSM90
 from .triton import TritonStandardReductionHeuristicSM100
+from .triton import TritonStandardReductionHeuristicXPU
 from .triton import TritonUserTiledReductionHeuristicSM90
 from .triton import TritonUserTiledReductionHeuristicSM100
+from .triton import TritonUserTiledReductionHeuristicXPU
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -52,8 +54,10 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         TritonMatmulReductionEpilogueHeuristic,
         TritonStandardReductionHeuristicSM90,
         TritonStandardReductionHeuristicSM100,
+        TritonStandardReductionHeuristicXPU,
         TritonUserTiledReductionHeuristicSM90,
         TritonUserTiledReductionHeuristicSM100,
+        TritonUserTiledReductionHeuristicXPU,
         TritonNarrowReductionHeuristic,
         TritonPointwiseSeedHeuristic,
     ),
