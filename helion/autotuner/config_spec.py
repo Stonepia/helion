@@ -18,6 +18,7 @@ import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
+from .. import exc
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
 from .._compat import get_num_xcd
@@ -578,6 +579,7 @@ class ConfigSpec:
         # Defaults to the device CU count (consistent with num_xcd) when not
         # passed explicitly by the compile path.
         self.num_sm: int = num_sm if num_sm is not None else device_num_sm(device)
+        self.device: torch.device | None = device
 
         self.block_sizes: BlockIdSequence[BlockSizeSpec] = BlockIdSequence()
         self.num_threads: BlockIdSequence[NumThreadsSpec] = BlockIdSequence()
@@ -1400,6 +1402,33 @@ class ConfigSpec:
     def is_supported_config(self, config: Mapping[str, object]) -> bool:
         return not self.unsupported_config_keys(config)
 
+    def _normalize_xpu_range_warp_specializes(self, config: dict[str, object]) -> None:
+        """XPU fallback for ``range_warp_specializes``.
+
+        The current Intel Triton XPU backend does not implement CUDA-style warp
+        specialization.  Normalize every requested entry to ``None`` and warn if a
+        non-``None`` value is discarded.  Already-``None`` values are left silently.
+        """
+        if self.device is None or self.device.type != "xpu":
+            return
+        value = config.get("range_warp_specializes")
+        if not value or not isinstance(value, (list, tuple)):
+            return
+        if any(v is not None for v in value):
+            from .._compiler.compile_environment import CompileEnvironment
+            from .._compiler.compile_environment import NoCurrentEnvironment
+            from .._compiler.compile_environment import warning
+
+            try:
+                CompileEnvironment.current()
+            except NoCurrentEnvironment:
+                pass
+            else:
+                warning(exc.XPUWarpSpecializeUnsupported(list(value)))
+        # Match the (typically empty) XPU warp-specialize sequence length so the
+        # generic normalize step does not reject the fallback values.
+        config["range_warp_specializes"] = [None] * len(self.range_warp_specialize)
+
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
     ) -> None:
@@ -1439,6 +1468,8 @@ class ConfigSpec:
                     config[names] = [value for _ in range(len(self.reduction_loops))]
                 else:
                     config[names] = [value]
+
+        self._normalize_xpu_range_warp_specializes(config)
 
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
