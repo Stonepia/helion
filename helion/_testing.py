@@ -524,11 +524,6 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
-def skipIfCUDA(reason: str) -> Callable[[Callable], Callable]:
-    """Skip test if running with CUDA."""
-    return skipIfFn(is_cuda, reason)
-
-
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
 

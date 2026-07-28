@@ -531,9 +531,14 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
 @onlyBackends(["triton"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
     def test_autotune_with_subprocess_bench(self) -> None:
-        device = torch.accelerator.current_accelerator(check_available=True)
-        if device is None:
-            self.skipTest("requires an accelerator")
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        if (
+            accelerator is None
+            or accelerator.type not in ("cuda", "xpu")
+            or torch.version.hip is not None
+        ):
+            self.skipTest("requires CUDA or XPU")
+        device = torch.device(accelerator)
 
         examples_dir = Path(__file__).parent.parent / "examples"
         matmul = import_path(examples_dir / "matmul.py").matmul
@@ -554,9 +559,14 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
         # autotune must still pick a best config from the rest.
-        device = torch.accelerator.current_accelerator(check_available=True)
-        if device is None:
-            self.skipTest("requires an accelerator")
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        if (
+            accelerator is None
+            or accelerator.type not in ("cuda", "xpu")
+            or torch.version.hip is not None
+        ):
+            self.skipTest("requires CUDA or XPU")
+        device = torch.device(accelerator)
 
         original = LocalBenchmarkProvider._benchmark_function_subprocess
         call_count = [0, 0]  # [total, simulated_failures]
@@ -601,9 +611,14 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         # check. Patches the accuracy job to raise a sticky CUDA error for a
         # fraction of configs; the worker dies and respawns, and autotune must
         # still pick a best config from the rest instead of aborting.
-        device = torch.accelerator.current_accelerator(check_available=True)
-        if device is None:
-            self.skipTest("requires an accelerator")
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        if (
+            accelerator is None
+            or accelerator.type not in ("cuda", "xpu")
+            or torch.version.hip is not None
+        ):
+            self.skipTest("requires CUDA or XPU")
+        device = torch.device(accelerator)
 
         original = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
         call_count = [0, 0]  # [total, simulated_crashes]
