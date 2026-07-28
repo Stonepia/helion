@@ -24,7 +24,6 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
-from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
@@ -429,9 +428,9 @@ class TestSettingsEnv(TestCase):
 
     def test_distributed_limits_pid_types_to_persistent(self) -> None:
         settings = helion.Settings()
-        device = (
-            torch.device("xpu", 0) if DEVICE.type == "xpu" else torch.device("cuda", 0)
-        )
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        assert accelerator is not None
+        device = torch.device(accelerator.type, 0)
         with (
             patch("torch.distributed.is_initialized", return_value=True),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),

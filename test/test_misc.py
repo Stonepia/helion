@@ -1380,8 +1380,10 @@ class TestLauncher(TestCase):
         Triton's launcher requires the current accelerator context to
         match the tensor's device. Like raw Triton, Helion expects the
         caller to set the device before launching on a non-default device."""
-        device_module = torch.xpu if DEVICE.type == "xpu" else torch.cuda
-        if device_module.device_count() < 2:
+        accelerator = torch.accelerator.current_accelerator(check_available=True)
+        if accelerator is None:
+            self.skipTest("requires an accelerator")
+        if torch.accelerator.device_count() < 2:
             self.skipTest("requires >= 2 accelerator devices")
 
         @helion.kernel(
@@ -1394,18 +1396,18 @@ class TestLauncher(TestCase):
                 out[i] = x[i] + y[i]
             return out
 
-        device0 = torch.device(DEVICE.type, 0)
-        device1 = torch.device(DEVICE.type, 1)
+        device0 = torch.device(accelerator.type, 0)
+        device1 = torch.device(accelerator.type, 1)
 
         x0 = torch.randn(1024, device=device0, dtype=torch.float32)
-        with device_module.device(device0.index):
+        with torch.accelerator.device_index(device0.index):
             out0 = add(x0, x0)
-        device_module.synchronize(0)
+        torch.accelerator.synchronize(device0)
 
         x1 = torch.randn(1024, device=device1, dtype=torch.float32)
-        with device_module.device(device1.index):
+        with torch.accelerator.device_index(device1.index):
             out1 = add(x1, x1)
-        device_module.synchronize(1)
+        torch.accelerator.synchronize(device1)
 
         self.assertEqual(out0.device, device0)
         self.assertEqual(out1.device, device1)

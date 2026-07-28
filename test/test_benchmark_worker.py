@@ -23,7 +23,6 @@ from unittest.mock import patch
 
 import torch
 
-from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
 from helion._testing import onlyBackends
@@ -532,18 +531,16 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
 @onlyBackends(["triton"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
     def test_autotune_with_subprocess_bench(self) -> None:
-        if DEVICE.type == "xpu":
-            if not torch.xpu.is_available():
-                self.skipTest("requires XPU")
-        elif not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
+        device = torch.accelerator.current_accelerator(check_available=True)
+        if device is None:
+            self.skipTest("requires an accelerator")
 
         examples_dir = Path(__file__).parent.parent / "examples"
         matmul = import_path(examples_dir / "matmul.py").matmul
 
         args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
+            torch.randn([512, 512], device=device),
+            torch.randn([512, 512], device=device),
         )
         bound_kernel = matmul.bind(args)
         bound_kernel.settings.autotune_benchmark_subprocess = True
@@ -557,11 +554,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
         # autotune must still pick a best config from the rest.
-        if DEVICE.type == "xpu":
-            if not torch.xpu.is_available():
-                self.skipTest("requires XPU")
-        elif not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
+        device = torch.accelerator.current_accelerator(check_available=True)
+        if device is None:
+            self.skipTest("requires an accelerator")
 
         original = LocalBenchmarkProvider._benchmark_function_subprocess
         call_count = [0, 0]  # [total, simulated_failures]
@@ -582,8 +577,8 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         matmul = import_path(examples_dir / "matmul.py").matmul
 
         args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
+            torch.randn([512, 512], device=device),
+            torch.randn([512, 512], device=device),
         )
         bound_kernel = matmul.bind(args)
         bound_kernel.settings.autotune_benchmark_subprocess = True
@@ -606,11 +601,9 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         # check. Patches the accuracy job to raise a sticky CUDA error for a
         # fraction of configs; the worker dies and respawns, and autotune must
         # still pick a best config from the rest instead of aborting.
-        if DEVICE.type == "xpu":
-            if not torch.xpu.is_available():
-                self.skipTest("requires XPU")
-        elif not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
+        device = torch.accelerator.current_accelerator(check_available=True)
+        if device is None:
+            self.skipTest("requires an accelerator")
 
         original = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
         call_count = [0, 0]  # [total, simulated_crashes]
@@ -637,8 +630,8 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         matmul = import_path(examples_dir / "matmul.py").matmul
 
         args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
+            torch.randn([512, 512], device=device),
+            torch.randn([512, 512], device=device),
         )
         bound_kernel = matmul.bind(args)
         bound_kernel.settings.autotune_benchmark_subprocess = True

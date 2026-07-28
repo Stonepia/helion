@@ -16,7 +16,6 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipIfNotCUDAOrXPU
 from helion._testing import skipIfRefEager
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -92,10 +91,7 @@ class TestDotScaled(TestCase):
                 "fp16 tl.dot_scaled is unsupported on this Triton/CUDA target"
             )
 
-    @skipIfNotCUDAOrXPU()
-    @skipIfCudaCapabilityLessThan(
-        (10, 0), reason="tl.dot_scaled requires CUDA capability >= 10.0 (B200+)"
-    )
+    @requires_sm100
     def test_invalid_format_string(self):
         """Verify that an invalid format string raises ValueError."""
         with self.assertRaises((ValueError, helion.exc.InternalError)):
@@ -131,10 +127,7 @@ class TestDotScaled(TestCase):
             y_scale = torch.ones(4, 64, device=DEVICE, dtype=torch.float32)
             bad_format_kernel(x, x_scale, y, y_scale)
 
-    @skipIfNotCUDAOrXPU()
-    @skipIfCudaCapabilityLessThan(
-        (10, 0), reason="tl.dot_scaled requires CUDA capability >= 10.0 (B200+)"
-    )
+    @requires_sm100
     def test_3d_tensor_rejected(self):
         """Verify that 3D tensors are rejected."""
         with self.assertRaises((ValueError, helion.exc.ControlFlowTensorMismatch)):

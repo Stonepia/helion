@@ -227,13 +227,6 @@ def is_cuda() -> bool:
     return _get_triton_backend() == "cuda" and torch.cuda.is_available()
 
 
-def is_xpu() -> bool:
-    """Return True if running on Intel XPU."""
-    if _get_backend() == "pallas":
-        return False
-    return _get_triton_backend() == "xpu" and torch.xpu.is_available()
-
-
 PROJECT_ROOT: Path = Path(__file__).parent.parent
 EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
 PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
@@ -531,6 +524,11 @@ def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(torch.xpu.is_available(), reason)
 
 
+def skipIfCUDA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with CUDA."""
+    return skipIfFn(is_cuda, reason)
+
+
 def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
 
@@ -564,14 +562,6 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     return skipIfFn(
         lambda: not is_cuda(),
         reason="Test skipped: CUDA (NVIDIA GPU) is not available.",
-    )
-
-
-def skipIfNotCUDAOrXPU() -> Callable[[Callable], Callable]:
-    """Skip test unless running on CUDA or Intel XPU."""
-    return skipIfFn(
-        lambda: not (is_cuda() or is_xpu()),
-        reason="Test skipped: CUDA or Intel XPU is not available.",
     )
 
 

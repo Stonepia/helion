@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextlib import nullcontext
 import csv
-import functools
 import logging
 import math
 import multiprocessing as mp
@@ -88,7 +87,6 @@ _HOPPER_HARDWARE = HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm90",
 )
-_HOPPER_REGS_PER_BLOCK = 65536
 examples_dir = Path(__file__).parent.parent / "examples"
 
 
@@ -130,40 +128,6 @@ def without_env_var(name: str):
     finally:
         if previous is not sentinel:
             os.environ[name] = previous
-
-
-def _cuda_maxnreg_snapshot(
-    test_item: Callable[..., object],
-) -> Callable[..., object]:
-    """Supply CUDA policy inputs only when a snapshot runs on XPU."""
-
-    @functools.wraps(test_item)
-    def wrapper(*args: object, **kwargs: object) -> object:
-        if DEVICE.type != "xpu":
-            return test_item(*args, **kwargs)
-
-        with (
-            patch.object(_compat, "_supports_maxnreg", lambda: True),
-            patch(
-                "helion.autotuner.config_spec._regs_per_block",
-                lambda: _HOPPER_REGS_PER_BLOCK,
-            ),
-            patch(
-                "helion.autotuner.config_spec.warps_to_threads",
-                lambda num_warps: num_warps * 32,
-            ),
-            patch(
-                "helion.autotuner.config_generation.warps_to_threads",
-                lambda num_warps: num_warps * 32,
-            ),
-            patch(
-                "helion._hardware.get_hardware_info",
-                return_value=_HOPPER_HARDWARE,
-            ),
-        ):
-            return test_item(*args, **kwargs)
-
-    return wrapper
 
 
 class RecordingRandomSearch(RandomSearch):
@@ -932,9 +896,18 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch(
+        "helion.autotuner.config_generation.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch(
+        "helion.autotuner.config_spec.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch("helion.autotuner.config_spec._regs_per_block", lambda: 65536)
+    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
-    @_cuda_maxnreg_snapshot
-    def test_config_fragment0(self):
+    def test_config_fragment0(self, _mock_hardware):
         args = (
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
@@ -952,9 +925,13 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @patch(
+        "helion.autotuner.config_spec.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch("helion.autotuner.config_spec._regs_per_block", lambda: 65536)
     @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
-    @_cuda_maxnreg_snapshot
     def test_config_fragment1(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -973,10 +950,14 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
     @patch("torch.version.hip", None)
     @patch("torch.version.xpu", None)
+    @patch(
+        "helion.autotuner.config_spec.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch("helion.autotuner.config_spec._regs_per_block", lambda: 65536)
     @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
-    @_cuda_maxnreg_snapshot
     def test_config_warp_specialize_unroll(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
@@ -992,10 +973,19 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
     @patch.object(_compat, "_supports_maxnreg", lambda: True)
     @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch(
+        "helion.autotuner.config_generation.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch(
+        "helion.autotuner.config_spec.warps_to_threads",
+        lambda num_warps: num_warps * 32,
+    )
+    @patch("helion.autotuner.config_spec._regs_per_block", lambda: 65536)
+    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
     @skipIfTileIR("block-size overshoot is gated to the triton backend")
-    @_cuda_maxnreg_snapshot
-    def test_small_dim_block_size_overshoot(self):
+    def test_small_dim_block_size_overshoot(self, _mock_hardware):
         # All dims are 16, smaller than SMALL_DIM_BLOCK_SIZE_OVERSHOOT, so the
         # generated configs may use block sizes larger than the dimensions
         # themselves (e.g. 32 or 64) -- the extra rows/cols are masked off.
@@ -3333,7 +3323,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         """Test that autotuning accuracy checks use chunked comparison for large tensors."""
         import helion.autotuner.accuracy as _accuracy
 
-        memory = torch.xpu if DEVICE.type == "xpu" else torch.cuda
         numel = 2**26  # 64M float32 elements (~256 MB each)
 
         config1 = helion.Config(block_sizes=[128], num_warps=4)
@@ -3359,11 +3348,11 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # on tensors of the same size
         ref_a = torch.randn(numel, device=DEVICE)
         ref_b = ref_a.clone()
-        memory.empty_cache()
-        memory.reset_peak_memory_stats()
-        base_mem = memory.memory_allocated()
+        torch.accelerator.empty_cache()
+        torch.accelerator.reset_peak_memory_stats()
+        base_mem = torch.accelerator.memory_allocated()
         torch.testing.assert_close(ref_a, ref_b, atol=1e-2, rtol=1e-2)
-        naive_peak = memory.max_memory_allocated() - base_mem
+        naive_peak = torch.accelerator.max_memory_allocated() - base_mem
         del ref_a, ref_b
 
         # Patch the moved chunked helper to record peak memory delta per call.
@@ -3371,10 +3360,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         peaks: list[int] = []
 
         def measuring_chunked_assert_close(*args, **kwargs):
-            memory.reset_peak_memory_stats()
-            before = memory.memory_allocated()
+            torch.accelerator.reset_peak_memory_stats()
+            before = torch.accelerator.memory_allocated()
             real_chunked_assert_close(*args, **kwargs)
-            peak = memory.max_memory_allocated() - before
+            peak = torch.accelerator.max_memory_allocated() - before
             peaks.append(peak)
 
         with patch.object(

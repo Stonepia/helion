@@ -7,7 +7,6 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import onlyBackends
-from helion._testing import skipIfNotCUDAOrXPU
 from helion._testing import skipIfRefEager
 import helion.language as hl
 
@@ -63,7 +62,6 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
             sum(1 for s in specs if s.eviction_index is not None),
         )
 
-    @skipIfNotCUDAOrXPU()
     @onlyBackends(["triton"])
     def test_reduction_fact_indexing_slot_invariant(self):
         """The ReductionKernelFact is built after _collect_memory_op_facts, but the collector
@@ -151,7 +149,6 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
         self.assertIsNone(operands.get("c"))
         self.assertEqual(operands.get("b"), "rhs")
 
-    @skipIfNotCUDAOrXPU()
     @onlyBackends(["triton"])
     def test_dot_scaled_operand_roles(self):
         """dot_scaled's rhs matrix is arg 3 (mat2), not arg 1 (mat1_scale)."""
