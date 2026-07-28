@@ -1890,10 +1890,22 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
         )
 
-    @onlyBackends(["cute"])
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan(
-        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    @onlyBackends(["cute", "triton"])
+    @skipIfFn(
+        lambda: DEVICE.type not in ("cuda", "xpu"),
+        "NVFP4 GEMM requires CUDA or XPU",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "cuda" and torch.cuda.get_device_capability() < (10, 0),
+        "NVFP4 conversion instructions require Blackwell on CUDA",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "cuda" and _get_backend() != "cute",
+        "CUDA NVFP4 GEMM is covered by the CuTe implementation",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "xpu" and _get_backend() != "triton",
+        "XPU NVFP4 GEMM is covered by the Triton portable implementation",
     )
     @skipIfRefEager("inline asm codegen is not available in ref eager mode")
     def test_nvfp4_gemm(self):
@@ -1937,6 +1949,181 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=1.0,
             rtol=2e-1,
         )
+
+    @onlyBackends(["triton"])
+    @skipIfFn(
+        lambda: DEVICE.type != "xpu",
+        "NVFP4 XPU layout regressions require the Triton XPU backend",
+    )
+    def test_nvfp4_scaled_matmul_xpu_manual_layout(self):
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemm.py")
+        m, k, n = 16, 32, 16
+        groups = k // 16
+
+        def manual_physical_scales(logical):
+            physical = torch.zeros(
+                mod.swizzled_scale_numel(*logical.shape),
+                dtype=logical.dtype,
+                device=logical.device,
+            )
+            for row in range(logical.size(0)):
+                for col in range(logical.size(1)):
+                    offset = (
+                        ((row // 128) * ((logical.size(1) + 3) // 4) + col // 4)
+                        * 512
+                        + (row % 32) * 16
+                        + ((row % 128) // 32) * 4
+                        + col % 4
+                    )
+                    physical[offset] = logical[row, col]
+            return physical
+
+        def decode_last_dim(storage):
+            lut = torch.tensor(
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                device=storage.device,
+            )
+            return torch.stack(
+                [lut[(storage & 0xF).long()], lut[((storage >> 4) & 0xF).long()]],
+                dim=-1,
+            ).reshape(storage.size(0), -1)
+
+        def decode_dim0(storage):
+            lut = torch.tensor(
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                device=storage.device,
+            )
+            return torch.stack(
+                [lut[(storage & 0xF).long()], lut[((storage >> 4) & 0xF).long()]],
+                dim=1,
+            ).reshape(storage.size(0) * 2, storage.size(1))
+
+        a_storage = torch.arange(m * (k // 2), device=DEVICE, dtype=torch.uint8).reshape(
+            m, k // 2
+        )
+        b_storage = torch.arange(
+            (k // 2) * n, device=DEVICE, dtype=torch.uint8
+        ).reshape(k // 2, n)
+        a_logical = (
+            torch.arange(m * groups, device=DEVICE, dtype=torch.float32).reshape(m, groups)
+            / 8
+            + 0.5
+        ).to(torch.float8_e4m3fn)
+        b_logical = (
+            torch.arange(n * groups, device=DEVICE, dtype=torch.float32).reshape(n, groups)
+            / 16
+            + 0.75
+        ).to(torch.float8_e4m3fn)
+        scale_a = manual_physical_scales(a_logical)
+        scale_b = manual_physical_scales(b_logical)
+        actual = mod.nvfp4_scaled_matmul(
+            a_storage.view(torch.float4_e2m1fn_x2),
+            b_storage.view(torch.float4_e2m1fn_x2),
+            scale_a,
+            scale_b,
+        )
+        expected = (
+            (decode_last_dim(a_storage) * a_logical.float().repeat_interleave(16, 1))
+            @ (decode_dim0(b_storage) * b_logical.T.float().repeat_interleave(16, 0))
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            mod.reference_nvfp4_scaled_matmul(
+                a_storage.view(torch.float4_e2m1fn_x2),
+                b_storage.view(torch.float4_e2m1fn_x2),
+                scale_a,
+                scale_b,
+            ),
+            expected,
+            atol=0,
+            rtol=0,
+        )
+
+    @onlyBackends(["triton"])
+    @skipIfFn(
+        lambda: DEVICE.type != "xpu",
+        "NVFP4 XPU adapter contract requires XPU tensors",
+    )
+    def test_nvfp4_scaled_matmul_native_xpu_contract(self):
+        mod = import_path(EXAMPLES_DIR / "nvfp4_gemm.py")
+        m, k, n = 128, 32, 4
+        groups = k // 16
+        a = torch.arange(m * (k // 2), device=DEVICE, dtype=torch.uint8).reshape(m, k // 2)
+        b = torch.arange((k // 2) * n, device=DEVICE, dtype=torch.uint8).reshape(k // 2, n)
+        row_ids = torch.arange(m, device=DEVICE)
+        a_col0_values = torch.tensor(
+            [0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375,
+             1.5, 1.625, 1.75, 1.875, 2.0, 2.25, 2.5, 3.0],
+            device=DEVICE,
+        )
+        a_col1_values = torch.tensor(
+            [3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0], device=DEVICE
+        )
+        logical_a = torch.stack(
+            [a_col0_values[row_ids % 16], a_col1_values[row_ids // 16]], dim=1
+        ).to(torch.float8_e4m3fn)
+        logical_b = torch.tensor(
+            [[2.5, 0.625], [0.875, 3.5], [5.0, 1.75], [1.25, 6.0]],
+            device=DEVICE,
+        ).to(torch.float8_e4m3fn)
+
+        def manual_physical_scales(logical):
+            physical = torch.zeros(
+                mod.swizzled_scale_numel(*logical.shape),
+                dtype=logical.dtype,
+                device=logical.device,
+            )
+            for row in range(logical.size(0)):
+                for col in range(logical.size(1)):
+                    offset = (
+                        ((row // 128) * ((logical.size(1) + 3) // 4) + col // 4)
+                        * 512
+                        + (row % 32) * 16
+                        + ((row % 128) // 32) * 4
+                        + col % 4
+                    )
+                    physical[offset] = logical[row, col]
+            return physical
+
+        swapped_a = logical_a.clone()
+        swapped_a[:32], swapped_a[32:64] = logical_a[32:64], logical_a[:32]
+        with patch.object(
+            torch.ops.aten._scaled_mm_v2, "default", return_value=object()
+        ) as swapped_native:
+            mod.nvfp4_scaled_matmul_native_xpu_experimental(
+                a.view(torch.float4_e2m1fn_x2),
+                b.view(torch.float4_e2m1fn_x2),
+                manual_physical_scales(swapped_a),
+                manual_physical_scales(logical_b),
+            )
+        swapped_args, _ = swapped_native.call_args
+        self.assertFalse(torch.equal(swapped_args[2][0], logical_a))
+
+        scale_a = manual_physical_scales(logical_a)
+        scale_b = manual_physical_scales(logical_b)
+        marker = object()
+        with patch.object(
+            torch.ops.aten._scaled_mm_v2, "default", return_value=marker
+        ) as native:
+            result = mod.nvfp4_scaled_matmul_native_xpu_experimental(
+                a.view(torch.float4_e2m1fn_x2),
+                b.view(torch.float4_e2m1fn_x2),
+                scale_a,
+                scale_b,
+            )
+        self.assertIs(result, marker)
+        args, kwargs = native.call_args
+        self.assertEqual(kwargs, {})
+        self.assertEqual(args[2][0].shape, (m, groups))
+        self.assertEqual(args[5][0].shape, (n, groups))
+        self.assertTrue(torch.equal(args[2][0], logical_a))
+        self.assertTrue(torch.equal(args[5][0], logical_b))
+        self.assertEqual(args[3], [2])
+        self.assertEqual(args[4], [0])
+        self.assertEqual(args[6], [2])
+        self.assertEqual(args[7], [0])
 
     @onlyBackends(["cute", "triton"])
     @skipIfNotCUDA()
