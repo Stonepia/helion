@@ -927,6 +927,43 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("warp_specialize=True", code_true)
         self.assertIn("warp_specialize=False", code_false)
 
+    @unittest.skipUnless(
+        DEVICE.type == "xpu",
+        "range_warp_specializes XPU fallback only applies on Intel XPU",
+    )
+    @skipIfRefEager("Codegen/normalization path not exercised in ref eager mode")
+    def test_range_warp_specialize_xpu_fallback(self):
+        # On XPU, Intel Triton does not implement warp specialization. A requested
+        # non-None value must fall back to None (with a warning) and still run.
+        args = (torch.randn([64, 32], device=DEVICE),)
+
+        with patch("sys.stderr") as mock_stderr:
+            _code, result = code_and_output(
+                nested_loop_kernel,
+                args,
+                block_sizes=[32, 16],
+                range_warp_specializes=[None, True],
+            )
+        torch.testing.assert_close(result, args[0] + 1)
+        written = "".join(
+            call.args[0] for call in mock_stderr.write.call_args_list if call.args
+        )
+        self.assertIn("XPUWarpSpecializeUnsupported", written)
+
+        # Already-None must not warn.
+        with patch("sys.stderr") as mock_stderr_none:
+            _code2, result2 = code_and_output(
+                nested_loop_kernel,
+                args,
+                block_sizes=[32, 16],
+                range_warp_specializes=[None, None],
+            )
+        torch.testing.assert_close(result2, args[0] + 1)
+        written_none = "".join(
+            call.args[0] for call in mock_stderr_none.write.call_args_list if call.args
+        )
+        self.assertNotIn("XPUWarpSpecializeUnsupported", written_none)
+
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
     def test_range_num_stages(self):

@@ -468,6 +468,14 @@ class WrongDevice(BaseWarning):
     message = "Operation {0} returned a tensor on {1} device, but the kernel is on {2} device."
 
 
+class XPUWarpSpecializeUnsupported(BaseWarning):
+    message = (
+        "range_warp_specializes={0} was requested, but the current Intel Triton "
+        "XPU backend does not implement warp specialization. Falling back to None. "
+        "See https://github.com/pytorch/helion for status."
+    )
+
+
 class BlockSizeIgnoredInInterpretMode(BaseWarning):
     message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
 
