@@ -42,6 +42,7 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
@@ -894,55 +895,57 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
-    @patch.object(_compat, "_supports_maxnreg", lambda: True)
-    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch.object(_compat, "_supports_maxnreg", lambda: DEVICE.type == "cuda")
+    @patch.object(loops, "_supports_warp_specialize", lambda: DEVICE.type == "cuda")
     @skipIfRocm("config space differs on ROCm")
     def test_config_fragment0(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
-        # PyTorch does not expose a register-file size for XPU. This snapshot
-        # deliberately forces maxnreg support, so normalize only its XPU run
-        # to the pinned H100 policy used by the shared golden.
-        with (
-            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536)
-            if DEVICE.type == "xpu"
-            else nullcontext(),
-            patch(
-                "helion._hardware.get_hardware_info",
-                return_value=_HOPPER_HARDWARE,
+        spec = _get_examples_matmul().bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
+        if DEVICE.type == "xpu":
+            self.assertTrue(all("maxnreg" not in config for config in configs))
+            self.assertTrue(
+                all(not any(config.range_warp_specializes) for config in configs)
             )
-            if DEVICE.type == "xpu"
-            else nullcontext(),
-        ):
-            spec = _get_examples_matmul().bind(args).config_spec
-            configs = ConfigGeneration(spec).random_population(10)
+        else:
             self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch(
         "helion.autotuner.config_generation.warps_to_threads",
         lambda num_warps: num_warps * 32,
     )
-    @patch.object(_compat, "_supports_maxnreg", lambda: True)
+    @patch.object(_compat, "_supports_maxnreg", lambda: DEVICE.type == "cuda")
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
-    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch.object(loops, "_supports_warp_specialize", lambda: DEVICE.type == "cuda")
     @patch("torch.version.hip", None)
-    @patch("torch.version.xpu", None)
-    @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfRocm("config space differs on ROCm")
-    def test_config_fragment1(self, _mock_hardware):
+    def test_config_fragment1(self):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
         with (
-            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536)
-            if DEVICE.type == "xpu"
-            else nullcontext()
+            patch("torch.version.xpu", None)
+            if DEVICE.type == "cuda"
+            else nullcontext(),
+            patch(
+                "helion._hardware.get_hardware_info",
+                return_value=_HOPPER_HARDWARE,
+            )
+            if DEVICE.type == "cuda"
+            else nullcontext(),
         ):
             spec = basic_kernels.add.bind(args).config_spec
             configs = ConfigGeneration(spec).random_population(10)
+        if DEVICE.type == "xpu":
+            self.assertTrue(all("maxnreg" not in config for config in configs))
+            self.assertTrue(
+                all(not any(config.range_warp_specializes) for config in configs)
+            )
+        else:
             self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch(
@@ -957,29 +960,25 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
     @patch("helion._hardware.get_hardware_info", return_value=_HOPPER_HARDWARE)
     @skipIfTileIR("tileir backend will ignore `warp specialization` hint")
     @skipIfRocm("config space differs on ROCm")
+    @skipIfXPU("warp specialization is CUDA-only")
     def test_config_warp_specialize_unroll(self, _mock_hardware):
         args = (
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        with (
-            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536)
-            if DEVICE.type == "xpu"
-            else nullcontext()
-        ):
-            spec = basic_kernels.add.bind(args).config_spec
-            overrides = {
-                "range_unroll_factors": [4],
-                "range_warp_specializes": ([True]),
-            }
-            # We expect all the unroll factors to be set to 0
-            configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
-            self.assertExpectedJournal("\n".join(map(repr, configs)))
+        spec = basic_kernels.add.bind(args).config_spec
+        overrides = {
+            "range_unroll_factors": [4],
+            "range_warp_specializes": ([True]),
+        }
+        # We expect all the unroll factors to be set to 0
+        configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
+        self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
-    @patch.object(_compat, "_supports_maxnreg", lambda: True)
-    @patch.object(loops, "_supports_warp_specialize", lambda: True)
+    @patch.object(_compat, "_supports_maxnreg", lambda: DEVICE.type == "cuda")
+    @patch.object(loops, "_supports_warp_specialize", lambda: DEVICE.type == "cuda")
     @skipIfRocm("config space differs on ROCm")
     @skipIfTileIR("block-size overshoot is gated to the triton backend")
     def test_small_dim_block_size_overshoot(self):
@@ -991,22 +990,17 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             torch.randn([16, 16], device=DEVICE),
             torch.randn([16, 16], device=DEVICE),
         )
-        # PyTorch does not expose a register-file size for XPU. This snapshot
-        # deliberately forces maxnreg support, so normalize only its XPU run
-        # to the pinned H100 policy used by the shared golden.
-        with (
-            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536)
-            if DEVICE.type == "xpu"
-            else nullcontext(),
-            patch(
-                "helion._hardware.get_hardware_info",
-                return_value=_HOPPER_HARDWARE,
+        spec = _get_examples_matmul().bind(args).config_spec
+        configs = ConfigGeneration(spec).random_population(10)
+        if DEVICE.type == "xpu":
+            self.assertTrue(
+                any(
+                    any(block_size > 16 for block_size in config.block_sizes)
+                    for config in configs
+                )
             )
-            if DEVICE.type == "xpu"
-            else nullcontext(),
-        ):
-            spec = _get_examples_matmul().bind(args).config_spec
-            configs = ConfigGeneration(spec).random_population(10)
+            self.assertTrue(all("maxnreg" not in config for config in configs))
+        else:
             self.assertExpectedJournal("\n".join(map(repr, configs)))
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: True)
