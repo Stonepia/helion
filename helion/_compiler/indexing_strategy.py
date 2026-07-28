@@ -969,13 +969,6 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 continue
             size, stride = size_stride.popleft()
             if isinstance(k, int):
-                if env.device.type == "xpu" and k != 0:
-                    # Intel's tensor-descriptor lowering currently ignores
-                    # nonzero scalar offsets in dimensions collapsed to a
-                    # one-element descriptor block.  Pointer indexing keeps
-                    # these accesses correct until the XPU lowering supports
-                    # scalar descriptor offsets.
-                    return False
                 # Python integer indexing collapses this tensor dimension to a
                 # scalar offset, so the descriptor block in that dimension is 1.
                 descriptor_block_shape.append(1)
@@ -1018,12 +1011,6 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     assert isinstance(block_size, int)
                     descriptor_block_shape.append(block_size)
                 else:
-                    if env.device.type == "xpu" and not env.known_equal(k, 0):
-                        # This includes scalar arguments, tile.begin, and
-                        # hl.grid() offsets.  XPU descriptor lowering treats
-                        # each as zero today, so use pointer indexing for this
-                        # access instead.
-                        return False
                     # Lowerable scalar SymInt offsets also collapse the tensor
                     # dimension to block_shape=1. The final stride-one check
                     # below decides whether that scalar dimension is legal for

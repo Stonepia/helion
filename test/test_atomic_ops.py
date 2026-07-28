@@ -988,12 +988,8 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         expected = torch.zeros_like(x)
         expected[1:] = 1
         torch.testing.assert_close(result, expected)
-        if DEVICE.type == "xpu":
-            self.assertIn("tl.atomic_add(", code)
-            self.assertNotIn("desc.atomic_add(", code)
-        else:
-            self.assertIn("desc.atomic_add(", code)
-            self.assertNotIn("tl.atomic_add(", code)
+        self.assertIn("desc.atomic_add(", code)
+        self.assertNotIn("tl.atomic_add(", code)
 
 
 if __name__ == "__main__":

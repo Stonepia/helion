@@ -321,41 +321,23 @@ class TritonBackend(Backend):
 
     def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
         from ..compile_environment import CompileEnvironment
-        from ..device_function import DeviceFunction
         from ..device_function import SymbolArgument
         from ..device_function import TensorSizeArg
         from ..device_function import TensorStrideArg
 
-        env = CompileEnvironment.current()
         # Default to Triton's own behavior: let Triton specialize on values and
         # alignment.  This enables vectorized loads (constexpr 1 for inner
         # strides, divisibility-by-16 hint for sizes) at the cost of an
         # occasional Triton recompile when a value crosses a specialization
         # boundary (e.g. size 1 -> 2, alignment changes).
-        if env.settings.triton_do_not_specialize:
-            do_not_specialize = [
-                arg.name
-                for arg in args
-                if isinstance(arg, (TensorSizeArg, TensorStrideArg, SymbolArgument))
-            ]
-        elif env.device.type == "xpu":
-            # Intel's tensor-descriptor lowering faults when a dynamic stride-0
-            # argument is value-specialized as constexpr 0.  Descriptor stride
-            # arguments must remain runtime scalars; keep Triton's normal
-            # specialization behavior for every other argument.
-            descriptor_tensors = {
-                descriptor.fake_value
-                for descriptor in DeviceFunction.current()._tensor_descriptor_args.values()
-            }
-            do_not_specialize = [
-                arg.name
-                for arg in args
-                if isinstance(arg, TensorStrideArg)
-                and arg.tensor_arg.fake_value in descriptor_tensors
-            ]
-        else:
+        if not CompileEnvironment.current().settings.triton_do_not_specialize:
             return self.function_decorator
 
+        do_not_specialize = [
+            arg.name
+            for arg in args
+            if isinstance(arg, (TensorSizeArg, TensorStrideArg, SymbolArgument))
+        ]
         if not do_not_specialize or not _triton_jit_supports_do_not_specialize():
             return self.function_decorator
         return (

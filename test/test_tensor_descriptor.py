@@ -17,6 +17,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
@@ -95,6 +96,10 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.permute", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU(
+        "Triton XPU produces incorrect results for 3D descriptors with a "
+        "non-last stride-1 dimension"
+    )
     def test_3d_tensor_permutation(self):
         """Test permutation with 3D tensor where stride==1 is in middle."""
 
@@ -1018,6 +1023,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     self.assertIn("tl.dot", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU("Triton XPU faults on descriptors with a runtime stride of zero")
     def test_dynamic_shape_stride_zero_input(self):
         """Expanded stride-0 dimensions should be TD-eligible with dynamic shapes."""
 
@@ -1166,10 +1172,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 with self.subTest(static_shapes=static_shapes, case=name):
                     code, result = code_and_output(kernel, args)
                     torch.testing.assert_close(result, expected)
-                    if DEVICE.type == "xpu" and name != "scalar_noncontiguous_dims":
-                        self.assert_tensor_descriptor_not_used_for(code, "x")
-                    else:
-                        self.assert_tensor_descriptor_used_for(code, "x")
+                    self.assert_tensor_descriptor_used_for(code, "x")
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_scalar_symint_subscript_blocklist(self):

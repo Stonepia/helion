@@ -120,10 +120,6 @@ class TestGrid(RefEagerTestBase, TestCase):
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
-        if DEVICE.type == "xpu":
-            self.assertNotIn("x_desc =", code)
-            self.assertNotIn("out_desc =", code)
-            self.assertIn("y_desc = tl.make_tensor_descriptor", code)
 
     @skipIfMetal("aten.addmm not yet registered for Metal backend")
     @xfailIfPallas(
