@@ -14,7 +14,8 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
-from helion._testing import skipIfNotCUDA
+from helion._testing import is_cuda
+from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
@@ -23,9 +24,20 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
+from helion._compiler.autotuner_heuristics.triton import (
+    TritonStandardReductionHeuristicXPU,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def skipUnlessCUDAOrXPU():
+    """Run promoted reduction regressions only on CUDA or Intel XPU."""
+    return skipIfFn(
+        lambda: not (is_cuda() or torch.xpu.is_available()),
+        reason="Test skipped: CUDA (NVIDIA GPU) or Intel XPU is not available.",
+    )
 
 
 @helion.kernel()
@@ -1000,7 +1012,7 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected_y = (y_f * inv_rms_y[:, None] * w2.float()).half()
         torch.testing.assert_close(out_y, expected_y, rtol=1e-2, atol=1e-2)
 
-    @skipIfNotCUDA()
+    @skipUnlessCUDAOrXPU()
     @skipIfRefEager(
         "promoted-seed reduction_loops is only materialized in compiled mode"
     )
@@ -1025,6 +1037,20 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         x = torch.randn([8, 4, 2048], device=DEVICE, dtype=torch.float32)
         expected = x.sum(1)
+        bound = mid_axis_reduce.bind((x,))
+        if DEVICE.type == "xpu":
+            promoted_default = bound.config_spec.compiler_default_config
+            self.assertIsNotNone(promoted_default)
+            self.assertEqual(
+                bound.config_spec.autotuner_heuristics,
+                [TritonStandardReductionHeuristicXPU.name],
+            )
+            default = bound.config_spec.default_config()
+            for key, value in promoted_default.config.items():
+                self.assertEqual(default.config[key], value)
+            self.assertTrue(
+                all(loop is None for loop in default.config["reduction_loops"])
+            )
         _code, out = code_and_output(mid_axis_reduce, (x,))
         torch.testing.assert_close(out, expected, rtol=1e-3, atol=1e-3)
 
