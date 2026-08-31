@@ -30,7 +30,6 @@ from helion._testing import skipIfFn
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import skipIfXPU
 import helion.language as hl
 
 
@@ -240,19 +239,17 @@ class TestDot(RefEagerTestBase, TestCase):
         self.assertIn("out_dtype=tl.float32", code)
 
         # Test case 2: separate addition (acc_dtype = float16, common dtype = float32)
-        # TODO(Eikan): Support this case on XPU
-        if not torch.xpu.is_available():
-            input_dtype_2 = torch.float32
-            acc_dtype_2 = torch.float16
-            x2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
-            y2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
-            code2, out2 = code_and_output(dot_kernel_acc_arg, (x2, y2, acc_dtype_2))
-            # Validate we use separate addition pattern with cast
-            self.assertIn("tl.dot(", code2)
-            # Check for the addition pattern: acc + result
-            self.assertIn(" + ", code2)
-            # Check that we cast the result to acc_dtype
-            self.assertIn("tl.cast", code2)
+        input_dtype_2 = torch.float32
+        acc_dtype_2 = torch.float16
+        x2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
+        y2 = torch.randn(64, 64, device=DEVICE, dtype=input_dtype_2)
+        code2, out2 = code_and_output(dot_kernel_acc_arg, (x2, y2, acc_dtype_2))
+        # Validate we use separate addition pattern with cast
+        self.assertIn("tl.dot(", code2)
+        # Check for the addition pattern: acc + result
+        self.assertIn(" + ", code2)
+        # Check that we cast the result to acc_dtype
+        self.assertIn("tl.cast", code2)
 
         # Test case 3: separate addition (acc_dtype = int32, common dtype = int8)
         input_dtype_3 = torch.int8
@@ -497,7 +494,6 @@ class TestDot(RefEagerTestBase, TestCase):
 
     @skipIfNotTriton("triton-specific codegen assertions")
     @skipIfRefEager("Debug dtype codegen checks rely on compiled code")
-    @skipIfXPU("Failed on XPU - https://github.com/pytorch/helion/issues/772")
     def test_baddbmm_pipeline_debug_dtype_asserts(self):
         # Reproduces scripts/repro512.py within the test suite and asserts
         # the kernel compiles and runs with debug dtype asserts enabled.
@@ -942,7 +938,6 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test hl.dot with N=2 created through reshape."""
         self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
-    @skipIfXPU("Accuracy issue on XPU - small M dim tiles produce wrong results")
     def test_mm_small_m_dim(self):
         """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for torch.mm small-dim tiles
@@ -1021,7 +1016,6 @@ class TestDot(RefEagerTestBase, TestCase):
             lambda acc, a, b: acc + torch.mm(a, b), rtol=1e-2, atol=5e-2
         )
 
-    @skipIfXPU("Accuracy issue on XPU - small M dim tiles produce wrong results")
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
         # Allow slightly larger absolute error for small-dim tiles
@@ -1214,17 +1208,6 @@ for input_dtype, acc_dtype, static_shapes_option in itertools.product(
             ),
             reason=REF_EAGER_TEST_FAILURES_FP8_E4M3FN_LOW_COMPUTE_CAP[test_name],
         )(_test_func)
-
-    # Apply skipIfXPU decorator if needed
-    if acc_dtype is torch.float16 and input_dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-        torch.bfloat16,
-        torch.float32,
-    ):
-        _test_func = skipIfXPU("skip: float6 accmulator for non-fp16 input data types")(
-            _test_func
-        )
 
     # Additional ref eager skips for unsupported accumulator/input combos
     if acc_dtype is torch.float16 and input_dtype in (
