@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import re
+from typing import cast
 
 import torch
 
@@ -78,6 +80,35 @@ class HardwareInfo:
             return [self.compute_capability, *arch_list]
 
 
+def _xpu_arch_name(props: object) -> str:
+    """Short, stable architecture token for an Intel GPU (e.g. ``pvc``).
+
+    Mirrors the granularity of CUDA's ``sm90`` / ROCm's ``gfx942``: one token
+    per architecture rather than per SKU, so a heuristic tuned on a Data Center
+    GPU Max 1550 also applies to a 1100.  Without Triton (e.g. a Pallas-only
+    install) fall back to a slugified device name, which is still stable and
+    filesystem safe.
+    """
+    from ._compat import xpu_arch_name
+
+    arch = xpu_arch_name()
+    if arch is not None:
+        return arch
+    name = cast("str", props.name)  # pyrefly: ignore [missing-attribute]
+    return re.sub(r"[^0-9a-z]+", "_", name.lower()).strip("_")
+
+
+def _xpu_hardware_info(device: torch.device | None) -> HardwareInfo:
+    props = torch.xpu.get_device_properties(device)
+    return HardwareInfo(
+        device_kind="xpu",
+        hardware_name=props.name,
+        runtime_version=props.driver_version,
+        # XPU has no CUDA-style compute capability; use the architecture token.
+        compute_capability=_xpu_arch_name(props),
+    )
+
+
 @functools.cache
 def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
     """
@@ -90,19 +121,8 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
         HardwareInfo with device details for caching and heuristic lookup.
     """
     # XPU (Intel) path
-    if (
-        device is not None
-        and device.type == "xpu"
-        and getattr(torch, "xpu", None) is not None
-        and torch.xpu.is_available()
-    ):
-        props = torch.xpu.get_device_properties(device)
-        return HardwareInfo(
-            device_kind="xpu",
-            hardware_name=props.name,
-            runtime_version=props.driver_version,
-            compute_capability=props.name,  # XPU doesn't have compute capability
-        )
+    if device is not None and device.type == "xpu" and torch.xpu.is_available():
+        return _xpu_hardware_info(device)
 
     # CUDA/ROCm path
     if torch.cuda.is_available():
@@ -127,6 +147,12 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
                 runtime_version=torch.version.hip,
                 compute_capability=props.gcnArchName,
             )
+
+    # Unqualified XPU path: no CUDA/ROCm device, so fall back to Intel GPUs
+    # before giving up.  Callers such as the AOT cache and heuristic generator
+    # invoke ``get_hardware_info()`` with no device at all.
+    if torch.xpu.is_available():
+        return _xpu_hardware_info(None)
 
     # TPU / Pallas path
     try:

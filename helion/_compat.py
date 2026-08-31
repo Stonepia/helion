@@ -595,6 +595,38 @@ def _supports_maxnreg() -> bool:
     )
 
 
+def supports_grf_mode() -> bool:
+    # call private func we can patch in testing
+    return _supports_grf_mode()
+
+
+@functools.cache
+def _supports_grf_mode() -> bool:
+    """Intel GPUs expose a per-thread register-file (GRF) budget knob.
+
+    This is the XPU-native analog of NVIDIA's ``maxnreg``: Triton's Intel
+    backend turns ``grf_mode`` into an IGC build flag
+    (``-cl-intel-<N>-GRF-per-thread`` / ``-cl-intel-enable-auto-large-GRF-mode``)
+    rather than a PTX ``.maxnreg`` directive, so it is a separate config key.
+    """
+    return torch.version.xpu is not None and torch.xpu.is_available()
+
+
+@functools.cache
+def xpu_arch_name() -> str | None:
+    """Short Intel GPU architecture token (e.g. ``pvc``), or None if unavailable.
+
+    Triton's Intel backend already derives this from the SYCL architecture id,
+    so reuse it instead of maintaining a parallel id-to-name table.
+    """
+    if not triton_is_available():
+        return None
+    target = triton.runtime.driver.active.get_current_target()
+    if target.backend != "xpu":
+        return None
+    return str(target.arch["arch"])
+
+
 def fp8_block_ptr_padding_broken() -> bool:
     # call private func we can patch in testing
     return _fp8_block_ptr_padding_broken()

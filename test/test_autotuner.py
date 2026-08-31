@@ -1103,7 +1103,6 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
 
     @skipIfRefEager("Autotuning not supported in ref eager mode")
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_log_started_completed(self):
         """Test started/completion logging with all autotuning algorithms."""
         configs = [
@@ -1139,7 +1138,6 @@ class TestAutotuneIgnoreErrors(TestCase):
                 self._run_autotuner_and_check_logging(factory)
 
     @skipIfRefEager("Autotuning not supported in ref eager mode")
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_skips_restricted_search(self):
         """A run restricted to user-pinned configs (``configs=[...]`` without
         ``force_autotune``) is a biased slice excluded from the dataset: even
@@ -1586,7 +1584,6 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         # should allow autotuning to succeed.
         torch.testing.assert_close(add(*args), sum(args))
 
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_random_search(self):
         args = (
             torch.randn([512, 512], device=DEVICE),
@@ -12068,7 +12065,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
         )
         return search.samples[0]
 
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_env_var(self) -> None:
         # same env var value -> same random sample
         with patch.dict(
@@ -12092,7 +12088,6 @@ class TestAutotuneRandomSeed(RefEagerTestDisabled, TestCase):
             second = self._autotune_and_record()
         self.assertNotEqual(first, second)
 
-    @skipIfXPU("maxnreg parameter not supported on XPU backend")
     def test_autotune_random_seed_from_settings(self) -> None:
         # same autotune_random_seed setting -> same random sample
         first = self._autotune_and_record(autotune_random_seed=4242)

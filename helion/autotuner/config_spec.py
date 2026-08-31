@@ -23,6 +23,7 @@ from .._compat import _regs_per_block
 from .._compat import device_num_sm
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
+from .._compat import supports_grf_mode
 from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
@@ -783,6 +784,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
     {
         "waves_per_eu",
         "matrix_instr_nonkdim",
+        "grf_mode",
         "num_ctas",
         "occupancy",
         "pallas_worklist_grouping",
@@ -884,6 +886,14 @@ EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
 # Lower values allow higher occupancy but may hurt performance for register-heavy kernels
 VALID_MAXNREG = (None, 32, 64, 128, 256)
 DEFAULT_MAXNREG = None
+# grf_mode is the Intel/XPU analog of maxnreg: it selects the per-thread GRF
+# (general register file) budget.  Triton's Intel backend maps these onto IGC
+# build flags -- "128"/"256" to -cl-intel-<N>-GRF-per-thread, "auto" to
+# -cl-intel-enable-auto-large-GRF-mode, and "default" to no flag (IGC chooses,
+# with an automatic 256-GRF retry on spill).  "512" is deliberately excluded:
+# it is rejected at build time by current Data Center GPU Max hardware.
+VALID_GRF_MODES = ("default", "128", "256", "auto")
+DEFAULT_GRF_MODE = "default"
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         "loop_orders",
@@ -2739,6 +2749,18 @@ class ConfigSpec:
                     )
             else:
                 config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
+
+        # Only validate grf_mode on Intel GPUs (the XPU analog of maxnreg).
+        # Non-Intel backends reject the key outright via unsupported_config_keys
+        # above, so this only runs where the key is actually supported.
+        if self.supports_config_key("grf_mode") and supports_grf_mode():
+            if "grf_mode" in config:
+                if config["grf_mode"] not in VALID_GRF_MODES:
+                    raise InvalidConfig(
+                        f"Invalid value for 'grf_mode': {config['grf_mode']!r} must be one of {list(VALID_GRF_MODES)!r}"
+                    )
+            else:
+                config["grf_mode"] = DEFAULT_GRF_MODE
 
         # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():

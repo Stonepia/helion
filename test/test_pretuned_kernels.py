@@ -353,14 +353,25 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
 _GEOMEAN_NOISE_BAND = 0.10
 
 
+def _pretuned_correctness_supported() -> bool:
+    """Platforms where the pretuned-kernel correctness suite runs.
+
+    CUDA/ROCm ship AOT heuristics for every kernel here.  Intel GPUs currently
+    ship one (``vector_add``); the remaining kernels resolve no heuristic and
+    fall back to Helion's default config.  They are still run because these are
+    numerical-correctness checks, and the fallback path must be correct too.
+    """
+    return is_cuda() or torch.xpu.is_available()
+
+
 @onlyBackends(["triton"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedKernelsCorrectness(TestCase):
     """Numerical correctness vs. PyTorch eager."""
 
     def _run_correctness(self, name: str) -> None:
-        if not is_cuda():
-            self.skipTest("Pretuned kernels require CUDA / ROCm.")
+        if not _pretuned_correctness_supported():
+            self.skipTest("Pretuned kernels require CUDA / ROCm / XPU.")
         module = _import_pretuned_kernel_module(_KERNEL_MODULE_NAMES.get(name, name))
         kernel = getattr(module, name)
         builder = _INPUT_BUILDERS[name]

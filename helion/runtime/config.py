@@ -21,6 +21,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
+GrfModeLiteral = Literal["default", "128", "256", "auto"]
 
 
 class Config(Mapping[str, object]):
@@ -51,6 +52,7 @@ class Config(Mapping[str, object]):
         pid_type: PidTypeLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
+        grf_mode: GrfModeLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
@@ -85,6 +87,10 @@ class Config(Mapping[str, object]):
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             num_sm_multiplier: Multiplier for the number of SMs in persistent kernels (1, 2, 4, 8).
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
+            grf_mode: Intel GPU (XPU) only. Per-thread GRF (general register file)
+                budget ("default", "128", "256", "auto"). The XPU analog of ``maxnreg``:
+                a larger GRF reduces spills for register-heavy kernels at the cost of
+                occupancy. Ignored on non-Intel backends.
             maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
                 Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
                 to ensure multi-occupancy can be achieved.
@@ -132,6 +138,7 @@ class Config(Mapping[str, object]):
             "pid_type": pid_type,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
+            "grf_mode": grf_mode,
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
@@ -294,6 +301,12 @@ class Config(Mapping[str, object]):
         from ..autotuner.config_spec import DEFAULT_MAXNREG
 
         return cast("int | None", self.config.get("maxnreg", DEFAULT_MAXNREG))
+
+    @property
+    def grf_mode(self) -> str:
+        from ..autotuner.config_spec import DEFAULT_GRF_MODE
+
+        return cast("str", self.config.get("grf_mode", DEFAULT_GRF_MODE))
 
     @property
     def range_unroll_factors(self) -> list[int]:

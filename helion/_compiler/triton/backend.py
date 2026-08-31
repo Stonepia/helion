@@ -88,6 +88,10 @@ class TritonBackend(Backend):
             from ..._compat import supports_amd_cdna_tunables
 
             return supports_amd_cdna_tunables()
+        if key == "grf_mode":
+            from ..._compat import supports_grf_mode
+
+            return supports_grf_mode()
         if key == "xcd_remap":
             from ..._compat import supports_amd_cdna_tunables
 
@@ -107,10 +111,11 @@ class TritonBackend(Backend):
         from ..._compat import get_mtia_tunable_fragments
         from ..._compat import is_hip
         from ..._compat import supports_amd_cdna_tunables
+        from ..._compat import supports_grf_mode
         from ..._compat import supports_mtia_tunables
         from ...autotuner.config_fragment import EnumFragment
 
-        if not is_hip() and not supports_mtia_tunables():
+        if not is_hip() and not supports_mtia_tunables() and not supports_grf_mode():
             return {}
         fragments: dict[str, ConfigSpecFragment] = {}
         if is_hip():
@@ -118,6 +123,11 @@ class TritonBackend(Backend):
             fragments["waves_per_eu"] = EnumFragment(choices=(0, 1, 2, 3, 4))
             if supports_amd_cdna_tunables():
                 fragments["matrix_instr_nonkdim"] = EnumFragment(choices=(0, 16, 32))
+
+        if supports_grf_mode():
+            from ...autotuner.config_spec import VALID_GRF_MODES
+
+            fragments["grf_mode"] = EnumFragment(choices=VALID_GRF_MODES)
 
         if supports_mtia_tunables():
             fragments.update(get_mtia_tunable_fragments())
