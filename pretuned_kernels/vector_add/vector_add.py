@@ -40,14 +40,17 @@ def main(verbose: bool = True) -> dict:
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import gpu_device
     from _bench import run_sweep
+
+    device = gpu_device()
 
     shapes = [2**i for i in range(19, 29)]
     baselines = _baselines()
 
     def make_calls(n: int) -> tuple:
-        x = torch.randn(n, device="cuda", dtype=torch.float32)
-        y = torch.randn(n, device="cuda", dtype=torch.float32)
+        x = torch.randn(n, device=device, dtype=torch.float32)
+        y = torch.randn(n, device=device, dtype=torch.float32)
 
         def helion_call() -> torch.Tensor:
             return vector_add(x, y)

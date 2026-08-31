@@ -7,7 +7,9 @@ who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
 autotuning.  Heuristics ship for both NVIDIA H100 (`sm90`) and B200 (`sm100`);
-Helion picks the matching file at runtime.  Treat the files as kernel recipes:
+`vector_add` additionally ships an Intel Data Center GPU Max (`xpu_pvc`)
+heuristic.  Helion picks the matching file at runtime.  Treat the files as
+kernel recipes:
 copy the kernel and its local `_helion_aot_*` heuristic into your code, then
 retune when your target shapes or hardware differ materially from the included
 sweep.
@@ -23,7 +25,8 @@ pretuned_kernels/
 ├── vector_add/
 │   ├── vector_add.py                          # the kernel + main()
 │   ├── _helion_aot_vector_add_cuda_sm100.py   # B200 heuristic
-│   └── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
+│   ├── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
+│   └── _helion_aot_vector_add_xpu_pvc.py      # Intel GPU Max heuristic
 ├── softmax/
 ├── layer_norm/
 ├── rms_norm/
@@ -118,10 +121,13 @@ the shapes or target hardware differ from the included sweep, generate and
 commit an AOT heuristic for the application's target shapes and hardware.
 
 For AOT pretuned kernels, Helion's runtime looks for
-`_helion_aot_<kernel>_cuda_sm<NN>.py` next to the kernel source file.  Helion
-looks for AOT heuristic files for the current compute capability first, then
-falls back to older compatible CUDA/ROCm capabilities.  For example, on
+`_helion_aot_<kernel>_<device>_<arch>.py` next to the kernel source file (e.g.
+`_helion_aot_vector_add_cuda_sm90.py`, `_helion_aot_vector_add_xpu_pvc.py`).
+Helion looks for AOT heuristic files for the current compute capability first,
+then falls back to older compatible CUDA/ROCm capabilities.  For example, on
 `sm120`, if no `sm120` heuristic exists, an `sm100` heuristic file can be used.
+Intel GPUs use the Triton architecture token (e.g. `pvc`) and have no fallback
+chain.
 
 ## Running benchmarks
 

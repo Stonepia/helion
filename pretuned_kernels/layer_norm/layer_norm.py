@@ -56,7 +56,10 @@ def main(verbose: bool = True) -> dict:
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from _bench import gpu_device
     from _bench import run_sweep
+
+    device = gpu_device()
 
     triton_tutorial_shapes = [(4096, 512 * i) for i in range(2, 32)]
     realistic_shapes = [
@@ -74,9 +77,9 @@ def main(verbose: bool = True) -> dict:
 
     def make_calls(shape: tuple[int, int]) -> tuple:
         M, N = shape
-        x = torch.randn([M, N], device="cuda", dtype=torch.float16)
-        w = torch.randn([N], device="cuda", dtype=torch.float16)
-        b = torch.randn([N], device="cuda", dtype=torch.float16)
+        x = torch.randn([M, N], device=device, dtype=torch.float16)
+        w = torch.randn([N], device=device, dtype=torch.float16)
+        b = torch.randn([N], device=device, dtype=torch.float16)
 
         def helion_call() -> torch.Tensor:
             return layer_norm(x, w, b)

@@ -34,6 +34,7 @@ from ._compat import get_mtia_tunable_fragments
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import supports_grf_mode
 from ._compat import supports_tensor_descriptor
 from ._dist_utils import is_master_rank
 from ._dist_utils import sync_object as sync_object
@@ -83,6 +84,8 @@ def _strip_launcher_args(value: str) -> str:
         ]
     if _get_backend() == "tileir":
         strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    if supports_grf_mode():
+        strip_pairs += [(r", grf_mode='[^']*'", "")]
     for tunable in get_mtia_tunable_fragments():
         # Match tunable=value patterns:
         # - Quoted strings: 'value' or "value"
@@ -370,6 +373,14 @@ def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(
         lambda: not (supports_amd_cdna_tunables() and get_num_xcd() > 1), reason
     )
+
+
+def skipUnlessXPUGrfMode(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on an Intel GPU that exposes the GRF-mode knob."""
+    from ._compat import supports_grf_mode
+
+    # Defers check to test execution time to avoid device init during collection.
+    return skipIfFn(lambda: not supports_grf_mode(), reason)
 
 
 def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:

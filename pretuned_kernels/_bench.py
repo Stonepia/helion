@@ -136,16 +136,33 @@ def bench_pre_captured_cudagraph(call: Callable[[], object], rep: int = 100) -> 
     return bench_pre_captured_cudagraphs([call], rep=rep)[0]
 
 
+def gpu_device() -> str:
+    """Accelerator these benchmarks run on ("cuda" or "xpu")."""
+    return "xpu" if torch.xpu.is_available() else "cuda"
+
+
+def gpu_synchronize() -> None:
+    """Synchronize the active accelerator."""
+    torch.xpu.synchronize() if torch.xpu.is_available() else torch.cuda.synchronize()
+
+
+def gpu_name() -> str:
+    """Human-readable name of the active accelerator."""
+    if torch.xpu.is_available():
+        return torch.xpu.get_device_name()
+    return torch.cuda.get_device_name()
+
+
 def thermal_warmup(duration_ms: int) -> None:
     """Raise GPU clocks with device work before a latency sweep."""
     if duration_ms <= 0:
         return
-    value = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn(4096, 4096, device=gpu_device(), dtype=torch.bfloat16)
     end = time.monotonic() + duration_ms / 1000
     while time.monotonic() < end:
         for _ in range(50):
             value = value @ value
-        torch.cuda.synchronize()
+        gpu_synchronize()
 
 
 class CapturedCudagraphBenchmarkProvider(LocalBenchmarkProvider, abc.ABC):
@@ -252,7 +269,7 @@ def run_sweep(
             print(*args)
 
     if verbose:
-        _p(f"GPU: {torch.cuda.get_device_name()}")
+        _p(f"GPU: {gpu_name()}")
     speedups_by_base: dict[str, list[float]] = {}
     best_speedups: list[float] = []
     helion_wins = 0
