@@ -928,6 +928,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         )
         search = self._make_search(settings, args=("arg0",))
 
+        device_module = torch.get_device_module(DEVICE)
         parent_pid = os.getpid()
         lazy_calls: list[int] = []
 
@@ -946,7 +947,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]
         ) -> None:
-            torch.cuda._lazy_init()
+            device_module._lazy_init()
             _launcher("fake_kernel", (1,), *fn_args)
 
         with (
@@ -954,7 +955,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 "helion.autotuner.precompile_future.make_precompiler",
                 side_effect=fake_make_precompiler,
             ),
-            patch("torch.cuda._lazy_init", side_effect=fake_lazy_init),
+            patch.object(device_module, "_lazy_init", side_effect=fake_lazy_init),
         ):
             future = search.benchmark_provider._create_precompile_future(
                 "cfg", fake_compiled_fn

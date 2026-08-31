@@ -46,7 +46,7 @@ class TestTileIR(TestCase):
 
     def test_tileir_tunables_error_when_not_supported(self) -> None:
         """Test that specifying tileir tunables on non-tileir backend raises an error."""
-        device = torch.device("cuda")
+        device = DEVICE
         settings = helion.Settings(backend="triton")
         env = CompileEnvironment(device, settings)
 

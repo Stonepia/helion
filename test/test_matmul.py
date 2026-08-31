@@ -533,7 +533,7 @@ class TestMatmul(RefEagerTestBase, TestCase):
         weight = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
 
         # Call the kernel under autocast, simulating the model's forward pass
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(DEVICE.type, dtype=torch.bfloat16):
             code, result = code_and_output(matmul_with_cast, (x, weight))
 
         expected = (x.float() @ weight.T).to(x.dtype)

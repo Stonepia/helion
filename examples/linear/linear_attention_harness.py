@@ -807,13 +807,13 @@ def run_accuracy(
         try:
             out = as_ref(harness.helion_fwd(inputs, C))
         except Exception:
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             fwd = "HEL-ERR"
         else:
             try:
                 ref = harness.reference(inputs)
             except Exception:
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
                 fwd = "REF-ERR"
             else:
                 fwd = "ok" if _rel_error(out, ref) < ACC_FWD_TOL else "FAIL"
@@ -827,14 +827,14 @@ def run_accuracy(
             h_inputs, h_leaves = _grad_leaves(harness, inputs)
             harness.helion_fwd(h_inputs, C).backward(grad_out)
         except Exception:
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             bwd = "HEL-ERR"
         else:
             try:
                 r_inputs, r_leaves = _grad_leaves(harness, inputs)
                 harness.chunked_reference(r_inputs, C).backward(grad_out)
             except Exception:
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
                 bwd = "REF-ERR"
             else:
                 bwd = (

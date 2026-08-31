@@ -514,7 +514,6 @@ def test_grpo_loss(
     print(f"Testing GRPO Loss: B={B}, L={L}, V={V}")
 
     torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
 
     logits1 = torch.randn(
         B, L + 1, V, device=DEVICE, dtype=torch.bfloat16, requires_grad=True
@@ -577,20 +576,20 @@ def test_grpo_loss(
     print("\n=== Test Complete ===")
 
 
-def _cuda_sync() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+def _accelerator_sync() -> None:
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
 
 
 def _measure_timing(run_fn: Callable[[], None], iters: int, warmup: int) -> float:
     times = []
     for _ in range(warmup):
         run_fn()
-        _cuda_sync()
+        _accelerator_sync()
     for _ in range(iters):
         t0 = time.perf_counter()
         run_fn()
-        _cuda_sync()
+        _accelerator_sync()
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000.0)
     times.sort()
@@ -614,8 +613,6 @@ def benchmark_grpo_loss(
     )
 
     torch.manual_seed(0)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(0)
 
     logits_ref = torch.randn(
         B, L + 1, V, device=DEVICE, dtype=torch.float32, requires_grad=True
