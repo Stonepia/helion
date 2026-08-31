@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from helion._testing import DEVICE
+
 # ════════════════════════════════════════════════════════════════════════════════
 # Shared test helpers
 # ════════════════════════════════════════════════════════════════════════════════
@@ -352,7 +354,7 @@ def make_mamba2_inputs(
     D: int,
     DV: int,
     dtype: torch.dtype = torch.bfloat16,
-    device: str | torch.device = "cuda",
+    device: str | torch.device = DEVICE,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """Create inputs for Mamba-2 SSD (scalar decay, no correction)."""
