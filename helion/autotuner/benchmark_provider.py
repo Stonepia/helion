@@ -851,11 +851,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return jobs
 
         device = self.kernel.env.device
-        if device.type != "cuda":
-            # TODO(jansel): support non-cuda devices
+        if device.type == "cuda":
+            available_memory, _ = torch.cuda.mem_get_info(device)
+        elif device.type == "xpu":
+            available_memory, _ = torch.xpu.mem_get_info(device)
+        else:
             return jobs
 
-        available_memory, _ = torch.cuda.mem_get_info(device)
         jobs_by_memory = available_memory // memory_per_job
         if jobs_by_memory < jobs:
             gib_per_job = memory_per_job / (1024**3)
