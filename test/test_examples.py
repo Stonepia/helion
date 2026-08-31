@@ -2015,9 +2015,17 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @onlyBackends(["cute", "triton"])
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan(
-        (10, 0), reason="NVFP4 conversion instructions require Blackwell"
+    @skipIfFn(
+        lambda: DEVICE.type not in ("cuda", "xpu"),
+        "NVFP4 GEMV requires CUDA or XPU",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "cuda" and torch.cuda.get_device_capability() < (10, 0),
+        "NVFP4 conversion instructions require Blackwell on CUDA",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "xpu" and _get_backend() != "triton",
+        "XPU NVFP4 GEMV is covered by the Triton portable implementation",
     )
     @skipIfRefEager("inline asm codegen is not available in ref eager mode")
     def test_nvfp4_gemv(self):
