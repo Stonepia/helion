@@ -3035,7 +3035,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             return _tf(o_hf), None
 
         torch.manual_seed(42)
-        layer = layer.cuda().to(dtype)
+        layer = layer.to(device=DEVICE, dtype=dtype)
         hidden = torch.randn(2, seq_len, 256, device=DEVICE, dtype=dtype)
 
         # Reference
