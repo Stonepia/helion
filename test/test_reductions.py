@@ -717,7 +717,9 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertEqual(result_multi.dtype, torch.float16)
 
         # Test with bfloat16 if available
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        if (
+            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        ) or (DEVICE.type == "xpu" and torch.xpu.is_bf16_supported()):
             x_bf16 = (
                 torch.abs(torch.randn([32], device=DEVICE, dtype=torch.bfloat16)) + 0.1
             )
