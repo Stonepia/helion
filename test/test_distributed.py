@@ -31,6 +31,8 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfFn
+from helion._testing import skipIfNoAccelerator
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -619,7 +621,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+@skipIfNoAccelerator()
 class TestDistributedGating(CommonTestCase):
     """Issue #3024: single-process checks that distributed gating keys off
     symmetric-memory usage, not torch.distributed.is_initialized()."""
@@ -674,6 +676,11 @@ class TestDistributedGating(CommonTestCase):
 
     @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
     @skipIfRefEager("process-group resolution only happens in compiled mode")
+    @skipIfFn(
+        lambda: DEVICE.type != "cuda",
+        "CompileEnvironment._clamp_max_num_sm_multiplier_for_symm_mem() returns "
+        "early for non-CUDA devices, so max_num_sm_multiplier stays at 128",
+    )
     def test_symm_mem_kernel_still_distributed(self) -> None:
         with patch.object(symm_mem, "is_symm_mem_tensor", return_value=True):
             self.assertTrue(kernel_uses_symm_mem(([torch.randn(4, device=DEVICE)],)))
@@ -760,6 +767,11 @@ class TestDistributedGating(CommonTestCase):
 
     @unittest.skipUnless(_HAS_SYMM_MEM_DETECT, "requires symm_mem.is_symm_mem_tensor")
     @skipIfRefEager("process-group resolution only happens in compiled mode")
+    @skipIfFn(
+        lambda: DEVICE.type != "cuda",
+        "CompileEnvironment._clamp_max_num_sm_multiplier_for_symm_mem() returns "
+        "early for non-CUDA devices, so max_num_sm_multiplier stays at 128",
+    )
     def test_explicit_distributed_flag(self) -> None:
         @helion.kernel(autotune_effort="none", distributed=True)
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

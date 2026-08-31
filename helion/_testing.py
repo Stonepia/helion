@@ -589,6 +589,20 @@ def skipIfNotCUDA() -> Callable[[Callable], Callable]:
     )
 
 
+def skipIfNoAccelerator() -> Callable[[Callable], Callable]:
+    """Skip test unless ``DEVICE`` is a usable accelerator.
+
+    For device-generic tests that just need a real GPU to allocate on, rather
+    than a specific vendor's GPU. Prefer this over ``skipIfNotCUDA()`` when the
+    test body contains no CUDA-specific API calls.
+    """
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: torch.accelerator.current_accelerator(check_available=True) != DEVICE,
+        reason="Test skipped: no accelerator device is available.",
+    )
+
+
 def skipIfCudaCapabilityLessThan(
     min_capability: tuple[int, int], *, reason: str | None = None
 ) -> Callable[[Callable], Callable]:
