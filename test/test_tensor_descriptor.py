@@ -96,6 +96,10 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.permute", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU(
+        "Triton XPU produces incorrect results for 3D descriptors with a "
+        "non-last stride-1 dimension"
+    )
     def test_3d_tensor_permutation(self):
         """Test permutation with 3D tensor where stride==1 is in middle."""
 
@@ -1038,7 +1042,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     self.assertIn("tl.dot", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    @skipIfXPU("XPU tensor descriptor path has issue with stride-0 input")
+    @skipIfXPU("Triton XPU faults on descriptors with a runtime stride of zero")
     def test_dynamic_shape_stride_zero_input(self):
         """Expanded stride-0 dimensions should be TD-eligible with dynamic shapes."""
 
@@ -1075,9 +1079,6 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn(f"{name}_desc = {get_tensor_descriptor_fn_name()}", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    @skipIfXPU(
-        "XPU tensor descriptor path has accuracy issue for scalar SymInt subscripts"
-    )
     def test_scalar_symint_subscript_allowlist(self):
         """Known scalar SymInt expressions should still use tensor descriptors."""
 
