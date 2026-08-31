@@ -29,7 +29,6 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import skipIfTileIR
-from helion._testing import skipIfXPU
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
@@ -169,7 +168,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             kernel.bind((x,))
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
-    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop0(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -180,7 +178,6 @@ class TestLoops(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, torch.sin(args[0]))
 
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
-    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop1(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -193,7 +190,6 @@ class TestLoops(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("large 4D tensors may exceed TPU VMEM")
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
-    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop2(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -208,7 +204,6 @@ class TestLoops(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfTileIR("TileIR does not support block_ptr indexing")
-    @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop3(self):
         args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
         code, result = code_and_output(
@@ -432,7 +427,6 @@ class TestLoops(RefEagerTestBase, TestCase):
             torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("int64 index dtype not supported on Pallas")
-    @skipIfXPU("worker crash on XPU")
     def test_data_dependent_bounds3(self):
         @helion.kernel()
         def fn(x: torch.Tensor, end0: torch.Tensor, end1: torch.Tensor) -> torch.Tensor:
@@ -1424,7 +1418,6 @@ class TestLoops(RefEagerTestBase, TestCase):
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("tileir backend will ignore `range_unroll_factors` hint")
     @skipIfNotTriton("range loop hints are Triton-specific")
-    @skipIfXPU("Accuracy issue on XPU backend")
     def test_unroll_with_pipelining(self):
         @helion.kernel(static_shapes=True)
         def matmul(
