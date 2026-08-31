@@ -151,16 +151,16 @@ def _bench_shapes() -> list[tuple[int, int]]:
     return [(t, h) for h in hidden_sizes for t in num_tokens_list]
 
 
-def correctness_check() -> None:
+def correctness_check(device: torch.device | str = "cuda") -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
     group_size = 128
     const = (group_size, 1e-10, -448.0, 448.0, False)
     for num_tokens, hidden_size in _bench_shapes():
-        inp = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        inp = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
         groups = hidden_size // group_size
         oq = torch.empty_like(inp, dtype=torch.float8_e4m3fn)
-        os = torch.empty((num_tokens, groups), device="cuda", dtype=torch.float32)
+        os = torch.empty((num_tokens, groups), device=device, dtype=torch.float32)
         oq_ref = torch.empty_like(oq)
         os_ref = torch.empty_like(os)
         per_token_group_fp8_quant(inp, oq, os, *const)

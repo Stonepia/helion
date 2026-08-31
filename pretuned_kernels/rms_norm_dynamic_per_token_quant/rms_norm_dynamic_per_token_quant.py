@@ -208,16 +208,16 @@ def _bench_shapes() -> list[tuple[int, int]]:
     return [(h, t) for h in hidden_sizes for t in num_tokens_list]
 
 
-def correctness_check() -> None:
+def correctness_check(device: torch.device | str = "cuda") -> None:
     """Assert the Helion kernel matches the torch reference for every bench shape."""
     torch.manual_seed(0)
     for hidden_size, num_tokens in _bench_shapes():
-        x_in = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        x_in = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16)
         weight = torch.normal(
-            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device="cuda"
+            mean=1.0, std=1.0, size=(hidden_size,), dtype=x_in.dtype, device=device
         )
         result = torch.empty_like(x_in, dtype=_FP8_DTYPE)
-        scale = torch.empty((num_tokens, 1), device="cuda", dtype=torch.float32)
+        scale = torch.empty((num_tokens, 1), device=device, dtype=torch.float32)
         result_ref = torch.empty_like(result)
         scale_ref = torch.empty_like(scale)
         rms_norm_dynamic_per_token_quant(result, x_in, weight, scale, 1e-6)
