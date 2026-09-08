@@ -894,7 +894,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 ):
                     code_and_output(kernel, (x, y))
                 del x, y
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
                 torch.accelerator.synchronize()
                 return
 
@@ -906,7 +906,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             torch.accelerator.synchronize()
             ref_out = torch.add(x, y)
             del x, y
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
             torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
 
