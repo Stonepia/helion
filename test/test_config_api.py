@@ -536,8 +536,6 @@ class TestSettingsEnv(TestCase):
 
     def test_autotune_force_persistent_clamps_on_symm_mem(self) -> None:
         # force_persistent + a symm-mem arg must clamp to the signal-pad budget.
-        # The clamp is CUDA-only (CompileEnvironment
-        # ._clamp_max_num_sm_multiplier_for_symm_mem returns early elsewhere), so
         # this uses a literal CUDA device like the other clamp tests below; every
         # device query it would make is mocked out.
         settings = helion.Settings(autotune_force_persistent=True)
