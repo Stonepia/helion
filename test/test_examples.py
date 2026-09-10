@@ -1163,7 +1163,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
-    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
@@ -1571,7 +1570,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("tensor-derived if-predicates not supported")
-    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
         max_seq_len = 64
