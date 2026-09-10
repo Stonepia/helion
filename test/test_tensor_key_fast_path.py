@@ -24,7 +24,8 @@ import torch
 
 import helion
 from helion._testing import DEVICE
-from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfFn
+from helion._testing import skipIfRocm
 import helion.language as hl
 from helion.runtime.kernel import _concrete_tensor_key
 from helion.runtime.kernel import _specialization_extractors
@@ -121,7 +122,12 @@ class TestTensorKeyFastPath(unittest.TestCase):
         self.assertEqual(sub_key, plain_key)
         self.assertEqual(hash(sub_key), hash(plain_key))
 
-    @skipIfNotCUDA()
+    @skipIfRocm("These bind tests are not validated on ROCm")
+    @skipIfFn(
+        lambda: torch.accelerator.current_accelerator(check_available=True)
+        not in {torch.device("cuda"), torch.device("xpu")},
+        "requires CUDA or XPU",
+    )
     def test_bind_caches_across_tensors_with_same_spec(self) -> None:
         """``bind()`` reuses one BoundKernel for distinct tensor objects of
         the same dtype/shape/stride."""
@@ -131,7 +137,12 @@ class TestTensorKeyFastPath(unittest.TestCase):
         y2 = torch.randn(64, device=DEVICE)
         self.assertIs(_vector_add.bind((x1, y1)), _vector_add.bind((x2, y2)))
 
-    @skipIfNotCUDA()
+    @skipIfRocm("These bind tests are not validated on ROCm")
+    @skipIfFn(
+        lambda: torch.accelerator.current_accelerator(check_available=True)
+        not in {torch.device("cuda"), torch.device("xpu")},
+        "requires CUDA or XPU",
+    )
     def test_bind_distinguishes_dtype_and_shape(self) -> None:
         x_f32 = torch.randn(64, dtype=torch.float32, device=DEVICE)
         x_f64 = torch.randn(64, dtype=torch.float64, device=DEVICE)
