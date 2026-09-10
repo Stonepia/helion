@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 # tl.dot_scaled requires SM 10.0+ (B200 / compute capability 10.0)
 def requires_sm100(fn: Callable) -> Callable:
+    if DEVICE.type == "xpu":
+        return fn
     return skipIfNotCUDA()(
         skipIfCudaCapabilityLessThan(
             (10, 0), reason="tl.dot_scaled requires CUDA capability >= 10.0 (B200+)"
@@ -74,7 +76,7 @@ def _supports_fp16_dot_scaled() -> bool:
             os.dup2(devnull.fileno(), stderr_fd)
             try:
                 _probe[(1,)](x, x_scale, y, y_scale, out, num_warps=1, num_stages=1)
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
             except RuntimeError:
                 return False
     finally:
