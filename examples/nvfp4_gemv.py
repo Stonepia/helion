@@ -228,6 +228,47 @@ def _nvfp4_gemv_bf16in_triton_body(
     return out
 
 
+def _nvfp4_gemv_bf16in_triton_portable_body(
+    weight_bytes: Tensor,
+    x_values: Tensor,
+    weight_scale: Tensor,
+    out: Tensor,
+    alpha: float = 1.0,
+) -> Tensor:
+    """W4A16 NVFP4 GEMV with target-independent E2M1 and E4M3 conversion."""
+    M = hl.specialize(weight_bytes.size(0))
+    K_bytes = hl.specialize(weight_bytes.size(1))
+    K_groups = K_bytes // 8
+    block_m = hl.register_block_size(1, 16)
+    block_g = hl.register_block_size(K_groups)
+    f16 = torch.float16
+    for tile_m in hl.tile(M, block_size=block_m):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            group_offsets = tile_m.index[:, None] * K_groups + tile_g.index[None, :]
+            weight_mask = (tile_m.index[:, None] < M) & (
+                tile_g.index[None, :] < K_groups
+            )
+            w = hl.load_float4_e2m1fn_x16_to_float16(
+                weight_bytes,
+                group_offsets,
+                extra_mask=weight_mask,
+            )
+            xt = x_values[tile_g, :].to(f16)
+            lane = hl.arange(16)[None, :]
+            contrib = hl.zeros([block_m, block_g], dtype=f16)
+            for i in hl.static_range(16):
+                xi = torch.where(lane == i, xt, 0.0).sum(-1)[None, :]
+                contrib = contrib + w[i] * xi
+            scale_offsets = swizzled_scale_offsets(
+                tile_m.index[:, None], tile_g.index[None, :], K_groups
+            )
+            scale = weight_scale[scale_offsets].to(torch.float32)
+            acc = acc + (contrib.to(torch.float32) * scale).sum(-1)
+        out[tile_m] = (acc * alpha).to(torch.bfloat16)
+    return out
+
+
 def _nvfp4_gemv_bf16in_body(
     weight_fp4x2: Tensor,
     x_values: Tensor,
@@ -367,6 +408,54 @@ def _nvfp4_gemv_fp4in_triton_body(
     return out
 
 
+def _nvfp4_gemv_fp4in_triton_portable_body(
+    weight_bytes: Tensor,
+    x_bytes: Tensor,
+    weight_scale: Tensor,
+    x_scale: Tensor,
+    out: Tensor,
+    alpha: float = 1.0,
+) -> Tensor:
+    """W4A4 NVFP4 GEMV with target-independent E2M1 and E4M3 conversion."""
+    M = hl.specialize(weight_bytes.size(0))
+    K_bytes = hl.specialize(weight_bytes.size(1))
+    K_groups = K_bytes // 8
+    block_m = hl.register_block_size(1, 16)
+    block_g = hl.register_block_size(K_groups)
+    for tile_m in hl.tile(M, block_size=block_m):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_g in hl.tile(K_groups, block_size=block_g):
+            group_offsets = tile_m.index[:, None] * K_groups + tile_g.index[None, :]
+            group_mask = tile_g.index < K_groups
+            weight_mask = (tile_m.index[:, None] < M) & group_mask[None, :]
+            w = hl.load_float4_e2m1fn_x16_to_float16(
+                weight_bytes,
+                group_offsets,
+                extra_mask=weight_mask,
+            )
+            x = hl.load_float4_e2m1fn_x16_to_float16(
+                x_bytes,
+                tile_g.index,
+                extra_mask=group_mask,
+            )
+            contrib = hl.zeros([block_m, block_g], dtype=torch.float16)
+            for i in hl.static_range(16):
+                contrib = contrib + w[i] * x[i][None, :]
+            weight_scale_offsets = swizzled_scale_offsets(
+                tile_m.index[:, None], tile_g.index[None, :], K_groups
+            )
+            x_scale_offsets = swizzled_scale_offsets(
+                tile_g.index * 0,
+                tile_g.index,
+                K_groups,
+            )
+            scale = weight_scale[weight_scale_offsets].to(torch.float32)
+            scale = scale * x_scale[x_scale_offsets].to(torch.float32)[None, :]
+            acc = acc + (contrib.to(torch.float32) * scale).sum(-1)
+        out[tile_m] = (acc * alpha).to(torch.bfloat16)
+    return out
+
+
 # Triton W4A16 uses the coalesced-load body with block_m=16 and block_g=128.
 # Triton W4A4 uses the autotuned pretuned config from nvfp4_gemv.
 BF16IN_TRITON_CONFIG = helion.Config(block_sizes=[16, 128], num_warps=4, num_stages=3)
@@ -399,6 +488,16 @@ def _nvfp4_gemv_bf16in_triton_kernel() -> helion.Kernel[Tensor]:
 
 
 @functools.cache
+def _nvfp4_gemv_bf16in_triton_portable_kernel() -> helion.Kernel[Tensor]:
+    return helion.kernel(
+        _nvfp4_gemv_bf16in_triton_portable_body,
+        static_shapes=True,
+        config=BF16IN_TRITON_CONFIG,
+        backend="triton",
+    )
+
+
+@functools.cache
 def _nvfp4_gemv_bf16in_cute_kernel() -> helion.Kernel[Tensor]:
     """Portable f32-decode W4A16 GEMV for Helion's CuTe backend."""
     return helion.kernel(
@@ -413,6 +512,16 @@ def _nvfp4_gemv_bf16in_cute_kernel() -> helion.Kernel[Tensor]:
 def _nvfp4_gemv_fp4in_triton_kernel() -> helion.Kernel[Tensor]:
     return helion.kernel(
         _nvfp4_gemv_fp4in_triton_body,
+        static_shapes=True,
+        config=FP4IN_TRITON_CONFIG,
+        backend="triton",
+    )
+
+
+@functools.cache
+def _nvfp4_gemv_fp4in_triton_portable_kernel() -> helion.Kernel[Tensor]:
+    return helion.kernel(
+        _nvfp4_gemv_fp4in_triton_portable_body,
         static_shapes=True,
         config=FP4IN_TRITON_CONFIG,
         backend="triton",
@@ -458,12 +567,18 @@ def nvfp4_gemv_bf16in(
     n_rows, k_bytes = weight_bytes.shape
     groups = k_bytes // 8
     if backend == "triton":
-        # Coalesced-load Triton kernel: weight stored as bytes, activation as
-        # contiguous (groups, 16) bf16, scales as the raw SWIZZLE_32_4_4 bytes.
-        return _nvfp4_gemv_bf16in_triton_kernel()(
+        if weight_bytes.device.type == "cuda":
+            return _nvfp4_gemv_bf16in_triton_kernel()(
+                weight_bytes,
+                x_bf16.view(groups, 16),
+                weight_scale.reshape(-1).view(torch.int8),
+                out,
+                alpha,
+            )
+        return _nvfp4_gemv_bf16in_triton_portable_kernel()(
             weight_bytes,
             x_bf16.view(groups, 16),
-            weight_scale.reshape(-1).view(torch.int8),
+            weight_scale.reshape(-1),
             out,
             alpha,
         )
@@ -507,11 +622,20 @@ def nvfp4_gemv_fp4in(
         weight_bytes.shape[0], dtype=torch.bfloat16, device=weight_bytes.device
     )
     if backend == "triton":
-        return _nvfp4_gemv_fp4in_triton_kernel()(
+        if weight_bytes.device.type == "cuda":
+            return _nvfp4_gemv_fp4in_triton_kernel()(
+                weight_bytes,
+                x_bytes,
+                weight_scale.reshape(-1).view(torch.int8),
+                x_scale.reshape(-1).view(torch.int8),
+                out,
+                alpha,
+            )
+        return _nvfp4_gemv_fp4in_triton_portable_kernel()(
             weight_bytes,
             x_bytes,
-            weight_scale.reshape(-1).view(torch.int8),
-            x_scale.reshape(-1).view(torch.int8),
+            weight_scale.reshape(-1),
+            x_scale.reshape(-1),
             out,
             alpha,
         )

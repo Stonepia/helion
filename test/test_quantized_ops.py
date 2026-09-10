@@ -11,6 +11,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
 
@@ -177,9 +178,13 @@ class TestCuteQuantizedOps(RefEagerTestDisabled, TestCase):
 
 @onlyBackends(["triton"])
 class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan(
-        (10, 0), reason="FP4/FP8 conversion instructions require Blackwell"
+    @skipIfFn(
+        lambda: DEVICE.type not in ("cuda", "xpu"),
+        "FP4 conversion tests require CUDA or XPU",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "cuda" and torch.cuda.get_device_capability() < (10, 0),
+        "FP4/FP8 conversion instructions require Blackwell on CUDA",
     )
     def test_float4_e2m1fn_x2_to_float32(self):
         # Also covers fp4x2 host args viewed as uint8 for Triton.
@@ -201,16 +206,26 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
             (raw.view(torch.float4_e2m1fn_x2),),
         )
         raw_i32 = raw.to(torch.int32)
-        torch.testing.assert_close(lo, _dequant_e2m1(raw_i32 & 0xF))
-        torch.testing.assert_close(hi, _dequant_e2m1((raw_i32 >> 4) & 0xF))
-        self.assertIn(" = load.to(tl.int16)", code)
-        self.assertIn("[fp4_packed_", code)
-        self.assertIn("=f,=f,h", code)
-        self.assertIn("tl.inline_asm_elementwise", code)
+        torch.testing.assert_close(lo, _dequant_e2m1(raw_i32 & 0xF), atol=0, rtol=0)
+        torch.testing.assert_close(
+            hi, _dequant_e2m1((raw_i32 >> 4) & 0xF), atol=0, rtol=0
+        )
+        if DEVICE.type == "cuda":
+            self.assertIn(" = load.to(tl.int16)", code)
+            self.assertIn("[fp4_packed_", code)
+            self.assertIn("=f,=f,h", code)
+            self.assertIn("tl.inline_asm_elementwise", code)
+        else:
+            self.assertNotIn("tl.inline_asm_elementwise", code)
+            self.assertNotIn("cvt.rn.f16x2.e2m1x2", code)
 
-    @skipIfNotCUDA()
-    @skipIfCudaCapabilityLessThan(
-        (10, 0), reason="FP4 conversion instructions require Blackwell"
+    @skipIfFn(
+        lambda: DEVICE.type not in ("cuda", "xpu"),
+        "FP4 conversion tests require CUDA or XPU",
+    )
+    @skipIfFn(
+        lambda: DEVICE.type == "cuda" and torch.cuda.get_device_capability() < (10, 0),
+        "FP4 conversion instructions require Blackwell on CUDA",
     )
     def test_load_float4_e2m1fn_x16_to_float16(self):
         @helion.kernel(autotune_effort="none")
@@ -237,10 +252,14 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
         raw_i32 = raw.view(2, 8).to(torch.int32)
         nibbles = torch.stack((raw_i32 & 0xF, (raw_i32 >> 4) & 0xF), dim=-1)
         expected = _dequant_e2m1(nibbles.reshape(2, 16)).to(torch.float16)
-        torch.testing.assert_close(result, expected)
-        self.assertIn("tl.pointer_type(tl.uint64)", code)
-        self.assertIn("[fp4_qword_", code)
-        self.assertIn("=h,=h", code)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+        if DEVICE.type == "cuda":
+            self.assertIn("tl.pointer_type(tl.uint64)", code)
+            self.assertIn("[fp4_qword_", code)
+            self.assertIn("=h,=h", code)
+        else:
+            self.assertNotIn("tl.inline_asm_elementwise", code)
+            self.assertNotIn("cvt.rn.f16x2.e2m1x2", code)
 
 
 if __name__ == "__main__":

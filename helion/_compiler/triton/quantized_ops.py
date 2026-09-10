@@ -19,6 +19,7 @@ from ...language.quantized_ops import float4_e2m1fn_x2_to_float32
 from ...language.quantized_ops import load_float4_e2m1fn_x16_to_float16
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
+from ..compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -39,6 +40,39 @@ _FP4X2_TO_F32_ASM = """
 """
 
 
+def _portable_e2m1_to_f32(state: CodegenState, nibble: ast.AST) -> ast.AST:
+    """Decode one E2M1 nibble without target-specific inline assembly."""
+    sign = state.codegen.lift(
+        expr_from_string("(({nibble} >> 3) & 1).to(tl.float32)", nibble=nibble),
+        dce=True,
+        prefix="fp4_sign",
+    )
+    magnitude = state.codegen.lift(
+        expr_from_string("({nibble} & 7).to(tl.float32)", nibble=nibble),
+        dce=True,
+        prefix="fp4_magnitude",
+    )
+    absolute = state.codegen.lift(
+        expr_from_string(
+            "tl.where({magnitude} < 4.0, {magnitude} * 0.5, "
+            "tl.where({magnitude} < 6.0, {magnitude} - 2.0, "
+            "{magnitude} * 2.0 - 8.0))",
+            magnitude=magnitude,
+        ),
+        dce=True,
+        prefix="fp4_absolute",
+    )
+    return state.codegen.lift(
+        expr_from_string(
+            "tl.where({sign} != 0.0, -{absolute}, {absolute})",
+            sign=sign,
+            absolute=absolute,
+        ),
+        dce=True,
+        prefix="fp4_value",
+    )
+
+
 @_decorators.codegen(float4_e2m1fn_x2_to_float32, "triton")
 def _(state: CodegenState) -> list[ast.AST]:
     value = state.codegen.lift(
@@ -46,6 +80,15 @@ def _(state: CodegenState) -> list[ast.AST]:
         dce=True,
         prefix="fp4_packed",
     )
+    if CompileEnvironment.current().device.type != "cuda":
+        return [
+            _portable_e2m1_to_f32(
+                state, expr_from_string("{value} & 0xF", value=value)
+            ),
+            _portable_e2m1_to_f32(
+                state, expr_from_string("{value} >> 4", value=value)
+            ),
+        ]
     call = create(
         ast.Call,
         func=expr_from_string("tl.inline_asm_elementwise"),
@@ -96,6 +139,48 @@ def _(state: CodegenState) -> list[ast.AST]:
     group_offset = state.ast_arg(1)
     extra_mask = state.ast_args[2]
     base = state.device_function.tensor_arg(storage).name
+    if CompileEnvironment.current().device.type != "cuda":
+        lanes: list[ast.AST] = []
+        for byte in range(8):
+            byte_offset = expr_from_string(
+                f"{{offset}} * 8 + {byte}", offset=group_offset
+            )
+            if extra_mask is None:
+                load_call = expr_from_string(
+                    f"tl.load({base} + {{offset}})", offset=byte_offset
+                )
+            else:
+                assert isinstance(extra_mask, ast.AST)
+                load_call = expr_from_string(
+                    f"tl.load({base} + {{offset}}, {{mask}}, other=0)",
+                    offset=byte_offset,
+                    mask=extra_mask,
+                )
+            packed = state.codegen.lift(load_call, dce=True, prefix="fp4_byte")
+            value = state.codegen.lift(
+                expr_from_string("{value}.to(tl.int32)", value=packed),
+                dce=True,
+                prefix="fp4_packed",
+            )
+            lanes.extend(
+                [
+                    expr_from_string(
+                        "{value}.to(tl.float16)",
+                        value=_portable_e2m1_to_f32(
+                            state,
+                            expr_from_string("{value} & 0xF", value=value),
+                        ),
+                    ),
+                    expr_from_string(
+                        "{value}.to(tl.float16)",
+                        value=_portable_e2m1_to_f32(
+                            state,
+                            expr_from_string("{value} >> 4", value=value),
+                        ),
+                    ),
+                ]
+            )
+        return lanes
     if extra_mask is None:
         load_call = expr_from_string(
             f"tl.load({base}.to(tl.pointer_type(tl.uint64)) + {{offset}})",
