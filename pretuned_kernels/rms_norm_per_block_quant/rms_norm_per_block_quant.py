@@ -239,11 +239,14 @@ def use_cudagraph() -> bool:
 
 
 def _make_inputs(
-    num_tokens: int, hidden_size: int, group_size: int
+    num_tokens: int,
+    hidden_size: int,
+    group_size: int,
+    device: torch.device | str = "cuda",
 ) -> tuple[torch.Tensor, ...]:
     in_dtype = torch.bfloat16
     out_dtype = torch.float8_e4m3fn
-    inp = torch.randn(num_tokens, hidden_size, device="cuda", dtype=in_dtype)
+    inp = torch.randn(num_tokens, hidden_size, device=device, dtype=in_dtype)
     result = torch.empty(inp.shape, device=inp.device, dtype=out_dtype)
     scale = torch.empty(
         (num_tokens, hidden_size // group_size),
@@ -272,11 +275,11 @@ def _bench_shapes() -> list[tuple[int, int, int]]:
     ]
 
 
-def correctness_check() -> None:
+def correctness_check(device: torch.device | str = "cuda") -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     torch.manual_seed(0)
     for hidden_size, group_size, num_tokens in _bench_shapes():
-        args = _make_inputs(num_tokens, hidden_size, group_size)
+        args = _make_inputs(num_tokens, hidden_size, group_size, device=device)
         (
             result,
             inp,

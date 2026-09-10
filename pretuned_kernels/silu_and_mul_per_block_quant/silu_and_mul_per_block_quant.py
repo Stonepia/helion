@@ -194,19 +194,22 @@ def _bench_shapes() -> list[tuple[int, int]]:
     return [(t, i) for i in intermediate_sizes for t in num_tokens_list]
 
 
-def correctness_check() -> None:
+def correctness_check(device: torch.device | str = "cuda") -> None:
     """Assert the Helion kernel matches the torch reference (used by the tests)."""
     group_size = 128
     torch.manual_seed(0)
     for num_tokens, intermediate in _bench_shapes():
         x = torch.randn(
-            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+            num_tokens, 2 * intermediate, device=device, dtype=torch.bfloat16
         )
         out = torch.empty(
-            num_tokens, intermediate, device="cuda", dtype=torch.float8_e4m3fn
+            num_tokens, intermediate, device=device, dtype=torch.float8_e4m3fn
         )
         scales = torch.empty(
-            num_tokens, intermediate // group_size, device="cuda", dtype=torch.float32
+            num_tokens,
+            intermediate // group_size,
+            device=device,
+            dtype=torch.float32,
         )
         out_ref = torch.empty_like(out)
         scales_ref = torch.empty_like(scales)
