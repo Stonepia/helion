@@ -1095,8 +1095,9 @@ def lower_helion_kernel(
 
     # Fix flat_leaves for dynamic shapes: kernel.bind() creates concrete
     # placeholder tensors (size 64 for symbolic dims), but downstream
-    # build_multi_outputs needs symbolic sizes for correct IR layouts.
-    # Replace concrete leaves with FakeTensors carrying the real symbolic sizes.
+    # build_multi_outputs needs the output-spec sizes for correct IR layouts.
+    # It can also create internal SymInts for concrete scalar arguments; replace
+    # those so symbols from Helion's private ShapeEnv do not leak into Inductor.
     leaf_specs_list = cast("list[dict[str, object]]", output_spec.get("leaf_specs", []))
     if leaf_specs_list:
         for i, (leaf, spec) in enumerate(
@@ -1105,8 +1106,10 @@ def lower_helion_kernel(
             if not isinstance(leaf, torch.Tensor) or spec.get("type") != "tensor":
                 continue
             spec_shape = cast("list[int | sympy.Expr]", spec.get("shape", []))
-            if not any(not isinstance(s, int) for s in spec_shape):
-                continue  # all static, no fixup needed
+            if not leaf._has_symbolic_sizes_strides and not any(
+                not isinstance(s, int) for s in spec_shape
+            ):
+                continue
             spec_stride = cast("list[int | sympy.Expr]", spec.get("stride", []))
             sym_shape = convert_shape_to_symint(spec_shape)
             sym_stride = convert_shape_to_symint(spec_stride)
