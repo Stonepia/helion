@@ -5,6 +5,7 @@ import functools
 import math
 import operator
 import re
+from types import SimpleNamespace
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -476,6 +477,55 @@ def k_default_dtype_output(x: torch.Tensor) -> torch.Tensor:
 
 @onlyBackends(["triton"])
 class TestTorchCompile(RefEagerTestDisabled, TestCase):
+    def test_template_buffer_empty_inputs_uses_bound_kernel_device(self) -> None:
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+        bound_kernel = SimpleNamespace(
+            env=SimpleNamespace(device=torch.device("xpu", 7))
+        )
+        with patch.object(HelionTemplateBuffer, "__init__", return_value=None) as init:
+            _, outputs = HelionTemplateBuffer.create(
+                realized_inputs={},
+                structured_outputs=None,
+                mutated_input_names=[],
+                direct_aliases={},
+                bound_kernel=bound_kernel,
+            )
+
+        self.assertEqual(outputs, ())
+        self.assertEqual(
+            init.call_args.kwargs["layout"].device, bound_kernel.env.device
+        )
+
+    def test_template_buffer_empty_inputs_normalizes_bound_kernel_device(self) -> None:
+        from helion._compiler._inductor.template_buffer import HelionTemplateBuffer
+
+        bound_kernel = SimpleNamespace(env=SimpleNamespace(device=torch.device("xpu")))
+        with (
+            patch.object(
+                torch.accelerator,
+                "current_accelerator",
+                return_value=torch.device("xpu"),
+            ),
+            patch.object(
+                torch.accelerator, "current_device_index", return_value=3
+            ) as current_device_index,
+            patch.object(HelionTemplateBuffer, "__init__", return_value=None) as init,
+        ):
+            _, outputs = HelionTemplateBuffer.create(
+                realized_inputs={},
+                structured_outputs=None,
+                mutated_input_names=[],
+                direct_aliases={},
+                bound_kernel=bound_kernel,
+            )
+
+        self.assertEqual(outputs, ())
+        self.assertEqual(
+            init.call_args.kwargs["layout"].device, torch.device("xpu", 3)
+        )
+        current_device_index.assert_called_once_with()
+
     def _compile_and_count_kernels(self, f, test_args, dynamic=False):
         """Compile f with torch.compile and return (result, source_codes, count)."""
         helion_kernel_side_table = None
