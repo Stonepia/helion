@@ -18,7 +18,7 @@ import helion
 from helion import exc
 from helion._compiler.backend import TritonBackend
 from helion._testing import DEVICE
-from helion._testing import skipIfNoAccelerator
+from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
 from helion.autotuner import PatternSearch
 from helion.autotuner import benchmark_provider as benchmark_provider_module
@@ -1495,7 +1495,11 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
         self.assertEqual(search._autotune_metrics.num_configs_tested, 5)
 
 
-@skipIfNoAccelerator()
+@skipIfFn(
+    lambda: torch.accelerator.current_accelerator(check_available=True)
+    not in {torch.device("cuda"), torch.device("xpu")},
+    "requires CUDA or XPU",
+)
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 class TestMultiShapeAutotuneIntegration(unittest.TestCase):
     @staticmethod
